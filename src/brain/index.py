@@ -1,0 +1,85 @@
+"""Rebuild the brain index.md from all entity files."""
+
+import re
+from pathlib import Path
+
+import brain.config as config
+
+
+def _extract_frontmatter(text: str) -> dict:
+    """Extract YAML frontmatter as a simple dict."""
+    if not text.startswith("---"):
+        return {}
+    end = text.index("---", 3)
+    fm_text = text[3:end].strip()
+    result = {}
+    for line in fm_text.split("\n"):
+        if ":" in line:
+            key, _, value = line.partition(":")
+            result[key.strip()] = value.strip().strip('"').strip("'")
+    return result
+
+
+def _first_sentence(text: str) -> str:
+    """Extract first non-frontmatter, non-header sentence."""
+    in_frontmatter = False
+    for line in text.split("\n"):
+        if line.strip() == "---":
+            in_frontmatter = not in_frontmatter
+            continue
+        if in_frontmatter:
+            continue
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Return first real content line, truncated
+        return line[:120] + ("..." if len(line) > 120 else "")
+    return ""
+
+
+def rebuild_index() -> None:
+    """Rebuild index.md from all entity files."""
+    sections = []
+
+    type_labels = {
+        "people": "People",
+        "clients": "Clients",
+        "projects": "Projects",
+        "domains": "Domains",
+        "decisions": "Decisions",
+        "issues": "Issues",
+        "insights": "Insights",
+        "evolutions": "Evolutions",
+    }
+
+    for type_key, label in type_labels.items():
+        type_dir = config.ENTITY_TYPES.get(type_key)
+        if type_dir is None or not type_dir.exists():
+            sections.append(f"## {label}\n_No entities yet._\n")
+            continue
+
+        files = sorted(type_dir.glob("*.md"))
+        if not files:
+            sections.append(f"## {label}\n_No entities yet._\n")
+            continue
+
+        lines = [f"## {label}"]
+        for f in files:
+            text = f.read_text()
+            fm = _extract_frontmatter(text)
+            name = fm.get("name", f.stem.replace("-", " ").title())
+            status = fm.get("status", "current")
+            summary = _first_sentence(text)
+            rel_path = f.relative_to(config.BRAIN_DIR)
+            status_marker = ""
+            if status == "contested":
+                status_marker = " ⚡"
+            elif status == "superseded":
+                status_marker = " ~~"
+            lines.append(f"- [[{rel_path}|{name}]]{status_marker} — {summary}")
+        sections.append("\n".join(lines) + "\n")
+
+    content = "# Brain Index\n\nEntity catalog for fast lookup. Updated automatically.\n\n"
+    content += "\n".join(sections)
+
+    config.INDEX_FILE.write_text(content)

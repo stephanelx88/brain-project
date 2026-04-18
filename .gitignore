@@ -1,0 +1,16 @@
+existing-codes/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.egg-info/
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+.env
+graphify-out/
+docs/superpowers/
