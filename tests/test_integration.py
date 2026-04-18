@@ -42,24 +42,16 @@ def test_harvest_then_extract_creates_entity(tmp_brain, sample_jsonl, monkeypatc
 
     # Step 2: Mock claude -p to return valid extraction JSON
     mock_response = json.dumps({
-        "people": [],
-        "clients": [],
-        "projects": [
+        "entities": [
             {
+                "type": "projects",
                 "name": "Test Project",
-                "client": "Test Client",
-                "facts": ["Bug fix in auth module"],
                 "is_new": True,
+                "facts": ["Bug fix in auth module"],
+                "metadata": {"client": "Test Client"},
             }
         ],
-        "domains": [],
-        "decisions": [],
-        "issues": [],
-        "insights": [],
         "corrections": [],
-        "evolutions": [],
-        "contested": [],
-        "high_value_outputs": [],
     })
 
     with patch.object(ae, "call_claude", return_value=mock_response):

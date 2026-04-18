@@ -54,27 +54,19 @@ def test_ingest_file_creates_entity(tmp_brain, monkeypatch):
     )
 
     mock_response = json.dumps({
-        "people": [],
-        "clients": [],
-        "projects": [],
-        "domains": [
+        "entities": [
             {
+                "type": "domains",
                 "name": "BMS Chiller Diagnostics",
-                "source_context": "work",
+                "is_new": True,
                 "facts": [
                     "Plant 1 chiller rated power is 245 kW per nameplate",
                     "All pump status BMS points are dead",
                 ],
-                "is_new": True,
+                "metadata": {"source_context": "work"},
             }
         ],
-        "decisions": [],
-        "issues": [],
-        "insights": [],
         "corrections": [],
-        "evolutions": [],
-        "contested": [],
-        "high_value_outputs": [],
     })
 
     with patch("brain.ingest.call_claude", return_value=mock_response):
