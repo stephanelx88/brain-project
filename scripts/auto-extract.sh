@@ -16,5 +16,6 @@ LOG="$LOG_DIR/auto-extract.log"
   echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) auto-extract run ==="
   python3 -m brain.auto_extract || echo "auto_extract exited $?"
   python3 -m brain.reconcile || echo "reconcile exited $?"
+  python3 -m brain.clean --execute || echo "clean exited $?"
   echo ""
 } >> "$LOG" 2>&1

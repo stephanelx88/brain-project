@@ -94,9 +94,11 @@ def find_possible_duplicates() -> str:
             # Same type only
             if k1.split("/")[0] != k2.split("/")[0]:
                 continue
-            overlap = all_names[k1] & all_names[k2]
-            union = all_names[k1] | all_names[k2]
-            if len(overlap) / len(union) > 0.5 and len(overlap) >= 2:
+            w1, w2 = all_names[k1], all_names[k2]
+            overlap = w1 & w2
+            union = w1 | w2
+            is_subset = w1 < w2 or w2 < w1  # one is proper subset of the other
+            if (len(overlap) / len(union) > 0.5 and len(overlap) >= 2) or (is_subset and len(overlap) >= 1):
                 duplicates.append(f"- **{k1}** and **{k2}** share: {', '.join(overlap)}")
 
     return "\n".join(duplicates) if duplicates else "None found."

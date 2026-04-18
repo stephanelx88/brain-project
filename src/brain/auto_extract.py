@@ -71,7 +71,7 @@ def call_claude(prompt: str) -> str | None:
             input=prompt,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=180,
             env=env,
         )
         if result.returncode == 0:
@@ -79,7 +79,7 @@ def call_claude(prompt: str) -> str | None:
         print(f"claude exit={result.returncode} stderr={result.stderr[:500]!r}", file=sys.stderr)
         return None
     except subprocess.TimeoutExpired:
-        print("claude call timed out after 60s", file=sys.stderr)
+        print("claude call timed out after 180s", file=sys.stderr)
         return None
     except FileNotFoundError:
         print("claude binary not found on PATH", file=sys.stderr)

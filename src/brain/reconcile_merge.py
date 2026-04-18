@@ -39,6 +39,7 @@ def entity_path(type_slug: str) -> Path:
 def is_high_confidence(pair: tuple[str, str]) -> bool:
     """Check if pair is safe to auto-merge."""
     k1, k2 = pair
+    type1 = k1.split("/", 1)[0]
     slug1 = k1.split("/", 1)[1]
     slug2 = k2.split("/", 1)[1]
     words1 = set(slug1.split("-"))
@@ -50,6 +51,13 @@ def is_high_confidence(pair: tuple[str, str]) -> bool:
 
     diff_numbers = {w for w in sym_diff if w.isdigit() and len(w) >= 3}
     if len(diff_numbers) >= 2:
+        return False
+
+    # Subset case: one slug is fully contained in the other. Usually a
+    # parent/child relationship (project + subproject, concept + variant),
+    # NOT a duplicate — skip auto-merge for non-people types.
+    is_subset = words1 < words2 or words2 < words1
+    if is_subset and type1 != "people":
         return False
 
     return True
@@ -91,6 +99,10 @@ def render_frontmatter(fm: dict) -> str:
 
 def merge_frontmatter(fm1: dict, fm2: dict) -> dict:
     merged = dict(fm1)
+    # Fill in any fields fm2 has that fm1 doesn't (or that fm1 left empty)
+    for k, v in fm2.items():
+        if k not in merged or not merged[k] or merged[k] in ("[]", '""', "''"):
+            merged[k] = v
     try:
         merged["source_count"] = str(int(fm1.get("source_count", 1)) + int(fm2.get("source_count", 1)))
     except ValueError:
