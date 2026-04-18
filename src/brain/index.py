@@ -38,23 +38,17 @@ def _first_sentence(text: str) -> str:
 
 
 def rebuild_index() -> None:
-    """Rebuild index.md from all entity files."""
+    """Rebuild index.md from all entity folders currently on disk."""
     sections = []
 
-    type_labels = {
-        "people": "People",
-        "clients": "Clients",
-        "projects": "Projects",
-        "domains": "Domains",
-        "decisions": "Decisions",
-        "issues": "Issues",
-        "insights": "Insights",
-        "evolutions": "Evolutions",
-    }
+    # Refresh runtime dict so newly-created folders show up.
+    config.ENTITY_TYPES.update(config._discover_entity_types())
+    type_keys = sorted(config.ENTITY_TYPES.keys())
 
-    for type_key, label in type_labels.items():
-        type_dir = config.ENTITY_TYPES.get(type_key)
-        if type_dir is None or not type_dir.exists():
+    for type_key in type_keys:
+        type_dir = config.ENTITY_TYPES[type_key]
+        label = type_key.replace("-", " ").title()
+        if not type_dir.exists():
             sections.append(f"## {label}\n_No entities yet._\n")
             continue
 

@@ -6,25 +6,26 @@ from pathlib import Path
 from brain.slugify import slugify, validate_slug
 import brain.config as config
 
-# Map plural type names (keys) to singular type names (frontmatter values)
-_TYPE_TO_FRONTMATTER_TYPE = {
+# Irregular plurals — used as frontmatter `type` values. For any other type
+# name, we fall back to stripping a trailing "s" if present, else use the
+# name as-is. Extraction picks these names freely, so this map only captures
+# the handful of irregular English plurals we seed the brain with.
+_IRREGULAR_SINGULAR = {
     "people": "person",
-    "clients": "client",
-    "projects": "project",
-    "domains": "domain",
-    "decisions": "decision",
-    "issues": "issue",
-    "insights": "insight",
-    "evolutions": "evolution",
 }
 
 
+def _singular_type(entity_type: str) -> str:
+    if entity_type in _IRREGULAR_SINGULAR:
+        return _IRREGULAR_SINGULAR[entity_type]
+    if entity_type.endswith("s") and len(entity_type) > 1:
+        return entity_type[:-1]
+    return entity_type
+
+
 def entity_path(entity_type: str, name: str) -> Path:
-    """Get the file path for an entity. Creates parent dir if needed."""
-    type_dir = config.ENTITY_TYPES.get(entity_type)
-    if type_dir is None:
-        raise ValueError(f"Unknown entity type: {entity_type}")
-    type_dir.mkdir(parents=True, exist_ok=True)
+    """Get the file path for an entity. Creates the type folder on demand."""
+    type_dir = config.get_or_create_type_dir(entity_type)
     slug = slugify(name)
     validate_slug(slug)
     return type_dir / f"{slug}.md"
@@ -55,7 +56,7 @@ def create_entity(
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     fm = {
-        "type": _TYPE_TO_FRONTMATTER_TYPE.get(entity_type, entity_type),
+        "type": _singular_type(entity_type),
         "name": name,
         "status": "current",
         "first_seen": now,
