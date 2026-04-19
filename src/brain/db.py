@@ -76,6 +76,29 @@ CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_entity USING fts5(
     name, aliases, summary, content='', tokenize='porter'
 );
+
+-- Free-form notes: anything in the vault that isn't `entities/`. Lives
+-- alongside facts so a single search query can hit both human-written
+-- markdown (e.g. `son dang o long xuyen.md`) and LLM-extracted facts.
+-- `path` is relative to BRAIN_DIR; `mtime` and `sha` form the change-detection
+-- ledger so the ingest walker only re-embeds what actually changed.
+CREATE TABLE IF NOT EXISTS notes (
+    id           INTEGER PRIMARY KEY,
+    path         TEXT NOT NULL UNIQUE,
+    title        TEXT NOT NULL,
+    body         TEXT NOT NULL,
+    mtime        REAL NOT NULL,
+    sha          TEXT NOT NULL,
+    last_indexed REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS notes_mtime_idx ON notes(mtime);
+
+-- Standalone (no `content=`) so plain DELETE/INSERT keep it in sync.
+-- External-content tables need `INSERT INTO fts_notes(fts_notes,rowid)
+-- VALUES('delete',rowid)` for removal which we don't use.
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(
+    title, body, path, tokenize='porter'
+);
 """
 
 _SOURCE_RE = re.compile(r"\(source:\s*([^,)]+?)(?:,\s*([\d-]+))?\s*\)")
@@ -283,6 +306,83 @@ def rebuild() -> dict:
     return counts
 
 
+# ---------------------------------------------------------------------------
+# Notes — second ingestion path, for any markdown file outside entities/
+# ---------------------------------------------------------------------------
+
+def upsert_note(rel_path: str, title: str, body: str, mtime: float, sha: str) -> int:
+    """Insert or replace a single note row + its FTS shadow. Returns note id."""
+    import time as _time
+
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM notes WHERE path = ?", (rel_path,))
+        row = cur.fetchone()
+        if row:
+            note_id = row[0]
+            cur.execute(
+                """UPDATE notes SET title=?, body=?, mtime=?, sha=?, last_indexed=?
+                   WHERE id=?""",
+                (title, body, mtime, sha, _time.time(), note_id),
+            )
+            cur.execute("DELETE FROM fts_notes WHERE rowid=?", (note_id,))
+        else:
+            cur.execute(
+                """INSERT INTO notes(path, title, body, mtime, sha, last_indexed)
+                   VALUES (?,?,?,?,?,?)""",
+                (rel_path, title, body, mtime, sha, _time.time()),
+            )
+            note_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO fts_notes(rowid, title, body, path) VALUES (?,?,?,?)",
+            (note_id, title, body, rel_path),
+        )
+    return note_id
+
+
+def delete_note_by_path(rel_path: str) -> None:
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM notes WHERE path=?", (rel_path,))
+        row = cur.fetchone()
+        if not row:
+            return
+        nid = row[0]
+        cur.execute("DELETE FROM fts_notes WHERE rowid=?", (nid,))
+        cur.execute("DELETE FROM notes WHERE id=?", (nid,))
+
+
+def list_note_ledger() -> dict[str, tuple[float, str]]:
+    """Return {path: (mtime, sha)} for the diff walker."""
+    with connect() as conn:
+        rows = conn.execute("SELECT path, mtime, sha FROM notes").fetchall()
+    return {p: (m, s) for p, m, s in rows}
+
+
+def search_notes(query: str, k: int = 10) -> list[dict]:
+    safe_q = _sanitize_fts(query)
+    if not safe_q:
+        return []
+    sql = """
+      SELECT n.title, n.path, n.body, n.mtime, bm25(fts_notes) AS score
+      FROM fts_notes
+      JOIN notes n ON n.id = fts_notes.rowid
+      WHERE fts_notes MATCH ?
+      ORDER BY score
+      LIMIT ?
+    """
+    with connect() as conn:
+        rows = conn.execute(sql, (safe_q, k)).fetchall()
+    cols = ["title", "path", "body", "mtime", "score"]
+    out = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        # snippet: first ~200 chars of body so callers don't drown in long notes
+        d["snippet"] = (d["body"] or "")[:200]
+        out.append(d)
+    return out
+
+
 def search(query: str, k: int = 10, type: str | None = None) -> list[dict]:
     """BM25 fact search. Returns list of dicts joined to their entity."""
     safe_q = _sanitize_fts(query)
@@ -349,6 +449,9 @@ def main():
     se = sub.add_parser("entities", help="entity-name search")
     se.add_argument("query")
     se.add_argument("-k", type=int, default=10)
+    sn = sub.add_parser("notes", help="note search (vault root files)")
+    sn.add_argument("query")
+    sn.add_argument("-k", type=int, default=10)
     args = p.parse_args()
 
     if args.cmd == "rebuild":
@@ -361,6 +464,10 @@ def main():
     elif args.cmd == "entities":
         for r in search_entities(args.query, k=args.k):
             print(f"[{r['type']}] {r['name']}  — {r['summary']}")
+    elif args.cmd == "notes":
+        for r in search_notes(args.query, k=args.k):
+            print(f"[note] {r['title']}  ({r['path']})")
+            print(f"  {r['snippet']}")
 
 
 if __name__ == "__main__":

@@ -42,6 +42,8 @@ FACTS_NPY = VEC_DIR / "facts.npy"
 FACTS_JSON = VEC_DIR / "facts.json"
 ENT_NPY = VEC_DIR / "entities.npy"
 ENT_JSON = VEC_DIR / "entities.json"
+NOTES_NPY = VEC_DIR / "notes.npy"
+NOTES_JSON = VEC_DIR / "notes.json"
 META_JSON = VEC_DIR / "meta.json"
 
 # Small, fast, CPU-friendly. 384-d, ~80 MB, ~5 ms per query embedding on M-series.
@@ -138,6 +140,10 @@ def build() -> dict:
     np.save(ENT_NPY, ent_vecs)
     FACTS_JSON.write_text(json.dumps(fact_meta))
     ENT_JSON.write_text(json.dumps(ent_meta))
+
+    # Notes — second corpus, indexed alongside facts/entities.
+    note_count = _build_notes_full()
+
     META_JSON.write_text(
         json.dumps(
             {
@@ -146,6 +152,7 @@ def build() -> dict:
                 "built_at": time.time(),
                 "fact_count": len(fact_meta),
                 "entity_count": len(ent_meta),
+                "note_count": note_count,
                 "build_seconds": round(time.time() - t0, 2),
             },
             indent=2,
@@ -155,8 +162,106 @@ def build() -> dict:
     return {
         "facts": len(fact_meta),
         "entities": len(ent_meta),
+        "notes": note_count,
         "elapsed": round(time.time() - t0, 2),
     }
+
+
+def _build_notes_full() -> int:
+    """Full-rebuild the notes embedding store from the SQLite mirror."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT id, path, title, body FROM notes"
+        ).fetchall()
+
+    meta = [
+        {"id": r[0], "path": r[1], "title": r[2], "body": r[3]} for r in rows
+    ]
+    if not meta:
+        np.save(NOTES_NPY, np.zeros((0, DIM), dtype=np.float32))
+        NOTES_JSON.write_text(json.dumps([]))
+        return 0
+    # Embed title + truncated body (first 1500 chars). Long-tail content is
+    # still keyword-searchable via fts_notes; semantic captures the gist.
+    texts = [f"{m['title']}\n{m['body'][:1500]}" for m in meta]
+    vecs = _embed(texts)
+    np.save(NOTES_NPY, vecs)
+    NOTES_JSON.write_text(json.dumps(meta))
+    return len(meta)
+
+
+def update_notes(changed: list[tuple[str, str, str]],
+                 deleted_paths: list[str]) -> dict:
+    """Incremental update: re-embed only changed notes, drop deleted ones.
+
+    `changed` = [(rel_path, title, body), ...]
+    `deleted_paths` = [rel_path, ...]
+
+    Falls back to a full notes rebuild if the existing index is missing
+    (first run) or out of sync. Cheap when only a handful of files moved.
+    """
+    if not changed and not deleted_paths:
+        return {"changed": 0, "deleted": 0}
+
+    if not NOTES_NPY.exists() or not NOTES_JSON.exists():
+        n = _build_notes_full()
+        return {"changed": n, "deleted": 0, "full_rebuild": True}
+
+    vecs = np.load(NOTES_NPY)
+    meta = json.loads(NOTES_JSON.read_text())
+    by_path = {m["path"]: i for i, m in enumerate(meta)}
+
+    # Delete: drop rows from both arrays (mask).
+    drop_idx = {by_path[p] for p in deleted_paths if p in by_path}
+
+    # Update: re-embed changed (or new) rows.
+    new_texts = [f"{title}\n{body[:1500]}" for _, title, body in changed]
+    new_vecs = _embed(new_texts) if new_texts else np.zeros((0, DIM), dtype=np.float32)
+
+    keep_mask = np.array([i not in drop_idx for i in range(len(meta))], dtype=bool)
+
+    # Among the kept rows, replace any whose path appears in `changed`.
+    kept_meta = [meta[i] for i in range(len(meta)) if keep_mask[i]]
+    kept_vecs = vecs[keep_mask] if vecs.size else vecs
+
+    changed_paths = {rel for rel, _, _ in changed}
+    keep_after_replace_idx = [
+        i for i, m in enumerate(kept_meta) if m["path"] not in changed_paths
+    ]
+    final_meta = [kept_meta[i] for i in keep_after_replace_idx]
+    final_vecs = (
+        kept_vecs[keep_after_replace_idx]
+        if kept_vecs.size
+        else np.zeros((0, DIM), dtype=np.float32)
+    )
+
+    # Append updated rows at the end.
+    next_id = (max((m.get("id", 0) for m in final_meta), default=0) or 0) + 1
+    appended = [
+        {"id": next_id + i, "path": rel, "title": title, "body": body}
+        for i, (rel, title, body) in enumerate(changed)
+    ]
+    final_meta.extend(appended)
+    final_vecs = (
+        np.concatenate([final_vecs, new_vecs], axis=0)
+        if new_vecs.size
+        else final_vecs
+    )
+
+    np.save(NOTES_NPY, final_vecs.astype(np.float32))
+    NOTES_JSON.write_text(json.dumps(final_meta))
+
+    # Bump build_at so `status()` reflects freshness.
+    if META_JSON.exists():
+        try:
+            m = json.loads(META_JSON.read_text())
+        except Exception:
+            m = {}
+        m["built_at"] = time.time()
+        m["note_count"] = len(final_meta)
+        META_JSON.write_text(json.dumps(m, indent=2))
+
+    return {"changed": len(changed), "deleted": len(drop_idx)}
 
 
 def _is_stale(threshold_seconds: float = 6 * 3600) -> bool:
@@ -189,6 +294,16 @@ def _load_entities() -> tuple[np.ndarray, list[dict]]:
         ensure_built()
     vecs = np.load(ENT_NPY)
     meta = json.loads(ENT_JSON.read_text())
+    return vecs, meta
+
+
+def _load_notes() -> tuple[np.ndarray, list[dict]]:
+    if not NOTES_NPY.exists():
+        # Build only the notes side, not the whole vault — cheap when
+        # entities/facts indexes are already up to date.
+        _build_notes_full()
+    vecs = np.load(NOTES_NPY)
+    meta = json.loads(NOTES_JSON.read_text())
     return vecs, meta
 
 
@@ -230,6 +345,28 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
     return out
 
 
+def search_notes(query: str, k: int = 8) -> list[dict]:
+    """Pure-semantic search across user-authored vault notes."""
+    vecs, meta = _load_notes()
+    if vecs.shape[0] == 0:
+        return []
+    qv = _embed([query])[0]
+    hits = _topk(qv, vecs, k)
+    out = []
+    for i, score in hits:
+        m = meta[i]
+        out.append(
+            {
+                "kind": "note",
+                "title": m["title"],
+                "path": m["path"],
+                "snippet": (m.get("body") or "")[:200],
+                "score": score,
+            }
+        )
+    return out
+
+
 def search_entities(query: str, k: int = 8) -> list[dict]:
     vecs, meta = _load_entities()
     qv = _embed([query])[0]
@@ -248,28 +385,63 @@ def search_entities(query: str, k: int = 8) -> list[dict]:
 
 
 def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]:
-    """Reciprocal-Rank Fusion of BM25 (lexical) and dense (semantic) results.
+    """Reciprocal-Rank Fusion across four branches:
 
-    RRF score = Σ 1/(60 + rank_i). Pulls the top 2k from each branch so the
-    fused list has both strict-keyword hits AND meaning-based ones.
+      1. BM25 facts        (db.search)
+      2. Semantic facts    (search_facts)
+      3. BM25 notes        (db.search_notes)        ← user-written .md
+      4. Semantic notes    (search_notes)           ← user-written .md
+
+    Notes are skipped when `type` is set, since `type` filters entity
+    families (people/projects/…) that don't apply to free-form notes.
     """
     K = 60
     pool: dict[tuple, dict] = {}
     scores: dict[tuple, float] = defaultdict(float)
 
+    def _key_fact(hit):
+        return ("fact", hit["type"], hit["name"], hit.get("text", "")[:120])
+
+    def _key_note(hit):
+        return ("note", hit.get("path") or hit.get("title", ""))
+
     for rank, hit in enumerate(db.search(query, k=k * 2, type=type)):
-        key = (hit["type"], hit["name"], hit["text"][:120])
-        pool.setdefault(key, {**hit, "lexical_rank": rank})
+        key = _key_fact(hit)
+        pool.setdefault(key, {**hit, "kind": "fact", "lexical_rank": rank})
         scores[key] += 1.0 / (K + rank)
 
     for rank, hit in enumerate(search_facts(query, k=k * 2, type=type)):
-        key = (hit["type"], hit["name"], hit["text"][:120])
+        key = _key_fact(hit)
         existing = pool.get(key)
         if existing is None:
-            pool[key] = {**hit, "semantic_rank": rank}
+            pool[key] = {**hit, "kind": "fact", "semantic_rank": rank}
         else:
             existing["semantic_rank"] = rank
         scores[key] += 1.0 / (K + rank)
+
+    if not type:
+        for rank, hit in enumerate(db.search_notes(query, k=k * 2)):
+            key = _key_note(hit)
+            pool.setdefault(
+                key,
+                {
+                    "kind": "note",
+                    "title": hit["title"],
+                    "path": hit["path"],
+                    "snippet": hit.get("snippet", ""),
+                    "lexical_rank": rank,
+                },
+            )
+            scores[key] += 1.0 / (K + rank)
+
+        for rank, hit in enumerate(search_notes(query, k=k * 2)):
+            key = _key_note(hit)
+            existing = pool.get(key)
+            if existing is None:
+                pool[key] = {**hit, "semantic_rank": rank}
+            else:
+                existing["semantic_rank"] = rank
+            scores[key] += 1.0 / (K + rank)
 
     fused = [
         {**pool[k_], "rrf": scores[k_]}
@@ -300,8 +472,9 @@ def main():
     sp.add_argument("query")
     sp.add_argument("-k", type=int, default=8)
     sp.add_argument("--type", default=None)
-    sp.add_argument("--hybrid", action="store_true", help="RRF fusion with BM25")
+    sp.add_argument("--hybrid", action="store_true", help="RRF fusion across all branches")
     sp.add_argument("--entities", action="store_true", help="Search entity names")
+    sp.add_argument("--notes", action="store_true", help="Search user-written notes only")
 
     args = p.parse_args()
 
@@ -316,6 +489,8 @@ def main():
     elif args.cmd == "search":
         if args.entities:
             results = search_entities(args.query, k=args.k)
+        elif args.notes:
+            results = search_notes(args.query, k=args.k)
         elif args.hybrid:
             results = hybrid_search(args.query, k=args.k, type=args.type)
         else:

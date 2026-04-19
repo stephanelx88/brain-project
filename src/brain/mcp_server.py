@@ -93,6 +93,64 @@ def brain_get(type: str, name: str) -> str:
 
 
 @mcp.tool()
+def brain_notes(query: str, k: int = 8) -> str:
+    """Search user-written notes anywhere in the vault.
+
+    Returns notes that the user typed directly into Obsidian (anywhere
+    outside `entities/`). Results are hybrid (BM25 + semantic). The
+    filename and the first heading both count as the title — so a file
+    named `son dang o long xuyen.md` is findable even when its body is
+    empty.
+
+    Returns JSON list of {title, path, snippet, mtime}.
+    """
+    k = max(1, min(int(k), 25))
+    semantic.ensure_built()
+    # Prefer the lexical hit when present (exact filename matches), then
+    # backfill with semantic. Caller gets the union, deduped by path.
+    seen = set()
+    out = []
+    for hit in db.search_notes(query, k=k):
+        if hit["path"] in seen:
+            continue
+        seen.add(hit["path"])
+        out.append({
+            "title": hit["title"],
+            "path": hit["path"],
+            "snippet": hit["snippet"],
+            "mtime": hit["mtime"],
+        })
+    for hit in semantic.search_notes(query, k=k):
+        if hit["path"] in seen:
+            continue
+        seen.add(hit["path"])
+        out.append({
+            "title": hit["title"],
+            "path": hit["path"],
+            "snippet": hit["snippet"],
+            "score": hit["score"],
+        })
+        if len(out) >= k:
+            break
+    return json.dumps(out[:k], ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def brain_note_get(path: str) -> str:
+    """Return the full body of a vault note. `path` is relative to ~/.brain/."""
+    p = config.BRAIN_DIR / path
+    try:
+        # Resolve & confine to BRAIN_DIR — no escapes via ../..
+        p = p.resolve()
+        p.relative_to(config.BRAIN_DIR.resolve())
+    except (ValueError, OSError):
+        return json.dumps({"error": f"path outside vault: {path}"})
+    if not p.exists() or not p.is_file():
+        return json.dumps({"error": f"not found: {path}"})
+    return p.read_text(errors="replace")
+
+
+@mcp.tool()
 def brain_recent(hours: int = 48, type: str | None = None, k: int = 20) -> str:
     """List entities last_updated within the last N hours.
 
@@ -133,13 +191,19 @@ def brain_identity() -> str:
 
 @mcp.tool()
 def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
-    """Hybrid (BM25 + semantic) recall — recommended default.
+    """Hybrid (BM25 + semantic) recall — RECOMMENDED DEFAULT.
 
-    Use this whenever you would have used `brain_search`. Hybrid catches
-    paraphrases ("how do I avoid the freeze" → "dual-instance Mac freeze
-    prevention") AND exact-keyword hits in one ranked list.
+    Searches across BOTH:
+      - extracted facts/entities (`entities/<type>/*.md`)
+      - free-form notes anywhere else in the vault (e.g. a root file
+        named `son dang o long xuyen.md`)
 
-    Returns JSON list of {type,name,text,source,rrf} sorted by RRF score.
+    Catches paraphrases ("how do I avoid the freeze" → "dual-instance
+    Mac freeze prevention") AND exact-keyword/filename hits in one
+    ranked list.
+
+    Each result has a `kind` field of "fact" or "note" so you can tell
+    where it came from. Sorted by Reciprocal-Rank Fusion score.
     """
     k = max(1, min(int(k), 25))
     semantic.ensure_built()
