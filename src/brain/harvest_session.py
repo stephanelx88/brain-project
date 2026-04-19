@@ -6,32 +6,77 @@ sessions, and writes structured summaries to ~/.brain/raw/ for extraction.
 
 Called by the SessionStart hook in ~/.claude/settings.json.
 Runs on every new session — harvests whatever ended since last time.
+
+Incremental mode (the default now): a SQLite ledger at
+`~/.brain/.harvest.db` records `(session_id → (path, last_byte_offset,
+last_ingested_at))`. On each run we `seek()` to the recorded offset and
+process only new bytes — no more re-parsing 2000 finished sessions.
+
+The legacy `.harvested` file is still maintained (so the cleanup
+script keeps working), but the ledger is authoritative.
 """
 
 import json
 import os
+import sqlite3
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import brain.config as config
 
 BRAIN_RAW = config.RAW_DIR
 HARVESTED_FILE = config.BRAIN_DIR / ".harvested"
+LEDGER_DB = config.BRAIN_DIR / ".harvest.db"
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
-# Sessions shorter than this many user+assistant messages aren't worth capturing
 MIN_MESSAGES = 4
-
-# Only harvest sessions modified in the last N seconds (24 hours)
 MAX_AGE_SECONDS = 86400
-
-# Max chars per message to include
 MAX_MSG_CHARS = 3000
-
-# When truncating a tool_use input, how much of the JSON to show
 TOOL_INPUT_PREVIEW = 200
+
+
+@contextmanager
+def _ledger():
+    LEDGER_DB.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(LEDGER_DB)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS harvest_state (
+              session_id   TEXT PRIMARY KEY,
+              path         TEXT NOT NULL,
+              byte_offset  INTEGER NOT NULL DEFAULT 0,
+              last_seen    REAL NOT NULL
+           )"""
+    )
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_offset(session_id: str) -> int:
+    with _ledger() as conn:
+        row = conn.execute(
+            "SELECT byte_offset FROM harvest_state WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def set_offset(session_id: str, path: Path, offset: int) -> None:
+    with _ledger() as conn:
+        conn.execute(
+            """INSERT INTO harvest_state(session_id, path, byte_offset, last_seen)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(session_id) DO UPDATE SET
+                 path=excluded.path,
+                 byte_offset=excluded.byte_offset,
+                 last_seen=excluded.last_seen""",
+            (session_id, str(path), offset, time.time()),
+        )
 
 
 def load_harvested() -> list[str]:
@@ -48,10 +93,7 @@ def save_harvested(harvested: list[str]) -> None:
 
 
 def rotate_harvested(max_entries: int = 2000) -> int:
-    """Trim .harvested to at most max_entries, keeping the most recently added.
-
-    Returns the number of entries removed.
-    """
+    """Trim .harvested to at most max_entries, keeping the most recently added."""
     if not HARVESTED_FILE.exists():
         return 0
     lines = HARVESTED_FILE.read_text().strip().splitlines()
@@ -79,12 +121,34 @@ def get_session_id(jsonl_path: Path) -> str:
     return jsonl_path.stem
 
 
-def extract_messages(jsonl_path: Path) -> list[dict]:
-    """Extract user and assistant messages from a session JSONL."""
-    messages = []
-    with open(jsonl_path) as f:
-        for line in f:
-            line = line.strip()
+def extract_messages(jsonl_path: Path, start_offset: int = 0) -> tuple[list[dict], int]:
+    """Extract user/assistant messages from a session JSONL.
+
+    Returns (messages, new_byte_offset). If `start_offset` is non-zero we
+    `seek()` there first and only parse newly-appended bytes — so a long
+    session that's been harvested before only re-parses the latest turns.
+
+    A best-effort sanity check: if the file shrank below `start_offset`
+    (e.g. user truncated it manually), we restart from 0.
+    """
+    messages: list[dict] = []
+    file_size = jsonl_path.stat().st_size
+    if start_offset > file_size:
+        start_offset = 0
+    with open(jsonl_path, "rb") as fb:
+        # `start_offset` is always set by a previous tell() that landed on
+        # a newline boundary, so seeking there is safe — no need to drop
+        # a "partial" line. (If somebody edits the file by hand we may
+        # parse one slightly-mangled line; json.loads handles that.)
+        fb.seek(start_offset)
+        new_offset = fb.tell()
+        for raw_bytes in fb:
+            try:
+                line = raw_bytes.decode("utf-8", errors="replace").strip()
+            except Exception:
+                new_offset += len(raw_bytes)
+                continue
+            new_offset += len(raw_bytes)
             if not line:
                 continue
             try:
@@ -142,7 +206,7 @@ def extract_messages(jsonl_path: Path) -> list[dict]:
                 "timestamp": entry.get("timestamp"),
             })
 
-    return messages
+    return messages, new_offset
 
 
 def derive_project_name(jsonl_path: Path) -> str:
@@ -205,7 +269,19 @@ def is_active_session(session_id: str) -> bool:
 
 
 def harvest_all() -> int:
-    """Harvest all unprocessed, non-active sessions. Returns count harvested."""
+    """Harvest all unprocessed, non-active sessions. Returns count harvested.
+
+    Two-tier dedup:
+      1. SQLite ledger (`get_offset` / `set_offset`) — authoritative,
+         records *byte offset* so we resume long sessions incrementally.
+      2. Legacy `.harvested` text file — kept in sync so other tooling
+         (e.g. `brain.clean.clean_stale_harvested`) still works.
+
+    A session is harvested when:
+      - it's not currently active (PID still alive),
+      - its file mtime is within MAX_AGE_SECONDS, AND
+      - either it has no offset yet OR new bytes appeared since last run.
+    """
     harvested = load_harvested()
     seen = set(harvested)
     all_jsonls = find_all_session_jsonls()
@@ -220,27 +296,36 @@ def harvest_all() -> int:
     for jsonl_path in all_jsonls:
         session_id = get_session_id(jsonl_path)
 
-        # Skip already harvested
-        if session_id in seen:
-            continue
-
-        # Skip old sessions — only harvest recent ones
         try:
             mtime = jsonl_path.stat().st_mtime
-            if mtime < cutoff_time:
-                mark(session_id)  # mark old ones so we never re-check
-                continue
+            size = jsonl_path.stat().st_size
         except OSError:
             continue
 
-        # Skip currently active sessions (don't harvest our own session)
+        if mtime < cutoff_time:
+            mark(session_id)
+            continue
+
         if is_active_session(session_id):
             continue
 
-        messages = extract_messages(jsonl_path)
-        if len(messages) < MIN_MESSAGES:
-            # Not enough content — skip silently
+        prior_offset = get_offset(session_id)
+        if prior_offset >= size:
+            # already fully ingested; nothing new
             mark(session_id)
+            continue
+
+        messages, new_offset = extract_messages(jsonl_path, start_offset=prior_offset)
+        # Always advance the offset — even if this slice was too small —
+        # so we don't reread the same prefix forever.
+        set_offset(session_id, jsonl_path, new_offset)
+
+        if len(messages) < MIN_MESSAGES:
+            # Not enough new content this round; will try again when more
+            # bytes arrive. Mark as seen only if file is "complete enough"
+            # (no new content for a long time → mark to silence re-checks).
+            if prior_offset == 0 and (time.time() - mtime) > 3600:
+                mark(session_id)
             continue
 
         project_name = derive_project_name(jsonl_path)

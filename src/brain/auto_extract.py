@@ -122,10 +122,50 @@ def cleanup_file(raw_file: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# LLM call (claude CLI in print mode, haiku)
+# LLM call — two backends:
+#   1. Direct Anthropic SDK (when ANTHROPIC_API_KEY is set, ~3-5x faster
+#      because no subprocess + auth dance every call). Opt-in to keep
+#      offline/CLI-only setups working unchanged.
+#   2. claude CLI in print mode (default fallback).
 # ---------------------------------------------------------------------------
 
+ANTHROPIC_MODEL = os.environ.get("BRAIN_ANTHROPIC_MODEL", "claude-haiku-4-5")
+ANTHROPIC_MAX_TOKENS = int(os.environ.get("BRAIN_ANTHROPIC_MAX_TOKENS", "8192"))
+
+
+def _call_anthropic_sdk(prompt: str, timeout: int) -> str | None:
+    """Direct REST call via the anthropic SDK. Returns text or None."""
+    try:
+        import anthropic
+    except ImportError:
+        return None
+    try:
+        client = anthropic.Anthropic(timeout=timeout)
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=ANTHROPIC_MAX_TOKENS,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        # Concatenate all text blocks (typical: a single block).
+        out = []
+        for block in resp.content:
+            text = getattr(block, "text", None)
+            if text:
+                out.append(text)
+        return "".join(out).strip() if out else None
+    except Exception as exc:
+        print(f"anthropic SDK error: {exc}", file=sys.stderr)
+        return None
+
+
 def call_claude(prompt: str, timeout: int = LLM_TIMEOUT_SEC) -> str | None:
+    # Prefer the SDK when an API key is present — much lower per-call latency.
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        out = _call_anthropic_sdk(prompt, timeout)
+        if out is not None:
+            return out
+        # SDK failed (network, model name, etc.) — fall through to CLI.
+
     try:
         env = {**os.environ, "BRAIN_EXTRACTING": "1"}
         result = subprocess.run(
@@ -292,13 +332,20 @@ def main():
             print(f"  {sid} → {st}", flush=True)
 
     # one rebuild + one commit for the entire run
-    if any(st == "ok" for st in counts) or counts.get("ok", 0) > 0:
+    if counts.get("ok", 0) > 0:
         rebuild_index()
         # refresh the entity-name cache so the next run sees new entities
         try:
             CACHE_FILE.unlink()
         except FileNotFoundError:
             pass
+        # Refresh semantic index so MCP recall sees the new facts.
+        # Failure here is non-fatal — semantic is a perf layer, not source of truth.
+        try:
+            from brain import semantic
+            semantic.build()
+        except Exception as exc:
+            print(f"  semantic rebuild skipped: {exc}", flush=True)
         summary = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
         append_log("extract-batch", summary)
         commit(f"brain: batch extract — {summary}")

@@ -18,6 +18,7 @@ def test_harvest_then_extract_creates_entity(tmp_brain, sample_jsonl, monkeypatc
     # Point harvest_session at temp dirs
     monkeypatch.setattr(hs, "BRAIN_RAW", tmp_brain / "raw")
     monkeypatch.setattr(hs, "HARVESTED_FILE", tmp_brain / ".harvested")
+    monkeypatch.setattr(hs, "LEDGER_DB", tmp_brain / ".harvest.db")
     monkeypatch.setattr(hs, "PROJECTS_DIR", projects_dir)
     monkeypatch.setattr(hs, "CLAUDE_DIR", claude_dir)
 

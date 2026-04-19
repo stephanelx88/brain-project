@@ -79,9 +79,14 @@ def judge_pair(k1: str, k2: str) -> dict | None:
 def main():
     execute = "--execute" in sys.argv
 
+    import builtins
+    def say(*args, **kwargs):
+        kwargs.setdefault("flush", True)
+        builtins.print(*args, **kwargs)
+
     raw = find_possible_duplicates()
     if raw == "None found.":
-        print("No duplicates to judge.")
+        say("No duplicates to judge.")
         return
 
     all_pairs = []
@@ -91,29 +96,23 @@ def main():
             all_pairs.append(p)
 
     borderline = [p for p in all_pairs if not is_high_confidence(p)]
-    print(f"Borderline pairs needing LLM judgment: {len(borderline)}")
-    print()
+    say(f"Borderline pairs needing LLM judgment: {len(borderline)}")
+    say()
 
     merged = 0
     kept = 0
     failed = 0
     deleted_keys = set()
 
-    import sys as _sys
-    _orig_print = print
-    def print(*args, **kwargs):
-        kwargs.setdefault("flush", True)
-        _orig_print(*args, **kwargs)
-
     for i, (k1, k2) in enumerate(borderline, 1):
         if k1 in deleted_keys or k2 in deleted_keys:
-            print(f"[{i}/{len(borderline)}] skip (already processed): {k1} vs {k2}")
+            say(f"[{i}/{len(borderline)}] skip (already processed): {k1} vs {k2}")
             continue
 
         judgment = judge_pair(k1, k2)
         if not judgment:
             failed += 1
-            print(f"[{i}/{len(borderline)}] LLM FAIL: {k1} vs {k2}")
+            say(f"[{i}/{len(borderline)}] LLM FAIL: {k1} vs {k2}")
             continue
 
         dup = judgment.get("duplicate", False)
@@ -122,7 +121,7 @@ def main():
 
         if not dup:
             kept += 1
-            print(f"[{i}/{len(borderline)}] KEEP: {k1} vs {k2} — {reasoning}")
+            say(f"[{i}/{len(borderline)}] KEEP: {k1} vs {k2} — {reasoning}")
             continue
 
         canonical = k1 if canonical_label == "A" else k2
@@ -133,23 +132,23 @@ def main():
             if status == "merged":
                 deleted_keys.add(duplicate)
                 merged += 1
-                print(f"[{i}/{len(borderline)}] MERGE: keep={canonical} delete={duplicate} — {reasoning}")
+                say(f"[{i}/{len(borderline)}] MERGE: keep={canonical} delete={duplicate} — {reasoning}")
             else:
                 failed += 1
-                print(f"[{i}/{len(borderline)}] MERGE FAIL ({status}): {canonical} + {duplicate}")
+                say(f"[{i}/{len(borderline)}] MERGE FAIL ({status}): {canonical} + {duplicate}")
         else:
             merged += 1
-            print(f"[{i}/{len(borderline)}] would MERGE: keep={canonical} delete={duplicate} — {reasoning}")
+            say(f"[{i}/{len(borderline)}] would MERGE: keep={canonical} delete={duplicate} — {reasoning}")
 
-    print()
-    print(f"Merged: {merged}, kept distinct: {kept}, failed: {failed}")
+    say()
+    say(f"Merged: {merged}, kept distinct: {kept}, failed: {failed}")
 
     if execute and merged:
-        print("Rebuilding index...")
+        say("Rebuilding index...")
         rebuild_index()
-        print("Done.")
+        say("Done.")
     elif not execute:
-        print("Dry run. Re-run with --execute to apply.")
+        say("Dry run. Re-run with --execute to apply.")
 
 
 if __name__ == "__main__":

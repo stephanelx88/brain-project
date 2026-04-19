@@ -30,7 +30,7 @@ def test_extract_messages_with_write_tool_preserves_subsequent_text(tmp_path):
         }
     }
     jsonl_path.write_text(json.dumps(entry) + "\n")
-    messages = extract_messages(jsonl_path)
+    messages, _offset = extract_messages(jsonl_path)
     assert len(messages) == 1
     # The text "File created successfully." must appear in output
     assert "File created successfully." in messages[0]["text"]
@@ -45,10 +45,11 @@ def test_extract_messages_simple_text(tmp_path):
         {"type": "assistant", "message": {"content": "hi there"}, "timestamp": "2026-04-11T10:00:05Z"},
     ]
     jsonl_path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
-    messages = extract_messages(jsonl_path)
+    messages, offset = extract_messages(jsonl_path)
     assert len(messages) == 2
     assert messages[0]["text"] == "hello"
     assert messages[1]["text"] == "hi there"
+    assert offset == jsonl_path.stat().st_size
 
 
 def test_extract_messages_skips_non_user_assistant(tmp_path):
@@ -58,9 +59,38 @@ def test_extract_messages_skips_non_user_assistant(tmp_path):
         {"type": "user", "message": {"content": "hello"}},
     ]
     jsonl_path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
-    messages = extract_messages(jsonl_path)
+    messages, _offset = extract_messages(jsonl_path)
     assert len(messages) == 1
     assert messages[0]["role"] == "user"
+
+
+def test_extract_messages_incremental_resume(tmp_path):
+    """Resuming with start_offset only returns the newly-appended turns."""
+    jsonl_path = tmp_path / "session.jsonl"
+
+    first_batch = [
+        {"type": "user", "message": {"content": "first"}},
+        {"type": "assistant", "message": {"content": "ok"}},
+    ]
+    jsonl_path.write_text("\n".join(json.dumps(e) for e in first_batch) + "\n")
+
+    msgs1, off1 = extract_messages(jsonl_path)
+    assert len(msgs1) == 2
+    assert off1 == jsonl_path.stat().st_size
+
+    # Append more turns
+    with open(jsonl_path, "a") as f:
+        for e in [
+            {"type": "user", "message": {"content": "second"}},
+            {"type": "assistant", "message": {"content": "still here"}},
+        ]:
+            f.write(json.dumps(e) + "\n")
+
+    msgs2, off2 = extract_messages(jsonl_path, start_offset=off1)
+    assert len(msgs2) == 2
+    assert msgs2[0]["text"] == "second"
+    assert msgs2[1]["text"] == "still here"
+    assert off2 == jsonl_path.stat().st_size
 
 
 import brain.harvest_session as hs
