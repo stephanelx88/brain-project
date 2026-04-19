@@ -15,6 +15,21 @@
 
 set -euo pipefail
 
+# Optional flags
+ALLOW_SANDBOX=0
+for arg in "$@"; do
+  case "$arg" in
+    --allow-sandbox) ALLOW_SANDBOX=1 ;;
+    -h|--help)
+      sed -n '2,15p' "$0" | sed 's/^# \?//'
+      echo
+      echo "Flags:"
+      echo "  --allow-sandbox   override the HOME-mismatch safety check (advanced)"
+      exit 0
+      ;;
+  esac
+done
+
 # ──────────────────────────────────────────────────────────────────────
 # Detect environment
 # ──────────────────────────────────────────────────────────────────────
@@ -24,6 +39,27 @@ HOME_DIR="$HOME"
 USERNAME="${USER:-$(whoami)}"
 BRAIN_DIR="$HOME_DIR/.brain"
 TODAY="$(date +%Y-%m-%d)"
+
+# ──────────────────────────────────────────────────────────────────────
+# Pre-flight: refuse to run with a faked $HOME unless explicitly opted in.
+#
+# Why: pip install -e . is *per Python interpreter*, not per HOME. If you
+# point HOME at /tmp/sandbox to "test a fresh install", pip will happily
+# overwrite the editable install in your real Python — silently breaking
+# your existing brain. Discovered the hard way 2026-04-19.
+# ──────────────────────────────────────────────────────────────────────
+REAL_HOME="$(dscl . -read "/Users/$USERNAME" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+if [[ -n "$REAL_HOME" && "$REAL_HOME" != "$HOME_DIR" && "$ALLOW_SANDBOX" -ne 1 ]]; then
+  echo "✗ \$HOME ($HOME_DIR) does not match $USERNAME's real home ($REAL_HOME)."
+  echo
+  echo "  Running install.sh under a faked \$HOME will mutate the real Python's"
+  echo "  editable install of 'brain', silently breaking your live setup."
+  echo
+  echo "  If you really want to test a fresh-clone install in a sandbox:"
+  echo "    1. Use a separate Python (venv or pyenv-virtualenv), then"
+  echo "    2. HOME=/your/sandbox $0 --allow-sandbox"
+  exit 1
+fi
 
 OS="$(uname -s)"
 if [[ "$OS" != "Darwin" ]]; then
@@ -192,7 +228,20 @@ echo "      ✓ index ready"
 echo "[7/8] load launchd watcher"
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
-echo "      ✓ watcher live (1 s throttle on $BRAIN_DIR + ~/.claude/projects)"
+# launchctl load is asynchronous — the job may take a beat to appear in
+# `launchctl list`. Poll briefly so the success message is honest.
+LAUNCHD_LABEL="com.${USERNAME}.brain-auto-extract"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if launchctl list | grep -q "$LAUNCHD_LABEL"; then break; fi
+  sleep 0.3
+done
+if launchctl list | grep -q "$LAUNCHD_LABEL"; then
+  echo "      ✓ watcher live (1 s throttle on $BRAIN_DIR + ~/.claude/projects)"
+else
+  echo "      ✗ launchctl load returned 0 but '$LAUNCHD_LABEL' is not visible."
+  echo "        Check $PLIST then run: launchctl bootstrap gui/\$(id -u) $PLIST"
+  exit 1
+fi
 
 # ──────────────────────────────────────────────────────────────────────
 # 8. Doctor — verify everything green
