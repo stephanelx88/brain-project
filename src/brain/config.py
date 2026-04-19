@@ -7,9 +7,29 @@ Extraction is free to introduce new types; any folder under entities/ is a
 valid type at runtime.
 """
 
+import os
 from pathlib import Path
 
-BRAIN_DIR = Path.home() / ".brain"
+DEFAULT_BRAIN_DIR = Path.home() / ".brain"
+
+
+def _resolve_brain_dir() -> Path:
+    """Resolve the brain vault location.
+
+    Resolution order:
+      1. BRAIN_DIR environment variable (supports ~ and env expansion)
+      2. ~/.brain (default)
+
+    Users can point this at any folder — e.g. an existing Obsidian vault:
+        export BRAIN_DIR="/Users/son/Documents/brain-2/stephane-brain/brain-stephane"
+    """
+    raw = os.environ.get("BRAIN_DIR")
+    if raw:
+        return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+    return DEFAULT_BRAIN_DIR
+
+
+BRAIN_DIR = _resolve_brain_dir()
 IDENTITY_DIR = BRAIN_DIR / "identity"
 ENTITIES_DIR = BRAIN_DIR / "entities"
 TIMELINE_DIR = BRAIN_DIR / "timeline"
