@@ -16,6 +16,7 @@ dependencies = [
     "mcp>=1.10,<2.0",
     "sentence-transformers>=3.0,<5.0",
     "numpy>=1.26,<3.0",
+    "PyYAML>=6.0,<7.0",
 ]
 
 [project.optional-dependencies]
@@ -24,19 +25,25 @@ dependencies = [
 sdk = [
     "anthropic>=0.40,<2.0",
 ]
+# Interactive `brain init` wizard. Optional so headless installs can skip it.
+init = [
+    "questionary>=2.0,<3.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "questionary>=2.0,<3.0",
 ]
 
 [project.scripts]
+brain = "brain.cli:main"
 brain-mcp = "brain.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-brain = ["prompts/*.md"]
+brain = ["prompts/*.md", "presets/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

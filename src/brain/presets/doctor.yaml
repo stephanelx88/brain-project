@@ -1,0 +1,26 @@
+order: 2
+display_name: Doctor / clinician
+description: Patients, conditions, treatments, studies, colleagues
+entity_types:
+  - name: patients
+    hint: Anonymized patient records, key history points
+  - name: conditions
+    hint: Diseases, syndromes, presentations
+  - name: treatments
+    hint: Drugs, procedures, protocols and your notes on them
+  - name: studies
+    hint: Papers, trials, guidelines you have read
+  - name: colleagues
+    hint: Other physicians, nurses, specialists
+  - name: decisions
+    hint: Clinical reasoning logged for later review
+identity:
+  role_hint: Physician / specialty (e.g. cardiologist, GP)
+  field: Medicine
+  how_i_work:
+    - Evidence-based reasoning; cite the study or guideline
+    - Flag uncertainty explicitly; never guess on clinical facts
+    - Use anonymised identifiers for patients in this brain
+  what_matters:
+    - Patient safety > convenience
+    - Differential diagnosis discipline

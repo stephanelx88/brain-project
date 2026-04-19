@@ -1,0 +1,26 @@
+order: 1
+display_name: Software developer
+description: People, projects, codebases, technical decisions
+entity_types:
+  - name: people
+    hint: Engineers, teammates, contacts
+  - name: projects
+    hint: Products, repos, initiatives
+  - name: domains
+    hint: Technical knowledge areas (auth, infra, ml, ...)
+  - name: decisions
+    hint: Architecture & design choices with rationale
+  - name: issues
+    hint: Bugs, blockers, open questions
+  - name: insights
+    hint: Lessons learned, gotchas, patterns
+identity:
+  role_hint: Engineer / developer / tech lead
+  field: Software development
+  how_i_work:
+    - Direct, concise — no fluff
+    - Show diffs and exact paths, not vague descriptions
+    - Push back when an approach is wrong; expect the same in return
+  what_matters:
+    - Correctness over speed
+    - Readable code over clever code

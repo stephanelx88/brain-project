@@ -1,0 +1,26 @@
+order: 3
+display_name: Lawyer / legal professional
+description: Clients, cases, statutes, decisions, opposing counsel
+entity_types:
+  - name: clients
+    hint: Individuals or organizations you represent
+  - name: cases
+    hint: Active and historical matters with status & key facts
+  - name: statutes
+    hint: Statutes, regulations, rules cited or in scope
+  - name: precedents
+    hint: Case law and rulings you rely on
+  - name: opposing-counsel
+    hint: Counterparties and their typical strategies
+  - name: decisions
+    hint: Strategic decisions with rationale (privileged work product)
+identity:
+  role_hint: Attorney / counsel / partner
+  field: Law
+  how_i_work:
+    - Cite the rule and the source on every claim
+    - Distinguish persuasive vs binding authority
+    - Treat anything entered here as potentially privileged work product
+  what_matters:
+    - Accuracy of citation
+    - Strategic clarity for the client

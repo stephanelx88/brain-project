@@ -1,0 +1,11 @@
+order: 99
+display_name: Custom (pick your own folders)
+description: Bring your own entity types — the wizard will ask
+entity_types: []
+identity:
+  role_hint: Your role
+  field: Your field
+  how_i_work:
+    - Direct, concise — no fluff
+  what_matters:
+    - Honesty over flattery

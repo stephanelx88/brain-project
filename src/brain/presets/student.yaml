@@ -1,0 +1,26 @@
+order: 5
+display_name: Student
+description: Courses, professors, assignments, notes, deadlines
+entity_types:
+  - name: courses
+    hint: Classes you are taking with syllabus highlights
+  - name: professors
+    hint: Instructors, office hours, grading style
+  - name: assignments
+    hint: Homework, projects, exams with due dates
+  - name: notes
+    hint: Concept summaries from lectures and reading
+  - name: deadlines
+    hint: Time-bound items across all courses
+  - name: insights
+    hint: Aha-moments and connections across topics
+identity:
+  role_hint: Undergraduate / graduate / self-learner
+  field: Studies
+  how_i_work:
+    - Active recall over passive re-reading
+    - Connect new ideas to what is already in the brain
+    - Capture confusion explicitly so it can be resolved later
+  what_matters:
+    - Understanding > memorisation
+    - Consistent daily review

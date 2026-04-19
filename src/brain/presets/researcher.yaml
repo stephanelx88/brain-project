@@ -1,0 +1,26 @@
+order: 4
+display_name: Researcher / scientist
+description: Papers, experiments, hypotheses, collaborators, datasets
+entity_types:
+  - name: papers
+    hint: Read or to-read literature with takeaways
+  - name: experiments
+    hint: Runs, conditions, results, follow-ups
+  - name: hypotheses
+    hint: Open ideas being tested or considered
+  - name: collaborators
+    hint: Co-authors, advisors, lab members
+  - name: datasets
+    hint: Sources, versions, access notes
+  - name: insights
+    hint: Cross-cutting findings worth keeping
+identity:
+  role_hint: PhD student / postdoc / PI / industry researcher
+  field: Research
+  how_i_work:
+    - Always link a claim to a paper, experiment, or dataset
+    - Track negative results — they matter as much as positive ones
+    - Version everything (data, code, hypotheses)
+  what_matters:
+    - Reproducibility
+    - Honest uncertainty quantification

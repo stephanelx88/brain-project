@@ -1,148 +1,164 @@
-# brain
+# Brain
 
-Persistent memory for Claude Code & Cursor. Captures everything you write — Claude session transcripts, Obsidian notes, manual edits — and exposes it as MCP tools so the LLM has perfect recall in every future conversation.
+Persistent memory for Claude Code & Cursor. Captures what you learn across sessions — people, projects, decisions, insights — and exposes it back as MCP tools so the LLM can recall, search, and reason over your own history.
 
-```
-You write a note in Obsidian, or finish a Claude session.
-                ↓
-launchd watches ~/.brain/ and ~/.claude/projects/ (1 s throttle)
-                ↓
-harvest_session  →  ingest_notes  →  auto_extract (LLM)  →  reconcile
-                ↓
-SQLite + FTS5 (BM25) + numpy semantic vectors (multilingual MiniLM)
-                ↓
-brain MCP server  →  Claude/Cursor calls brain_recall("where is son")
-                ↓
-Hybrid BM25 + dense ranking with path-density re-ranking → instant answer
-```
+Works for any field. Pick a preset (developer, doctor, lawyer, researcher, student) or bring your own entity types.
 
-No commands to run. No slash prompts. Just install once.
-
-## Install
-
-Requires macOS, Python ≥ 3.11, and the [Claude Code](https://claude.ai/code) CLI.
+## Quick start
 
 ```bash
-git clone https://github.com/stephanelx88/brain-project ~/code/brain-project
+git clone https://github.com/<you>/brain-project ~/code/brain-project
 cd ~/code/brain-project
-bin/install.sh
+pip install -e '.[init]'
+brain init
 ```
 
-That's it. `install.sh` is idempotent — re-run it any time you edit a template or pull updates.
+`brain init` is one interactive prompt:
 
-What it does:
+```
+? What's your field?
+  ❯ Software developer  — people, projects, decisions, insights
+    Doctor              — patients, conditions, treatments, studies
+    Lawyer              — clients, cases, statutes, decisions
+    Researcher          — papers, experiments, hypotheses, datasets
+    Student             — courses, professors, assignments, notes
+    Custom              — pick your own folders
+```
 
-1. Picks the right Python (≥ 3.11), refuses to install if the project sits in `~/Desktop` / `~/Documents` / `~/Downloads` (macOS TCC blocks launchd from reading those).
-2. `pip install -e .` (editable, so source edits take effect immediately).
-3. Renders `templates/` into `~/.brain/bin/`, `~/Library/LaunchAgents/`, and `~/.claude/CLAUDE.md`.
-4. Seeds `~/.brain/identity/{who-i-am,preferences,corrections}.md` (only if missing — existing files are never overwritten).
-5. Downloads the multilingual embedding model (~120 MB, one-time).
-6. Registers the `brain` MCP server with Claude Code (`claude mcp add brain ...`).
-7. Builds the SQLite + semantic indexes.
-8. Loads the launchd watcher (1 s throttle on the vault + Claude project dir).
-9. Runs `bin/doctor.sh` — the install only succeeds if doctor reports green.
+It then collects your name + role, writes `~/.brain/brain-config.yaml`, seeds entity folders for the preset, renders `identity/who-i-am.md`, and delegates to `bin/install.sh` for the mechanical work — vault git init, MCP server registration, launchd watcher, embedding model download, and a final `bin/doctor.sh` health check.
 
-After install: **restart your Claude Code / Cursor session** so the MCP tools load.
+Restart Claude Code / Cursor afterwards to pick up the brain MCP tools.
 
-## Verify
+> macOS only for the auto-extract launchd watcher. The Python package itself is portable; PRs for `systemd-user` are welcome.
+
+## What you get
+
+```
+~/.brain/
+  brain-config.yaml      # preset, identity, llm provider
+  identity/              # who-i-am, preferences, corrections
+  entities/<type>/       # one .md per entity, folders match your preset
+  raw/                   # transient session summaries waiting for extraction
+  index.md               # auto-generated entity catalog
+  log.md                 # extraction log
+  bin/                   # rendered watcher + doctor scripts
+  logs/                  # auto-extract logs
+```
+
+The pipeline:
+
+```
+Claude / Cursor session  ──► launchd watcher
+                              │
+                              ▼
+                        harvest_session.py   (transcripts → ~/.brain/raw/)
+                              │
+                              ▼
+                        auto_extract.py      (LLM → entities/, index, log)
+                              │
+                              ▼
+                        reconcile + clean    (dedup, tidy)
+
+                Anywhere in your conversation, the LLM calls
+                  brain_recall · brain_search · brain_get · ...
+                via the brain MCP server, which reads the same
+                vault back as a SQLite + FTS5 + semantic mirror.
+```
+
+No slash commands. No memory of "did I save that?". You work normally; the brain captures and recalls.
+
+## CLI
+
+| Command | What it does |
+|---|---|
+| `brain init` | Interactive setup wizard (presets + identity + install) |
+| `brain init --preset doctor --yes` | Non-interactive setup |
+| `brain status` | Vault location + per-type entity counts |
+| `brain doctor` | Run `bin/doctor.sh` health check |
+| `brain config` | Print resolved `brain-config.yaml` |
+
+Lower-level entry points are still exposed for scripting:
 
 ```bash
-~/.brain/bin/doctor.sh
+python3 -m brain.harvest_session    # one-shot harvest of pending Claude sessions
+python3 -m brain.auto_extract       # one-shot extraction of pending raw files
+python3 -m brain.ingest_notes       # one-shot pickup of user-authored markdown
+python3 -m brain.mcp_server         # MCP stdio server (auto-registered by install.sh)
 ```
 
-Expected: `11 passed, 0 warnings, 0 failures`. Doctor catches every silent failure mode (stale install, launchd not loaded, MCP can't boot, semantic index missing, deletions not propagating).
+## Customising
 
-## Daily use
+### Pick different folders later
 
-Open Obsidian on `~/.brain/`. Write notes anywhere in there. They're searchable from your next prompt to Claude/Cursor within ~2 s.
+Re-run `brain init` and pick a different preset, or edit
+`~/.brain/brain-config.yaml`'s `entity_types:` list and create the
+matching folders:
 
-In Claude Code:
-
+```yaml
+entity_types:
+  - patients
+  - conditions
+  - treatments
 ```
-> where am I?
-[brain_recall called automatically]
-> Long Xuyen — per ~/.brain/Untitled 2.md, modified today.
+
+The discovery logic in `brain/config.py` picks up any folder under
+`entities/`, so manual edits work too.
+
+### Identity
+
+Edit `~/.brain/identity/who-i-am.md` (and `preferences.md`,
+`corrections.md`). The MCP `brain_identity` tool returns these on
+demand, and the install also wires them into `~/.claude/CLAUDE.md` so
+the LLM sees them at session start.
+
+### LLM provider
+
+`brain init` writes `llm_provider: claude` by default. Switch by
+editing `brain-config.yaml`:
+
+```yaml
+llm_provider: openai   # or: ollama
 ```
 
-The LLM knows to use the brain because `~/.claude/CLAUDE.md` (installed by `install.sh`) mandates `brain_recall` as the first action for any factual query.
-
-## MCP tools
-
-| Tool | Use for |
-|---|---|
-| `brain_recall` | **Default** — hybrid BM25+semantic across everything |
-| `brain_semantic` | Paraphrase / concept queries |
-| `brain_notes` | User-authored markdown notes only |
-| `brain_note_get` | Fetch full note body by path |
-| `brain_entities` | List extracted entities by type |
-| `brain_get` | Fetch one entity file by slug |
-| `brain_recent` | Last N entities/facts |
-| `brain_identity` | Who-I-am snapshot |
-| `brain_stats` | Counts |
+The extraction pipeline picks this up on the next run.
 
 ## Architecture
 
-| Component | What it does | Trigger |
-|---|---|---|
-| `harvest_session` | Tails `~/.claude/projects/*.jsonl`, writes `~/.brain/raw/session-*.md` | launchd, 1 s throttle |
-| `ingest_notes` | Walks `~/.brain/**/*.md`, mirrors to SQLite + FTS5 + semantic | launchd, 1 s throttle |
-| `auto_extract` | Sends raw sessions to Claude Haiku, extracts entities/facts | launchd, skipped during active session |
-| `reconcile` | Merges duplicate entities, regenerates `index.md` | launchd, skipped during active session |
-| `clean` | Removes empty entity files, dedups facts | launchd, 1 s throttle |
-| `mcp_server` | FastMCP server exposing tools, with synchronous embedding warm-up | spawned by Claude/Cursor on session start |
+```
+src/brain/
+  init.py             interactive wizard            (NEW)
+  cli.py              top-level `brain` dispatcher  (NEW)
+  presets/*.yaml      persona definitions           (NEW)
+  config.py           paths + entity-type discovery
+  harvest_session.py  scans Claude/Cursor session JSONLs → raw/
+  auto_extract.py     batched LLM extraction        (raw/ → entities/)
+  apply_extraction.py single source of truth for brain mutations
+  ingest_notes.py     auto-pickup of user-authored markdown
+  reconcile.py        conflict / duplicate sweep
+  clean.py            stale-data sweep + MOC regen
+  prefilter.py        strips low-signal tool noise from transcripts
+  db.py               SQLite + FTS5 mirror of the vault
+  semantic.py         sentence-transformer embeddings + RRF fusion
+  mcp_server.py       MCP stdio server exposing brain_* tools
+  entities.py         entity CRUD
+  index.py            rebuilds index.md
+  slugify.py          name → filesystem slug
+  log.py              append-only log
+  git_ops.py          stage + commit
+```
 
-State lives in:
-
-- `~/.brain/`              — your vault (markdown, git repo)
-- `~/.brain/.brain.db`      — SQLite cache (rebuildable from markdown)
-- `~/.brain/.vec/`          — numpy semantic vectors (rebuildable)
-- `~/.brain/.harvest.db`    — incremental session-byte-offset ledger
-- `~/.brain/raw/`           — pending session captures + new content
-- `~/.brain/logs/auto-extract.log` — what launchd has been doing
-
-## Troubleshooting
-
-| Symptom | First thing to check |
-|---|---|
-| Claude doesn't call `brain_recall` | `~/.claude/CLAUDE.md` exists and contains "Personal Brain — Mandatory Use". Restart session. |
-| `brain_recall` returns nothing | `~/.brain/.brain.db` exists, `doctor.sh` shows non-zero notes count. |
-| New note isn't searchable | `tail -f ~/.brain/logs/auto-extract.log` — should see `ingest_notes` runs every ~1–2 s. |
-| Deleted note still appears | Same as above — `ingest_notes` cleans the index on the next launchd cycle (~1–3 s). |
-| MCP tools missing in Claude UI | `claude mcp list` should show `brain ✔ connected`. If not: `bin/install.sh` re-runs the registration step. |
-| `ModuleNotFoundError: brain` in launchd log | Project is under `~/Desktop`/`~/Documents`/`~/Downloads`. Move to `~/code/` and re-run install. |
-| Slow first query (~10 s) | Embedding model wasn't cached. Re-run `install.sh` step 4, or set `BRAIN_WARMUP=1` (default). |
-
-When in doubt: `~/.brain/bin/doctor.sh`.
-
-## Uninstall
+## Testing
 
 ```bash
-~/code/brain-project/bin/uninstall.sh           # keeps your vault
-~/code/brain-project/bin/uninstall.sh --purge   # also deletes ~/.brain (asks confirmation)
+pip install -e '.[dev]'
+pytest -v
 ```
 
-## Layout
+## Cost
 
-```
-brain-project/
-├── bin/
-│   ├── install.sh        # 8-step idempotent installer
-│   ├── uninstall.sh      # symmetric teardown
-│   └── doctor.sh         # health check (also symlinked into ~/.brain/bin/)
-├── templates/            # rendered into per-machine paths by install.sh
-│   ├── scripts/auto-extract.sh.tmpl
-│   ├── launchd/brain-auto-extract.plist.tmpl
-│   ├── claude/CLAUDE.md.tmpl
-│   └── identity/{who-i-am,preferences,corrections}.md.tmpl
-├── src/brain/            # the actual python package
-│   ├── mcp_server.py     # FastMCP tools (brain_recall, brain_semantic, …)
-│   ├── semantic.py       # multilingual MiniLM + RRF + path-density re-rank
-│   ├── ingest_notes.py   # vault → SQLite mirror
-│   ├── harvest_session.py# Claude transcripts → ~/.brain/raw/
-│   └── auto_extract.py   # raw → entities via Claude Haiku
-├── tests/
-└── pyproject.toml
-```
+- Extraction uses your Claude SDK (sonnet by default — ~$0.001 per session).
+- Interactive sessions use whatever model you already pay for (Claude Max / Pro / API).
+- Local embedding model is `paraphrase-multilingual-MiniLM-L12-v2` (~120 MB, downloaded once).
 
 ## License
 
