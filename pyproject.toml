@@ -1,7 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "brain"
 version = "0.1.0"
+description = "Persistent memory system for Claude Code / Cursor — autonomous extraction, hybrid (BM25+semantic) recall, exposed as MCP tools."
 requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "brain contributors" }]
+
+# Pinned to versions verified working in production. Bump deliberately.
+dependencies = [
+    "mcp>=1.10,<2.0",
+    "sentence-transformers>=3.0,<5.0",
+    "numpy>=1.26,<3.0",
+]
+
+[project.optional-dependencies]
+# Direct Anthropic SDK is faster than shelling out to `claude --print`, but
+# the system works either way — the SDK is auto-detected at runtime.
+sdk = [
+    "anthropic>=0.40,<2.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+brain-mcp = "brain.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

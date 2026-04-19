@@ -46,20 +46,30 @@ NOTES_NPY = VEC_DIR / "notes.npy"
 NOTES_JSON = VEC_DIR / "notes.json"
 META_JSON = VEC_DIR / "meta.json"
 
-# Small, fast, CPU-friendly. 384-d, ~80 MB, ~5 ms per query embedding on M-series.
-DEFAULT_MODEL = os.environ.get("BRAIN_EMBED_MODEL", "all-MiniLM-L6-v2")
+# Multilingual by default — Vietnamese / Spanish / Chinese queries return real
+# semantic matches, not just lucky-keyword hits. Same 384-d output as the
+# English-only MiniLM, so the .npy layout is unchanged. ~120 MB, ~6 ms/query.
+# Override with BRAIN_EMBED_MODEL=all-MiniLM-L6-v2 for English-only / smaller.
+DEFAULT_MODEL = os.environ.get(
+    "BRAIN_EMBED_MODEL", "paraphrase-multilingual-MiniLM-L12-v2"
+)
 DIM = 384
 
 _model = None  # lazy-loaded sentence-transformers model
+_model_lock = __import__("threading").Lock()
 
 
 def _get_model():
+    """Load the embedding model. Thread-safe: a background warmup thread
+    and the first real query may race; the lock makes sure we pay the
+    ~7 s torch-import + weights-load exactly once."""
     global _model
-    if _model is None:
-        # Import lazy because sentence-transformers pulls torch (slow startup).
-        from sentence_transformers import SentenceTransformer
-
-        _model = SentenceTransformer(DEFAULT_MODEL)
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            from sentence_transformers import SentenceTransformer
+            _model = SentenceTransformer(DEFAULT_MODEL)
     return _model
 
 
@@ -443,10 +453,42 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
                 existing["semantic_rank"] = rank
             scores[key] += 1.0 / (K + rank)
 
-    fused = [
-        {**pool[k_], "rrf": scores[k_]}
-        for k_ in sorted(pool, key=lambda x: -scores[x])
-    ]
+    # Re-rank step: punish low-signal-density meta files and reward short,
+    # specific notes. Without this the auto-generated `index.md`, every
+    # `_MOC.md`, and the always-touched `identity/*.md` files dominate any
+    # query that mentions Son or a known entity, burying the real answer.
+    META_PENALTY_PATHS = {"index.md", "log.md"}
+    def _path_penalty(path: str) -> float:
+        if not path:
+            return 1.0
+        if path in META_PENALTY_PATHS:
+            return 0.4               # the catch-all index/log files
+        name = path.rsplit("/", 1)[-1]
+        if name.startswith("_") and name.endswith("_MOC.md"):
+            return 0.5               # auto-generated maps-of-content
+        if path.startswith("identity/"):
+            return 0.7               # useful but answers a different question
+        return 1.0
+
+    def _density_boost(hit: dict) -> float:
+        # Short notes carry concentrated signal — reward up to +50%.
+        snippet = hit.get("snippet") or hit.get("text") or ""
+        n = len(snippet)
+        if n == 0:
+            return 1.3               # filename-only notes (e.g. `Son location.md`)
+        if n < 200:
+            return 1.3
+        if n < 800:
+            return 1.1
+        return 1.0
+
+    fused = []
+    for k_ in pool:
+        hit = pool[k_]
+        path = hit.get("path", "")
+        adj = scores[k_] * _path_penalty(path) * _density_boost(hit)
+        fused.append({**hit, "rrf": adj})
+    fused.sort(key=lambda x: -x["rrf"])
     return fused[:k]
 
 

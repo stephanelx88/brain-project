@@ -32,6 +32,25 @@ from brain import db, semantic
 mcp = FastMCP("brain")
 
 
+def _warmup() -> None:
+    """Pre-load the embedding model + run one dummy encode so the first
+    real `brain_recall` call doesn't pay the ~7 s cold-start (torch import
+    + model weights + first-encode JIT). Runs synchronously before
+    mcp.run() so the model is in RAM by the time Claude's first tool call
+    lands. Adds ~7 s to server boot, but boot happens before the user
+    types — so it's invisible.
+
+    Set BRAIN_WARMUP=0 to disable (useful for tests / fast-start dev)."""
+    import os
+    if os.environ.get("BRAIN_WARMUP", "1") == "0":
+        return
+    try:
+        semantic.ensure_built()
+        semantic._embed(["warmup"])
+    except Exception:
+        pass
+
+
 @mcp.tool()
 def brain_search(query: str, k: int = 8, type: str | None = None) -> str:
     """BM25 fact search across the brain.
@@ -248,6 +267,7 @@ def identity_resource() -> str:
 
 
 def main():
+    _warmup()
     mcp.run()
 
 

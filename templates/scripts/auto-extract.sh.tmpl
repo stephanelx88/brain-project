@@ -1,0 +1,59 @@
+#!/bin/bash
+# Brain auto-extract — generated from templates/scripts/auto-extract.sh.tmpl by
+# bin/install.sh. Edit the template, not this file (it gets overwritten).
+#
+# Two guards against the dual-instance Mac freeze (incident 2026-04-11):
+#   1. flock singleton — never overlap two launchd runs
+#   2. active-session check — skip the LLM-calling stages while Claude Code
+#      is actively writing to ~/.claude/projects/
+
+set -euo pipefail
+
+export PATH="{{HOME}}/.local/bin:{{HOME}}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+export PYTHONPATH="{{PROJECT_DIR}}/src${PYTHONPATH:+:$PYTHONPATH}"
+PYTHON="{{PYTHON}}"
+
+LOG_DIR="{{HOME}}/.brain/logs"
+mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/auto-extract.log"
+LOCKDIR="{{HOME}}/.brain/.extract.lock.d"
+
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  if [[ -f "$LOCKDIR/pid" ]] && kill -0 "$(cat "$LOCKDIR/pid" 2>/dev/null)" 2>/dev/null; then
+    echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) SKIP: prior extract still running ===" >> "$LOG"
+    exit 0
+  fi
+  rm -rf "$LOCKDIR"
+  mkdir "$LOCKDIR"
+fi
+echo $$ > "$LOCKDIR/pid"
+trap 'rm -rf "$LOCKDIR"' EXIT
+
+# Idle-time guard: only the LLM-calling stages skip when a Claude Code session
+# was actively typing in the last IDLE_THRESHOLD seconds. Pure-Python stages
+# always run — they don't spawn `claude --print` so they can't trigger the
+# dual-instance freeze, and we need them to keep the index fresh while you work.
+IDLE_THRESHOLD=180
+NEWEST=$(find "{{HOME}}/.claude/projects" -name "*.jsonl" -type f -print0 2>/dev/null \
+  | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1)
+ACTIVE_SESSION=0
+if [[ -n "$NEWEST" ]] && (( $(date +%s) - NEWEST < IDLE_THRESHOLD )); then
+  ACTIVE_SESSION=1
+fi
+
+{
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) auto-extract run (active_session=$ACTIVE_SESSION) ==="
+  # Always-safe stages (pure Python, no LLM subprocess):
+  "$PYTHON" -m brain.harvest_session || echo "harvest exited $?"
+  "$PYTHON" -m brain.ingest_notes     || echo "ingest_notes exited $?"
+  "$PYTHON" -m brain.clean --execute  || echo "clean exited $?"
+
+  # LLM-calling stages — skip while a Claude session is actively writing.
+  if (( ACTIVE_SESSION == 0 )); then
+    "$PYTHON" -m brain.auto_extract     || echo "auto_extract exited $?"
+    "$PYTHON" -m brain.reconcile        || echo "reconcile exited $?"
+  else
+    echo "skip auto_extract+reconcile: active claude session (last write $(($(date +%s) - NEWEST))s ago)"
+  fi
+  echo ""
+} >> "$LOG" 2>&1

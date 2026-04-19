@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.{{USERNAME}}.brain-auto-extract</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{HOME}}/.brain/bin/auto-extract.sh</string>
+    </array>
+
+    <!-- Safety-net poll every 5 minutes. Day-to-day we run via WatchPaths. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Event-driven. The vault root + Claude project dir are watched so any
+         Obsidian save or session message triggers a run. -->
+    <key>WatchPaths</key>
+    <array>
+        <string>{{HOME}}/.brain</string>
+        <string>{{HOME}}/.brain/raw</string>
+        <string>{{HOME}}/.claude/projects</string>
+    </array>
+
+    <!-- 1 s throttle: pure-Python ingest is cheap (~50 ms idle). -->
+    <key>ThrottleInterval</key>
+    <integer>1</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/.brain/logs/launchd-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.brain/logs/launchd-stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}/.brain</string>
+</dict>
+</plist>
