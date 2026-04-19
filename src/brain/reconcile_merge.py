@@ -36,6 +36,10 @@ def entity_path(type_slug: str) -> Path:
     return ENTITY_TYPES[type_key] / f"{slug}.md"
 
 
+def _compact(slug: str) -> str:
+    return "".join(c for c in slug.lower() if c.isalnum())
+
+
 def is_high_confidence(pair: tuple[str, str]) -> bool:
     """Check if pair is safe to auto-merge."""
     k1, k2 = pair
@@ -45,6 +49,10 @@ def is_high_confidence(pair: tuple[str, str]) -> bool:
     words1 = set(slug1.split("-"))
     words2 = set(slug2.split("-"))
 
+    # Compact-equal slugs (`mover-os` vs `moveros`) are always safe to merge.
+    if _compact(slug1) == _compact(slug2):
+        return True
+
     sym_diff = words1.symmetric_difference(words2)
     if sym_diff & SPLITTING_WORDS:
         return False
@@ -53,9 +61,6 @@ def is_high_confidence(pair: tuple[str, str]) -> bool:
     if len(diff_numbers) >= 2:
         return False
 
-    # Subset case: one slug is fully contained in the other. Usually a
-    # parent/child relationship (project + subproject, concept + variant),
-    # NOT a duplicate — skip auto-merge for non-people types.
     is_subset = words1 < words2 or words2 < words1
     if is_subset and type1 != "people":
         return False
@@ -64,8 +69,18 @@ def is_high_confidence(pair: tuple[str, str]) -> bool:
 
 
 def pick_canonical(k1: str, k2: str) -> tuple[str, str]:
-    """Return (canonical, duplicate). Shorter slug wins; tiebreak alphabetical."""
+    """Return (canonical, duplicate).
+
+    For compact-equal pairs (`mover-os` vs `moveros`), prefer the
+    HYPHENATED version — it's more readable and aligns with the slug
+    convention. Otherwise: shorter slug wins; tiebreak alphabetical.
+    """
     s1, s2 = k1.split("/", 1)[1], k2.split("/", 1)[1]
+    if _compact(s1) == _compact(s2) and s1 != s2:
+        # Prefer the one with more hyphens (more word-segmented)
+        h1, h2 = s1.count("-"), s2.count("-")
+        if h1 != h2:
+            return (k1, k2) if h1 > h2 else (k2, k1)
     if len(s1) != len(s2):
         return (k1, k2) if len(s1) < len(s2) else (k2, k1)
     return (k1, k2) if s1 < s2 else (k2, k1)
@@ -97,9 +112,15 @@ def render_frontmatter(fm: dict) -> str:
     return "\n".join(lines)
 
 
-def merge_frontmatter(fm1: dict, fm2: dict) -> dict:
+def _parse_alias_list(raw: str) -> list[str]:
+    raw = (raw or "").strip().strip("[]")
+    if not raw:
+        return []
+    return [a.strip().strip("'\"") for a in raw.split(",") if a.strip()]
+
+
+def merge_frontmatter(fm1: dict, fm2: dict, *, dup_aliases: list[str] | None = None) -> dict:
     merged = dict(fm1)
-    # Fill in any fields fm2 has that fm1 doesn't (or that fm1 left empty)
     for k, v in fm2.items():
         if k not in merged or not merged[k] or merged[k] in ("[]", '""', "''"):
             merged[k] = v
@@ -113,6 +134,19 @@ def merge_frontmatter(fm1: dict, fm2: dict) -> dict:
     updates1, updates2 = fm1.get("last_updated", ""), fm2.get("last_updated", "")
     if updates1 and updates2:
         merged["last_updated"] = max(updates1, updates2)
+
+    # Roll the duplicate's name + slug + prior aliases into `aliases:`
+    aliases = set(_parse_alias_list(merged.get("aliases", "")))
+    aliases.update(_parse_alias_list(fm2.get("aliases", "")))
+    if dup_aliases:
+        aliases.update(dup_aliases)
+    name1 = (fm1.get("name") or "").strip()
+    name2 = (fm2.get("name") or "").strip()
+    if name2 and name2 != name1:
+        aliases.add(name2)
+    aliases = {a for a in aliases if a and a != name1}
+    if aliases:
+        merged["aliases"] = "[" + ", ".join(sorted(aliases)) + "]"
     return merged
 
 
@@ -142,7 +176,8 @@ def merge_pair(canonical: str, duplicate: str, execute: bool) -> str:
     fm1, body1 = split_frontmatter(canon_text)
     fm2, body2 = split_frontmatter(dup_text)
 
-    new_fm = merge_frontmatter(fm1, fm2)
+    dup_slug = duplicate.split("/", 1)[1]
+    new_fm = merge_frontmatter(fm1, fm2, dup_aliases=[dup_slug])
     new_body = merge_bodies(body1, body2)
     new_text = render_frontmatter(new_fm) + new_body
 
@@ -151,6 +186,13 @@ def merge_pair(canonical: str, duplicate: str, execute: bool) -> str:
 
     canon_path.write_text(new_text)
     dup_path.unlink()
+    # keep SQLite mirror in sync
+    try:
+        from brain.db import upsert_entity_from_file, delete_entity_by_path
+        upsert_entity_from_file(canon_path)
+        delete_entity_by_path(dup_path)
+    except Exception:
+        pass
     return "merged"
 
 

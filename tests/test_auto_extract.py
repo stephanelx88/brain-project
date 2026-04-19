@@ -50,26 +50,40 @@ def test_get_pending_files_returns_sorted_oldest_first(tmp_path, monkeypatch):
 
 
 def test_get_existing_index_compact(tmp_path, monkeypatch):
-    """Index should be sent as compact entity names only."""
+    """Cached entity-name list should be compact: section + bullet names only."""
     import brain.auto_extract as ae
     import brain.config as config
-    index_file = tmp_path / "index.md"
-    index_file.write_text(
-        "# Brain Index\n\n## People\n"
-        "- [[entities/people/alice.md|Alice Smith]] — Engineer at Acme\n"
-        "- [[entities/people/bob.md|Bob Jones]] — Manager at Acme\n"
-        "\n## Projects\n"
-        "- [[entities/projects/widget.md|Widget Project]] — Main product\n"
+
+    brain_dir = tmp_path / "brain"
+    entities_dir = brain_dir / "entities"
+    (entities_dir / "people").mkdir(parents=True)
+    (entities_dir / "projects").mkdir(parents=True)
+
+    (entities_dir / "people" / "alice-smith.md").write_text(
+        "---\ntype: person\nname: Alice Smith\n---\n\n# Alice Smith\n\nEngineer at Acme\n"
     )
-    monkeypatch.setattr(config, "INDEX_FILE", index_file)
+    (entities_dir / "people" / "bob-jones.md").write_text(
+        "---\ntype: person\nname: Bob Jones\n---\n\n# Bob Jones\n\nManager at Acme\n"
+    )
+    (entities_dir / "projects" / "widget.md").write_text(
+        "---\ntype: project\nname: Widget Project\n---\n\n# Widget Project\n\nMain product\n"
+    )
+
+    monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
+    monkeypatch.setattr(config, "ENTITIES_DIR", entities_dir)
+    monkeypatch.setattr(config, "INDEX_FILE", brain_dir / "index.md")
+    monkeypatch.setattr(
+        config,
+        "ENTITY_TYPES",
+        {"people": entities_dir / "people", "projects": entities_dir / "projects"},
+    )
+    monkeypatch.setattr(ae, "CACHE_FILE", brain_dir / ".entity-names.cache")
 
     result = get_existing_index()
-    # Should contain names but NOT descriptions
     assert "Alice Smith" in result
     assert "Bob Jones" in result
     assert "Widget Project" in result
     assert "Engineer at Acme" not in result
     assert "Main product" not in result
-    # Should contain section headers
-    assert "## People" in result
-    assert "## Projects" in result
+    assert "## people" in result
+    assert "## projects" in result

@@ -17,11 +17,17 @@ from brain.entities import (
     append_to_entity,
     create_entity,
     entity_exists,
+    entity_path,
 )
 from brain.git_ops import commit
 from brain.index import rebuild_index
 from brain.log import append_log
 from brain.slugify import slugify
+
+try:
+    from brain.db import upsert_entity_from_file  # write-through index
+except Exception:  # pragma: no cover - db is optional at first run
+    upsert_entity_from_file = None
 
 
 def _render_frontmatter_value(v) -> str:
@@ -39,12 +45,27 @@ def _render_frontmatter_value(v) -> str:
     return str(v)
 
 
+def _strip_existing_source_suffix(fact: str) -> str:
+    """Drop any trailing `(source: …)` annotations the LLM accidentally
+    added so we can attach a single canonical one ourselves."""
+    s = fact.strip()
+    while True:
+        i = s.rfind("(source:")
+        if i == -1:
+            return s
+        j = s.find(")", i)
+        if j == -1:
+            return s
+        s = (s[:i] + s[j + 1:]).rstrip()
+
+
 def _apply_entity(
     item: dict,
     source_label: str,
     now: str,
     created: list[str],
     updated: list[str],
+    touched_paths: set | None = None,
 ) -> None:
     """Apply one generic entity from the extraction payload."""
     entity_type = (item.get("type") or "").strip().lower()
@@ -52,7 +73,8 @@ def _apply_entity(
     if not entity_type or not name:
         return
 
-    facts = [str(f).strip() for f in item.get("facts", []) if str(f).strip()]
+    raw_facts = [str(f).strip() for f in item.get("facts", []) if str(f).strip()]
+    facts = [_strip_existing_source_suffix(f) for f in raw_facts]
     metadata = item.get("metadata") or {}
 
     fm = {}
@@ -66,18 +88,22 @@ def _apply_entity(
     is_new = bool(item.get("is_new"))
     exists = entity_exists(entity_type, name)
 
+    path = None
     if is_new or not exists:
         body = f"## Key Facts\n{facts_body}\n" if facts_body else ""
-        create_entity(entity_type, name, frontmatter=fm, body=body)
+        path = create_entity(entity_type, name, frontmatter=fm, body=body)
         created.append(f"{_singular_type(entity_type)}:{name}")
     elif facts_body:
         try:
-            append_to_entity(entity_type, name, "Key Facts", facts_body)
+            path = append_to_entity(entity_type, name, "Key Facts", facts_body)
             updated.append(f"{_singular_type(entity_type)}:{name}")
         except FileNotFoundError:
             body = f"## Key Facts\n{facts_body}\n"
-            create_entity(entity_type, name, frontmatter=fm, body=body)
+            path = create_entity(entity_type, name, frontmatter=fm, body=body)
             created.append(f"{_singular_type(entity_type)}:{name}")
+
+    if path is not None and touched_paths is not None:
+        touched_paths.add(path)
 
 
 def _apply_corrections(corrections: list[dict], source_label: str, now: str) -> None:
@@ -116,7 +142,13 @@ def _apply_corrections(corrections: list[dict], source_label: str, now: str) -> 
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
-def apply_extraction(extraction: dict, source_label: str) -> dict:
+def apply_extraction(
+    extraction: dict,
+    source_label: str,
+    *,
+    do_commit: bool = True,
+    do_rebuild_index: bool = True,
+) -> dict:
     """Apply an extraction payload to the brain.
 
     Expected payload shape:
@@ -124,18 +156,31 @@ def apply_extraction(extraction: dict, source_label: str) -> dict:
           "entities": [ {type, name, is_new, facts, metadata}, ... ],
           "corrections": [ {pattern, correction, rule}, ... ]
         }
+
+    Set `do_commit=False` and `do_rebuild_index=False` for batched callers
+    that want to apply many extractions and then commit/rebuild once at
+    the end. Returns created/updated lists plus the set of touched paths.
     """
     config.ensure_dirs()
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     created: list[str] = []
     updated: list[str] = []
+    touched: set = set()
 
     for entity in extraction.get("entities", []):
-        _apply_entity(entity, source_label, now, created, updated)
+        _apply_entity(entity, source_label, now, created, updated, touched)
 
     _apply_corrections(extraction.get("corrections", []), source_label, now)
 
-    rebuild_index()
+    if upsert_entity_from_file is not None:
+        for p in touched:
+            try:
+                upsert_entity_from_file(p)
+            except Exception as e:  # don't break extraction on db trouble
+                print(f"db write-through failed for {p}: {e}")
+
+    if do_rebuild_index:
+        rebuild_index()
 
     summary_parts = []
     if created:
@@ -145,10 +190,15 @@ def apply_extraction(extraction: dict, source_label: str) -> dict:
     summary = ", ".join(summary_parts) or "no changes"
     append_log("extract", f"{source_label} → {summary}")
 
-    entity_names = [e.split(":", 1)[1] for e in created + updated]
-    commit_msg = f"brain: extract from {source_label} — {summary}"
-    if entity_names:
-        commit_msg += f"\n\nEntities: {', '.join(entity_names[:10])}"
-    commit(commit_msg)
+    if do_commit:
+        entity_names = [e.split(":", 1)[1] for e in created + updated]
+        commit_msg = f"brain: extract from {source_label} — {summary}"
+        if entity_names:
+            commit_msg += f"\n\nEntities: {', '.join(entity_names[:10])}"
+        commit(commit_msg)
 
-    return {"created": created, "updated": updated}
+    return {
+        "created": created,
+        "updated": updated,
+        "touched_paths": [str(p) for p in touched],
+    }

@@ -82,11 +82,37 @@ def create_entity(
     return path
 
 
+_FACT_PREFIX = "- "
+
+
+def _normalize_fact(line: str) -> str:
+    """Strip leading bullet, source-suffix annotations, and whitespace.
+
+    Used as the dedup key so the same fact captured from two sessions
+    is recognised even when its `(source: …, date)` suffixes differ.
+    """
+    s = line.strip()
+    if s.startswith(_FACT_PREFIX):
+        s = s[len(_FACT_PREFIX):]
+    # Drop any number of trailing "(source: …)" annotations
+    while True:
+        i = s.rfind("(source:")
+        if i == -1:
+            break
+        j = s.find(")", i)
+        if j == -1:
+            break
+        s = (s[:i] + s[j + 1:]).strip()
+    return s.lower()
+
+
 def append_to_entity(entity_type: str, name: str, section: str, content: str) -> Path:
     """Append content to a section of an existing entity page.
 
-    If the section doesn't exist, creates it.
-    Also updates last_updated in frontmatter.
+    If the section doesn't exist, creates it. Skips fact lines whose
+    normalised body already exists in the file (dedup) — fixes the
+    double-source repetition bug. Also bumps `last_updated` and
+    `source_count` in frontmatter.
     """
     path = entity_path(entity_type, name)
     if not path.exists():
@@ -95,7 +121,25 @@ def append_to_entity(entity_type: str, name: str, section: str, content: str) ->
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     text = path.read_text()
 
-    # Update last_updated in frontmatter
+    existing_facts = {
+        _normalize_fact(line)
+        for line in text.split("\n")
+        if line.lstrip().startswith(_FACT_PREFIX)
+    }
+    new_lines = []
+    for line in content.split("\n"):
+        if not line.strip():
+            continue
+        key = _normalize_fact(line) if line.lstrip().startswith(_FACT_PREFIX) else None
+        if key and key in existing_facts:
+            continue
+        if key:
+            existing_facts.add(key)
+        new_lines.append(line)
+    if not new_lines:
+        return path
+    new_content = "\n".join(new_lines)
+
     lines = text.split("\n")
     updated_lines = []
     for line in lines:
@@ -111,17 +155,13 @@ def append_to_entity(entity_type: str, name: str, section: str, content: str) ->
             updated_lines.append(line)
     text = "\n".join(updated_lines)
 
-    # Find or create section
     section_header = f"## {section}"
     if section_header in text:
-        # Append after section header
         idx = text.index(section_header) + len(section_header)
-        # Find the end of the line
         next_newline = text.index("\n", idx)
-        text = text[:next_newline] + f"\n{content}" + text[next_newline:]
+        text = text[:next_newline] + f"\n{new_content}" + text[next_newline:]
     else:
-        # Add section at the end
-        text = text.rstrip() + f"\n\n{section_header}\n{content}\n"
+        text = text.rstrip() + f"\n\n{section_header}\n{new_content}\n"
 
     path.write_text(text)
     return path
