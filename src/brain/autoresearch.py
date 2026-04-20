@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -33,9 +34,76 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import brain.config as config
-from brain import db, semantic
-from brain.auto_extract import call_claude
+from brain import db, ingest_notes, recall_metric, semantic
+from brain.auto_extract import call_claude as _call_claude_default
 from brain.log import append_log
+
+
+# ---------------------------------------------------------------------------
+# Dedicated LLM caller for autoresearch.
+#
+# auto_extract.call_claude works for session extraction because the
+# extraction prompt is tiny + format-strict. Autoresearch prompts are
+# bigger and the brain's own MCP/CLAUDE.md keep tempting Claude to
+# "look it up via tools" instead of synthesizing from the inlined
+# context. We use --bare to skip CLAUDE.md + hooks, --tools "" to
+# disable tool calls outright, and --system-prompt to override the
+# default system prompt with one tailored for one-shot JSON synthesis.
+# ---------------------------------------------------------------------------
+
+AR_SYSTEM_PROMPT = (
+    "You are a one-shot JSON synthesis agent for a knowledge brain. "
+    "The user message contains ALL the context you need (entity cards, "
+    "facts, the spec excerpt). The brain MCP tools are NOT available "
+    "in this run; do not request them, do not refer to them. "
+    "Do NOT ask clarifying questions. Do NOT produce any prose "
+    "preamble. Read the user message, synthesize new playground items "
+    "from the inlined context, and respond with a SINGLE JSON object "
+    "matching the schema described in the user message. Begin your "
+    "output with `{` and end with `}`. Wrap in a ```json fence is OK "
+    "but optional."
+)
+
+
+def call_claude(prompt: str, timeout: int) -> str | None:
+    """CLI invocation tuned for one-shot JSON synthesis: full
+    --system-prompt override (replaces the default 'you are Claude
+    Code' system prompt that argues with our instructions) and
+    --tools '' so the model can't try to call brain MCP tools that
+    aren't wired into this run. CLAUDE.md is still discovered, but
+    with no system-prompt anchor it just becomes flavour text the
+    model can ignore."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return _call_claude_default(prompt, timeout=timeout)
+    try:
+        env = {**os.environ, "BRAIN_EXTRACTING": "1"}
+        result = subprocess.run(
+            [
+                "claude", "-p",
+                "--model", "haiku",
+                "--no-session-persistence",
+                "--system-prompt", AR_SYSTEM_PROMPT,
+                "--tools", "",
+            ],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        print(
+            f"claude exit={result.returncode} "
+            f"stderr={result.stderr[:300]!r}; falling back to default caller",
+            file=sys.stderr,
+        )
+        return _call_claude_default(prompt, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        print(f"claude call timed out after {timeout}s", file=sys.stderr)
+        return None
+    except FileNotFoundError:
+        return _call_claude_default(prompt, timeout=timeout)
 
 PROGRAM_MD = config.BRAIN_DIR / "program.md"
 QUEUE_MD = config.BRAIN_DIR / "research-queue.md"
@@ -262,17 +330,46 @@ def _build_cycle_prompt(question: str, program: Program, ctx: dict) -> str:
 
 def _parse_response(raw: str) -> dict | None:
     text = raw.strip()
-    if text.startswith("```"):
+    if not text:
+        return None
+    #  Drop fenced code blocks if present.
+    if "```" in text:
         text = "\n".join(l for l in text.split("\n") if not l.startswith("```"))
+    #  Walk forward to the first {…} balanced object so prose preambles
+    #  ("Sure, here is the JSON:") and SessionStart hook output don't
+    #  derail json.loads.
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        s, e = text.find("{"), text.rfind("}") + 1
-        if 0 <= s < e:
-            try:
-                return json.loads(text[s:e])
-            except json.JSONDecodeError:
-                return None
+        pass
+    s = text.find("{")
+    while s != -1:
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(s, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[s:i + 1]
+                    try:
+                        return json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break  # try next `{`
+        s = text.find("{", s + 1)
     return None
 
 
@@ -298,7 +395,9 @@ def _write_playground_item(cycle_n: int, item: dict) -> Path | None:
     refs = item.get("refs") or []
     confidence = item.get("confidence") or "low"
 
-    sub = PLAYGROUND / (kind + "s")  # insights, articles, etc
+    #  English plural rules — "hypothesis" → "hypotheses", others just +s.
+    plural = {"hypothesis": "hypotheses"}.get(kind, kind + "s")
+    sub = PLAYGROUND / plural
     sub.mkdir(parents=True, exist_ok=True)
     slug = _slugify(title)
     path = sub / f"{cycle_n:04d}-{slug}.md"
@@ -353,7 +452,17 @@ def _is_idle() -> bool:
 # one cycle
 # ---------------------------------------------------------------------------
 
-def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None = None) -> dict:
+def _refresh_index_after_writes() -> None:
+    """Re-ingest the vault so newly-written playground items are visible
+    to semantic.search_notes / hybrid_search on the next eval pass."""
+    try:
+        ingest_notes.ingest_all(verbose=False)
+    except Exception as exc:
+        print(f"refresh-index warn: {exc!r}", file=sys.stderr)
+
+
+def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None = None,
+              measure_metric: bool = True) -> dict:
     started = time.time()
     program = Program.load()
 
@@ -414,20 +523,58 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
         cycle_log.write_text("\n".join(log_lines))
         return {"status": "parse_fail", "cycle": cycle_n, "question": question}
 
+    # Pre-cycle metric (computed AFTER context gather so the slow embed
+    # cold-start happens once for both gather + score). Skip if the caller
+    # asked to (e.g. inside a long --cycles N run we score once at the
+    # outer loop's start, then incrementally between cycles).
+    pre = recall_metric.score_coverage(persist=False) if measure_metric else None
+
     written: list[str] = []
     for item in parsed.get("items", [])[:MAX_OUTPUT_FILES]:
         path = _write_playground_item(cycle_n, item)
         if path:
             written.append(str(path.relative_to(config.BRAIN_DIR)))
 
+    # Post-cycle metric: re-ingest so playground writes are searchable,
+    # then re-score the same eval set.
+    post = None
+    delta = None
+    if measure_metric:
+        if written:
+            _refresh_index_after_writes()
+        post = recall_metric.score_coverage(persist=True)
+        delta = recall_metric.diff_reports(pre, post)
+
     log_lines.append(f"**Summary:** {parsed.get('summary', '(none)')}")
     log_lines.append("")
-    metric = parsed.get("metric_estimate", {})
+    metric_self = parsed.get("metric_estimate", {})
     log_lines.append(
-        f"**Metric estimate:** {metric.get('kind_of_impact', '?')} — "
-        f"{metric.get('rationale', '?')}"
+        f"**Agent self-estimate:** {metric_self.get('kind_of_impact', '?')} — "
+        f"{metric_self.get('rationale', '?')}"
     )
     log_lines.append("")
+    if pre is not None and post is not None:
+        log_lines.append("## Coverage metric (val_bpb analog)")
+        log_lines.append("")
+        log_lines.append(f"- before: {pre.headline()}")
+        log_lines.append(f"-  after: {post.headline()}")
+        log_lines.append(
+            f"-  delta: {delta['score_delta']:+.4f}  "
+            f"({'IMPROVED' if delta['improved'] else 'no improvement'})"
+        )
+        if delta["flipped_to_hit"]:
+            log_lines.append(f"- newly answered ({len(delta['flipped_to_hit'])}):")
+            for q in delta["flipped_to_hit"]:
+                log_lines.append(f"  - {q}")
+        if delta["flipped_to_miss"]:
+            log_lines.append(f"- regressed ({len(delta['flipped_to_miss'])}):")
+            for q in delta["flipped_to_miss"]:
+                log_lines.append(f"  - {q}")
+        if delta["biggest_score_gains"]:
+            log_lines.append("- top score gains:")
+            for q, d in delta["biggest_score_gains"]:
+                log_lines.append(f"  - {d:+.3f}  {q}")
+        log_lines.append("")
     if written:
         log_lines.append(f"**Written ({len(written)}):**")
         for w in written:
@@ -442,10 +589,14 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
         _mark_queue_done(question)
 
     # research-log.md one-line summary
+    metric_str = (
+        f"score: {pre.score:.3f}->{post.score:.3f} (Δ{delta['score_delta']:+.3f})"
+        if pre is not None and post is not None else "score: n/a"
+    )
     line = (
         f"## [{_now()}] cycle-{cycle_n:04d} | "
         f"q: {question[:80]} | items: {len(written)} | "
-        f"impact: {metric.get('kind_of_impact', '?')}\n"
+        f"{metric_str}\n"
     )
     if not RESEARCH_LOG.exists():
         RESEARCH_LOG.write_text(
@@ -464,6 +615,13 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
         "question": question,
         "items_written": len(written),
         "duration_s": round(time.time() - started, 1),
+        "score_before": pre.score if pre is not None else None,
+        "score_after": post.score if post is not None else None,
+        "score_delta": delta["score_delta"] if delta is not None else None,
+        "avg_top_before": pre.avg_top_score if pre is not None else None,
+        "avg_top_after": post.avg_top_score if post is not None else None,
+        "newly_answered": delta["flipped_to_hit"] if delta is not None else [],
+        "regressed": delta["flipped_to_miss"] if delta is not None else [],
     }
 
 
@@ -472,20 +630,51 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
 # ---------------------------------------------------------------------------
 
 def run(cycles: int = 1, *, dry_run: bool = False, force_question: str | None = None,
-        respect_idle: bool = True) -> list[dict]:
+        respect_idle: bool = True, measure_metric: bool = True) -> list[dict]:
     if respect_idle and not _is_idle() and not dry_run:
         print(f"skip: claude session active in last {IDLE_THRESHOLD_S}s",
               file=sys.stderr)
         return []
     PLAYGROUND.mkdir(parents=True, exist_ok=True)
+
+    if measure_metric and not dry_run:
+        baseline = recall_metric.score_coverage(persist=True)
+        print(f"[autoresearch] BASELINE  {baseline.headline()}", file=sys.stderr)
+
     results = []
-    for _ in range(cycles):
+    for i in range(cycles):
         n = _next_cycle_number()
-        r = run_cycle(n, dry_run=dry_run, force_question=force_question)
-        print(json.dumps(r), file=sys.stderr)
+        r = run_cycle(n, dry_run=dry_run, force_question=force_question,
+                      measure_metric=measure_metric and not dry_run)
+        if r["status"] == "ok" and r.get("score_after") is not None:
+            arrow = "↓" if (r["score_delta"] or 0) < 0 else (
+                "↑" if (r["score_delta"] or 0) > 0 else "·")
+            avg_d = (r.get("avg_top_after") or 0) - (r.get("avg_top_before") or 0)
+            avg_arrow = "↑" if avg_d > 0 else ("↓" if avg_d < 0 else "·")
+            print(
+                f"[autoresearch] cycle {r['cycle']:>4}  "
+                f"items={r['items_written']}  "
+                f"miss-rate {r['score_before']:.3f}→{r['score_after']:.3f} "
+                f"({arrow}{abs(r['score_delta']):.3f})  "
+                f"avg-top {r.get('avg_top_before',0):.3f}→{r.get('avg_top_after',0):.3f} "
+                f"({avg_arrow}{abs(avg_d):.3f})  "
+                f"flipped+={len(r['newly_answered'])}/-={len(r['regressed'])}",
+                file=sys.stderr,
+            )
+        else:
+            print(json.dumps(r), file=sys.stderr)
         results.append(r)
         if r["status"] != "ok" and not dry_run:
             break
+
+    if results and measure_metric and not dry_run:
+        scores = [r.get("score_after") for r in results if r.get("score_after") is not None]
+        if scores:
+            print(
+                f"[autoresearch] FINAL trajectory: "
+                f"{baseline.score:.3f} → " + " → ".join(f"{s:.3f}" for s in scores),
+                file=sys.stderr,
+            )
     return results
 
 
@@ -497,12 +686,15 @@ def main() -> int:
                     help="override the queue/round-robin with a single question")
     ap.add_argument("--no-idle-check", action="store_true",
                     help="ignore the active-session guard")
+    ap.add_argument("--no-metric", action="store_true",
+                    help="skip the pre/post coverage scoring (faster)")
     args = ap.parse_args()
     res = run(
         cycles=args.cycles,
         dry_run=args.dry_run,
         force_question=args.question,
         respect_idle=not args.no_idle_check,
+        measure_metric=not args.no_metric,
     )
     if not res:
         return 1
