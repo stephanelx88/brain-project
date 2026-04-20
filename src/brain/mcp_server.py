@@ -21,13 +21,14 @@ SQLite + filesystem reads, sub-50ms).
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 import brain.config as config
-from brain import db, semantic
+from brain import db, harvest_session, semantic
 
 mcp = FastMCP("brain")
 
@@ -309,6 +310,178 @@ def brain_history(path: str, limit: int = 10) -> str:
     if cur:
         commits.append(cur)
     return json.dumps(commits, ensure_ascii=False, indent=2)
+
+
+def _claude_active_sessions() -> list[dict]:
+    """Claude sessions whose registered PID is still alive.
+
+    Mirrors the active-session check in `harvest_session.is_active_session`,
+    but returns the full set instead of yes/no for one ID. Reads from
+    `harvest_session.CLAUDE_DIR` so tests can monkeypatch one constant.
+    """
+    sessions_dir = harvest_session.CLAUDE_DIR / "sessions"
+    if not sessions_dir.exists():
+        return []
+    out: list[dict] = []
+    for f in sessions_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        sid = data.get("sessionId")
+        pid = data.get("pid")
+        cwd = data.get("cwd", "") or ""
+        if not sid or not pid:
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError, TypeError):
+            continue
+        out.append({"session_id": sid, "pid": int(pid), "cwd": cwd})
+    return out
+
+
+def _find_session_jsonl(session_id: str) -> Path | None:
+    """Resolve a session_id (Claude UUID, `cursor:<uuid>`, or bare Cursor
+    UUID) to its on-disk transcript jsonl. None if not found."""
+    want_cursor_only = session_id.startswith(harvest_session.CURSOR_PREFIX)
+    bare = session_id.split(":", 1)[-1]
+    candidates: list[Path] = []
+    if not want_cursor_only:
+        candidates.extend(harvest_session.find_all_session_jsonls())
+    try:
+        candidates.extend(harvest_session.find_cursor_session_jsonls())
+    except Exception:
+        pass
+    for p in candidates:
+        if p.stem == bare:
+            return p
+    return None
+
+
+@mcp.tool()
+def brain_live_sessions(active_within_sec: int = 300) -> str:
+    """List Claude Code + Cursor sessions that are alive *right now*.
+
+    Bypasses the harvest/extract pipeline (which is gated by 60-180 s
+    idle thresholds). Use this when you need to know what other LLM
+    windows are doing in real time — e.g. at session start to coordinate
+    with peers, or when the user asks "what else am I working on?".
+
+    Activity rule:
+      - Claude Code: PID recorded in ~/.claude/sessions/<pid>.json is alive.
+      - Cursor:      transcript jsonl mtime within `active_within_sec` s
+                     (Cursor exposes no PID file, so mtime is the proxy).
+
+    Returns JSON list of {source, session_id, project, cwd, last_write,
+    age_sec, path}, newest write first. Cursor `session_id`s come back
+    namespaced as `cursor:<uuid>` — pass them as-is to brain_live_tail.
+
+    Caps `active_within_sec` to [1, 86400].
+    """
+    window = max(1, min(int(active_within_sec), 86400))
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+
+    for cs in _claude_active_sessions():
+        jsonl = _find_session_jsonl(cs["session_id"])
+        last_write_iso = None
+        age = None
+        path_str = None
+        project = ""
+        if jsonl is not None:
+            try:
+                mtime = jsonl.stat().st_mtime
+                last_write_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+                age = int(now.timestamp() - mtime)
+                path_str = str(jsonl)
+                project = harvest_session.derive_project_name(jsonl)
+            except OSError:
+                pass
+        out.append({
+            "source": "claude",
+            "session_id": cs["session_id"],
+            "project": project,
+            "cwd": cs["cwd"],
+            "pid": cs["pid"],
+            "last_write": last_write_iso,
+            "age_sec": age,
+            "path": path_str,
+        })
+
+    cutoff = now.timestamp() - window
+    try:
+        cursor_jsonls = harvest_session.find_cursor_session_jsonls()
+    except Exception:
+        cursor_jsonls = []
+    for jsonl in cursor_jsonls:
+        try:
+            mtime = jsonl.stat().st_mtime
+        except OSError:
+            continue
+        if mtime < cutoff:
+            continue
+        out.append({
+            "source": "cursor",
+            "session_id": f"{harvest_session.CURSOR_PREFIX}{jsonl.stem}",
+            "project": harvest_session.derive_project_name(jsonl),
+            "cwd": None,
+            "pid": None,
+            "last_write": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+            "age_sec": int(now.timestamp() - mtime),
+            "path": str(jsonl),
+        })
+
+    out.sort(key=lambda r: r.get("age_sec") if r.get("age_sec") is not None else 10**9)
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def brain_live_tail(session_id: str, n: int = 20) -> str:
+    """Return the last N user/assistant turns of one live session.
+
+    Realtime read of the raw transcript — no LLM, no harvest, no idle
+    gating. Pair with brain_live_sessions to see what a peer window is
+    currently doing.
+
+    Args:
+      session_id: a Claude UUID, a `cursor:<uuid>` ID returned by
+                  brain_live_sessions, or a bare Cursor UUID. We try
+                  Claude first for bare IDs, then fall back to Cursor.
+      n: max turns to return (default 20, capped at 200).
+
+    Returns JSON {source, session_id, project, last_write, turns:
+    [{role, text, timestamp}]} or {error}.
+    """
+    n = max(1, min(int(n), 200))
+    session_id = (session_id or "").strip()
+    if not session_id:
+        return json.dumps({"error": "session_id is required"})
+
+    jsonl = _find_session_jsonl(session_id)
+    if jsonl is None:
+        return json.dumps({"error": f"session not found: {session_id}"})
+
+    try:
+        messages, _ = harvest_session.extract_messages(jsonl, start_offset=0)
+    except Exception as e:
+        return json.dumps({"error": f"failed to read transcript: {e}"})
+
+    try:
+        mtime = jsonl.stat().st_mtime
+        last_write = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+    except OSError:
+        last_write = None
+
+    source = "cursor" if str(jsonl).startswith(str(harvest_session.CURSOR_PROJECTS_DIR)) else "claude"
+    return json.dumps({
+        "source": source,
+        "session_id": session_id,
+        "project": harvest_session.derive_project_name(jsonl),
+        "last_write": last_write,
+        "turns": messages[-n:],
+        "total_turns": len(messages),
+    }, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
