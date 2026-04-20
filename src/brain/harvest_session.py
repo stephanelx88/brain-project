@@ -346,7 +346,7 @@ def format_session_summary(messages: list[dict], project_name: str, session_id: 
 def claude_active_sessions() -> list[dict]:
     """Return all Claude Code sessions whose registered PID is still alive.
 
-    Walks `CLAUDE_DIR / "sessions" / *.json` once and yields, for every entry
+    Walks `CLAUDE_DIR / "sessions" / *.json` once and returns, for every entry
     whose recorded PID responds to `os.kill(pid, 0)`, a dict of:
 
         {"session_id": str, "pid": int, "cwd": str}
