@@ -266,6 +266,44 @@ def brain_semantic(query: str, k: int = 8, type: str | None = None) -> str:
 
 
 @mcp.tool()
+def brain_live_coverage(days: int = 7, top_miss: int = 10) -> str:
+    """Rolling recall coverage computed from real MCP `brain_recall`
+    calls over the last `days`.
+
+    Unlike the synthetic eval-set score (which answers "does the brain
+    do well on the questions we told it would matter?"), this reflects
+    actual usage — the miss rate on whatever Son has been asking this
+    week. A high live miss rate means the brain is failing on real
+    queries and either needs new canonical entities or needs the eval
+    set expanded to capture those topics.
+
+    Returns JSON:
+      {
+        "window_days": 7,
+        "summary": { total_calls, hits, misses, score, avg_top, ... },
+        "top_miss_queries": [ { query, misses, hits, best_score,
+                                latest_hit }, ... ],
+      }
+
+    Use this at session start alongside `brain_audit()` to ask: "what's
+    the user's brain consistently failing to remember right now?".
+    """
+    days = max(1, min(int(days), 90))
+    top_miss = max(0, min(int(top_miss), 50))
+    try:
+        from brain import recall_metric
+        summary = recall_metric.live_coverage(days=days)
+        misses = recall_metric.top_miss_queries(days=days, n=top_miss)
+    except Exception as exc:
+        return json.dumps({"error": repr(exc)})
+    return json.dumps({
+        "window_days": days,
+        "summary": summary,
+        "top_miss_queries": misses,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
 def brain_history(path: str, limit: int = 10) -> str:
     """Return git commit history for one entity/note path.
 

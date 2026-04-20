@@ -301,6 +301,62 @@ def live_coverage(days: int = 7) -> dict:
     }
 
 
+def top_miss_queries(days: int = 7, n: int = 10) -> list[dict]:
+    """Group live-ledger misses by (normalized) query, return the worst
+    offenders within the last `days`.
+
+    Surfaces "what is the brain consistently failing to recall?" — the
+    queries that deserve either a canonical entity (write the answer
+    down) or an eval-set entry (make the miss loud). Each item:
+
+        { "query": str, "misses": int, "hits": int,
+          "best_score": float, "latest_hit": str | None }
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    groups: dict[str, dict] = {}
+    if not LEDGER.exists():
+        return []
+    for raw in LEDGER.read_text(errors="replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if row.get("kind") != "live":
+            continue
+        try:
+            t = datetime.strptime(row.get("ts", ""), "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            ).timestamp()
+        except ValueError:
+            continue
+        if t < cutoff:
+            continue
+        q = (row.get("query") or "").strip().lower()
+        if not q:
+            continue
+        g = groups.setdefault(q, {
+            "query": q, "misses": 0, "hits": 0,
+            "best_score": 0.0, "latest_hit": None,
+        })
+        score = float(row.get("top_score", 0.0))
+        if row.get("miss"):
+            g["misses"] += 1
+        else:
+            g["hits"] += 1
+        if score > g["best_score"]:
+            g["best_score"] = score
+            g["latest_hit"] = row.get("top_hit")
+    # Sort by miss count desc, then best_score asc (worst-performing first)
+    ranked = sorted(
+        (g for g in groups.values() if g["misses"] > 0),
+        key=lambda g: (-g["misses"], g["best_score"]),
+    )
+    return ranked[:n]
+
+
 def diff_reports(before: CoverageReport, after: CoverageReport) -> dict:
     """Compute a structured delta between two coverage reports run on the
     same eval set."""

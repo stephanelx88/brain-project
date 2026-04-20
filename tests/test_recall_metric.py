@@ -148,6 +148,44 @@ def _mk_report(scores: list[tuple[str, float, bool]]) -> recall_metric.CoverageR
     )
 
 
+def test_top_miss_queries_ranks_by_miss_count(fake_ledger):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = [
+        ("common-miss", 0.4, True),
+        ("common-miss", 0.42, True),
+        ("common-miss", 0.45, True),
+        ("occasional-miss", 0.5, True),
+        ("always-hits", 0.9, False),
+    ]
+    fake_ledger.write_text("\n".join(
+        json.dumps({"ts": now, "kind": "live", "query": q,
+                    "top_score": s, "miss": m}) for q, s, m in rows
+    ) + "\n")
+    out = recall_metric.top_miss_queries()
+    assert [r["query"] for r in out] == ["common-miss", "occasional-miss"]
+    assert out[0]["misses"] == 3
+    assert out[0]["best_score"] == 0.45
+
+
+def test_top_miss_queries_empty_when_no_misses(fake_ledger):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fake_ledger.write_text(
+        json.dumps({"ts": now, "kind": "live", "query": "ok",
+                    "top_score": 0.9, "miss": False}) + "\n"
+    )
+    assert recall_metric.top_miss_queries() == []
+
+
+def test_top_miss_queries_caps_at_n(fake_ledger):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fake_ledger.write_text("\n".join(
+        json.dumps({"ts": now, "kind": "live", "query": f"q{i}",
+                    "top_score": 0.3, "miss": True})
+        for i in range(20)
+    ) + "\n")
+    assert len(recall_metric.top_miss_queries(n=5)) == 5
+
+
 def test_diff_reports_flags_flipped_queries():
     before = _mk_report([("a", 0.5, True), ("b", 0.7, False)])
     after = _mk_report([("a", 0.75, False), ("b", 0.4, True)])
