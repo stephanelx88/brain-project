@@ -3,19 +3,30 @@
 Replaces the "preload index.md into the system prompt" model with
 on-demand retrieval. Tools:
 
-  brain_search(query, k, type)    → BM25 fact search across the vault
-  brain_entities(query, k)        → entity-name search (with summary)
-  brain_get(type, name)           → full entity card
-  brain_recent(hours, type)       → entities updated since cutoff
-  brain_identity()                → identity + active corrections
+  brain_search(query, k, type)         → BM25 fact search across the vault
+  brain_entities(query, k)             → entity-name search (with summary)
+  brain_get(type, name)                → full entity card
+  brain_notes(query, k)                → user-note search (BM25 + semantic)
+  brain_note_get(path)                 → full body of one vault note
+  brain_recent(hours, type, k)         → entities updated since cutoff
+  brain_identity()                     → identity + active corrections
+  brain_recall(query, k, type)         → hybrid fact + note search (RRF)
+  brain_semantic(query, k, type)       → pure semantic fact search
+  brain_history(path, limit)           → git commit history for one entity/note
+  brain_live_sessions(active_within_sec, include_self)
+                                       → live Claude/Cursor sessions
+  brain_live_tail(session_id, n)       → last N turns of one live session
+  brain_audit(limit)                   → top-N items needing a human decision
+  brain_status()                       → operational dashboard
+  brain_stats()                        → high-level counts
 
 Resources:
-  brain://identity                → the three identity markdown files
-  brain://entity/<type>/<slug>    → one entity file
+  brain://identity                     → the three identity markdown files
 
 Run as a stdio MCP server. Wire into ~/.claude/settings.json under
 `mcpServers`. Designed to be cheap to invoke (no model calls; pure
-SQLite + filesystem reads, sub-50ms).
+SQLite + filesystem reads, sub-50ms — except brain_recall/semantic
+which pay the embedding warmup, see _warmup() below).
 """
 
 from __future__ import annotations
@@ -42,7 +53,6 @@ def _warmup() -> None:
     types — so it's invisible.
 
     Set BRAIN_WARMUP=0 to disable (useful for tests / fast-start dev)."""
-    import os
     if os.environ.get("BRAIN_WARMUP", "1") == "0":
         return
     try:
