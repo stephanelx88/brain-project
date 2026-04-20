@@ -280,7 +280,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 0.3
 done
 if launchctl list | grep -q "$LAUNCHD_LABEL"; then
-  echo "      ✓ watcher live (1 s throttle on $BRAIN_DIR + ~/.claude/projects)"
+  echo "      ✓ watcher live (1 s throttle on $BRAIN_DIR + ~/.claude/projects + ~/.cursor/projects)"
 else
   echo "      ✗ launchctl load returned 0 but '$LAUNCHD_LABEL' is not visible."
   echo "        Check $PLIST then run: launchctl bootstrap gui/\$(id -u) $PLIST"
