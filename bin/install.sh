@@ -7,7 +7,7 @@
 #   3. ensure ~/.brain/ exists with seed dirs
 #   4. render templates → ~/.brain/bin/, identity/*, ~/Library/LaunchAgents/, ~/.claude/
 #   5. download embedding model (~120 MB, one-time)
-#   6. register the MCP server with Claude Code
+#   6. register the MCP server with Claude Code (and Cursor, if installed)
 #   7. load the launchd job
 #   8. run doctor.sh to verify everything green
 #
@@ -177,6 +177,11 @@ if [[ -f "$CLAUDE_MD" ]] && ! grep -q "Personal Brain — Mandatory Use" "$CLAUD
 fi
 render "$PROJECT_DIR/templates/claude/CLAUDE.md.tmpl" "$CLAUDE_MD"
 
+# Cursor has no global rules file — render a copy-paste-ready document
+# so the user can drop it into Cursor → Settings → Rules → User Rules.
+CURSOR_RULES="$BRAIN_DIR/cursor-user-rules.md"
+render "$PROJECT_DIR/templates/cursor/USER_RULES.md.tmpl" "$CURSOR_RULES"
+
 # Identity files: only seed if missing — never overwrite the user's own data.
 for name in who-i-am preferences corrections; do
   dst="$BRAIN_DIR/identity/$name.md"
@@ -200,19 +205,58 @@ print("      ✓ model cached")
 PY
 
 # ──────────────────────────────────────────────────────────────────────
-# 5. Register MCP server with Claude Code (idempotent)
+# 5. Register MCP server with Claude Code + Cursor (both idempotent)
 # ──────────────────────────────────────────────────────────────────────
-echo "[5/8] register MCP server with Claude Code"
+echo "[5/8] register MCP server with Claude Code + Cursor"
 if command -v claude >/dev/null 2>&1; then
   # `claude mcp add` errors if name exists — remove first to be idempotent.
   claude mcp remove brain -s user >/dev/null 2>&1 || true
   claude mcp add brain -s user \
     -e "PYTHONPATH=$PROJECT_DIR/src" \
     -- "$PYTHON" -m brain.mcp_server >/dev/null
-  echo "      ✓ registered"
+  echo "      ✓ Claude Code registered"
 else
-  echo "      ! 'claude' CLI not found — skipping. Install from claude.ai/code."
+  echo "      - 'claude' CLI not found — Claude Code skipped."
 fi
+
+# Cursor has no MCP CLI; merge into ~/.cursor/mcp.json by hand using Python
+# (already a hard dep). Preserves any sibling servers, backs up first.
+"$PYTHON" - "$PYTHON" "$PROJECT_DIR" <<'PY'
+import json, os, shutil, sys, time
+
+py, proj = sys.argv[1], sys.argv[2]
+home = os.path.expanduser("~")
+cursor_dir = os.path.join(home, ".cursor")
+cfg = os.path.join(cursor_dir, "mcp.json")
+
+if not os.path.isdir(cursor_dir):
+    print("      - ~/.cursor not found — Cursor skipped.")
+    sys.exit(0)
+
+data = {}
+if os.path.exists(cfg):
+    try:
+        with open(cfg) as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        print(f"      ! {cfg} is not valid JSON — Cursor skipped (fix manually).")
+        sys.exit(0)
+    shutil.copy2(cfg, f"{cfg}.bak.{time.strftime('%Y%m%d%H%M%S')}")
+
+servers = data.setdefault("mcpServers", {})
+servers["brain"] = {
+    "name": "brain",
+    "transport": "stdio",
+    "command": py,
+    "args": ["-m", "brain.mcp_server"],
+    "env": {"PYTHONPATH": os.path.join(proj, "src")},
+}
+
+with open(cfg, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print("      ✓ Cursor registered (~/.cursor/mcp.json)")
+PY
 
 # ──────────────────────────────────────────────────────────────────────
 # 6. Build the search index (so first query is instant)
@@ -251,7 +295,12 @@ echo
 if "$BRAIN_DIR/bin/doctor.sh"; then
   echo
   echo "── install complete ──────────────────────────────────"
-  echo "  Restart your Claude Code / Cursor session to pick up the brain MCP tools."
+  echo "  Restart Claude Code / Cursor to pick up the brain MCP tools."
+  echo
+  echo "  Cursor extra step (one-time): paste"
+  echo "    $BRAIN_DIR/cursor-user-rules.md"
+  echo "  into Cursor → Settings → Rules → User Rules."
+  echo
   echo "  Run anytime: $BRAIN_DIR/bin/doctor.sh"
   exit 0
 else

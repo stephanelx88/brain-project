@@ -1,0 +1,72 @@
+# Personal Brain — Mandatory Use (Cursor)
+
+{{USERNAME}} has a persistent memory system exposed as MCP tools served by
+the `brain` MCP server (registered in `~/.cursor/mcp.json`).
+**Use them. Do not read brain files manually.**
+
+> Cursor has no global rules file. Paste this entire document into
+> Cursor → Settings → Rules → **User Rules** so every chat session
+> picks it up.
+
+## Brain-first rule (MANDATORY, AUTONOMOUS)
+
+For **any** question about {{USERNAME}}, work, people, clients, projects,
+locations, preferences, decisions, issues, history, or "what do you know
+about X" — your **first action** is `brain_recall`. No asking, no warm-up,
+no file reads.
+
+```
+User asks anything personal/factual  →  call brain_recall(query)  →  then answer
+```
+
+If `brain_recall` returns nothing useful, escalate:
+1. `brain_notes(query)` — user-authored notes only
+2. `brain_entities(type=...)` — list extracted entities
+3. `brain_get(slug)` / `brain_note_get(path)` — fetch full file
+4. Only after all of the above return empty: say "the brain has no record of this."
+
+**Never** answer from training data or guesses for personal/factual questions
+about {{USERNAME}}. The brain is the source of truth.
+
+## Tools available
+
+| Tool | Use for |
+|---|---|
+| `brain_recall` | **Default** — hybrid BM25+semantic across everything |
+| `brain_semantic` | Paraphrase / concept queries |
+| `brain_notes` | User-authored markdown notes only |
+| `brain_note_get` | Fetch full note body by path |
+| `brain_entities` | List entities by type |
+| `brain_get` | Fetch one entity file by slug |
+| `brain_recent` | Last N entities/facts |
+| `brain_identity` | Who-I-am snapshot |
+| `brain_stats` | Counts |
+| `brain_audit` | Top-N items needing a human decision (contested / dedupe / low-conf) |
+
+## Session-start audit (surface, don't dump)
+
+Cursor has no SessionStart hook. On the **first user message of a fresh
+session**, call `brain_audit(limit=3)` once. If it returns items,
+acknowledge them in a single line at the top of your reply: e.g.
+*"FYI — your brain has 3 items pending review (1 contested, 2 merge
+candidates). Say `audit` if you want to walk through them."* Then
+proceed with the actual user request.
+
+Do not list every item, do not derail the user's task, do not nag on
+subsequent turns. If they ignore it, drop it. If they say "audit" /
+"show", call `brain_audit(limit=10)` and walk through them one at a time.
+
+## NEVER
+
+- Never read `{{HOME}}/.brain/*.md` with file tools when an MCP tool can answer.
+- Never run `brain.auto_extract` from a Cursor command — it calls Claude internally.
+
+## Architecture (FYI only)
+
+- **Harvest** (auto, launchd, ~1 s throttle): captures Claude/Cursor sessions → `{{HOME}}/.brain/raw/`
+- **Ingest notes** (auto): picks up user-authored markdown anywhere in `{{HOME}}/.brain/`
+- **Extract** (auto): LLM extracts entities → `{{HOME}}/.brain/entities/`
+- **Reconcile + clean** (auto): dedup, tidy
+- **MCP server** (`brain.mcp_server`): how you query all of the above
+
+Source: `{{PROJECT_DIR}}` · run `{{HOME}}/.brain/bin/doctor.sh` if anything seems off.

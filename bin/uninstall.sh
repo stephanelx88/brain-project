@@ -4,8 +4,10 @@
 # Removes:
 #   - launchd job + plist
 #   - Claude Code MCP registration
+#   - Cursor MCP registration (brain entry in ~/.cursor/mcp.json)
 #   - generated scripts in ~/.brain/bin/
 #   - generated CLAUDE.md (restoring backup if one exists)
+#   - generated cursor-user-rules.md
 #   - editable pip install
 #
 # Preserves (your data, on purpose):
@@ -51,18 +53,43 @@ if [[ -f "$PLIST" ]]; then
   echo "      ✓ removed $PLIST"
 fi
 
-echo "[2/5] Claude Code MCP"
+echo "[2/5] MCP registrations"
 if command -v claude >/dev/null 2>&1; then
   claude mcp remove brain -s user >/dev/null 2>&1 || true
-  echo "      ✓ deregistered"
+  echo "      ✓ Claude Code deregistered"
 else
   echo "      - claude CLI not installed; skip"
+fi
+
+if [[ -n "$PYTHON" && -x "$PYTHON" ]]; then
+  "$PYTHON" - <<'PY'
+import json, os, sys
+
+cfg = os.path.expanduser("~/.cursor/mcp.json")
+if not os.path.exists(cfg):
+    sys.exit(0)
+try:
+    with open(cfg) as f:
+        data = json.load(f)
+except json.JSONDecodeError:
+    print("      ! ~/.cursor/mcp.json not valid JSON; skip")
+    sys.exit(0)
+servers = data.get("mcpServers", {})
+if "brain" not in servers:
+    sys.exit(0)
+del servers["brain"]
+with open(cfg, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+print("      ✓ Cursor deregistered (~/.cursor/mcp.json)")
+PY
 fi
 
 echo "[3/5] generated files"
 rm -f "$BRAIN_DIR/bin/auto-extract.sh" \
       "$BRAIN_DIR/bin/doctor.sh" \
-      "$BRAIN_DIR/.brain.conf"
+      "$BRAIN_DIR/.brain.conf" \
+      "$BRAIN_DIR/cursor-user-rules.md"
 echo "      ✓ removed scripts + conf"
 
 CLAUDE_MD="$HOME/.claude/CLAUDE.md"
