@@ -539,9 +539,21 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
     # then re-score the same eval set.
     post = None
     delta = None
+    promoted_targets: list[str] = []
     if measure_metric:
         if written:
             _refresh_index_after_writes()
+        #  Auto-promote after the reindex so any item the agent just
+        #  wrote that meets the rule (confidence: high, ≥2 refs, ≤14d)
+        #  becomes a canonical entity *before* we re-score. Cap to 1
+        #  per cycle so a runaway cycle can't flood entities/.
+        if written and not dry_run:
+            try:
+                from brain import promote as _promote
+                promo = _promote.run(apply=True, limit=1)
+                promoted_targets = [p["target"] for p in promo.promoted]
+            except Exception as exc:
+                log_lines.append(f"- promote warn: {exc!r}")
         post = recall_metric.score_coverage(persist=True)
         delta = recall_metric.diff_reports(pre, post)
 
@@ -581,6 +593,11 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
             log_lines.append(f"- `{w}`")
     else:
         log_lines.append("**Written:** (none — agent decided no items worth filing)")
+    if promoted_targets:
+        log_lines.append("")
+        log_lines.append(f"**Promoted ({len(promoted_targets)}):**")
+        for t in promoted_targets:
+            log_lines.append(f"- `{t}`")
     log_lines.append("")
     log_lines.append(f"_Wall clock: {round(time.time() - started, 1)} s_")
     cycle_log.write_text("\n".join(log_lines))
