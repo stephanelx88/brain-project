@@ -54,7 +54,7 @@ import numpy as np
 
 import brain.config as config
 from brain import semantic
-from brain.entities import append_to_entity
+from brain.entities import append_to_entity_path
 from brain.git_ops import commit
 from brain.log import append_log
 
@@ -392,8 +392,12 @@ def apply_merge(cand: dict, verdict: dict) -> dict:
     facts_block = _facts_for_append(loser_body, loser.stem, now)
     if facts_block:
         try:
-            append_to_entity(cand["type"], _entity_name_from(winner),
-                             "Key Facts", facts_block)
+            # Path-addressed append: real entity slugs often carry date
+            # prefixes (e.g. `2026-04-11-foo.md`) that `slugify(name)`
+            # can't reconstruct. Going through `append_to_entity` by
+            # name used to fail with `Entity not found` here, leaving
+            # the merge half-done in the ledger.
+            append_to_entity_path(winner, "Key Facts", facts_block)
         except Exception as exc:
             return {"action": "error",
                     "error": f"append failed: {exc}",
@@ -439,14 +443,6 @@ def apply_merge(cand: dict, verdict: dict) -> dict:
         "cosine": cand["cosine"],
         "reason": verdict.get("reason", ""),
     }
-
-
-def _entity_name_from(path: Path) -> str:
-    """Recover the canonical `name:` from a file's frontmatter (falls
-    back to slug-titlecased if missing)."""
-    fm, _ = _parse_frontmatter(path.read_text(errors="replace"))
-    name = fm.get("name", "").strip().strip('"').strip("'")
-    return name or path.stem.replace("-", " ").title()
 
 
 # ---------------------------------------------------------------------------

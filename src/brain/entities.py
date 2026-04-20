@@ -106,17 +106,20 @@ def _normalize_fact(line: str) -> str:
     return s.lower()
 
 
-def append_to_entity(entity_type: str, name: str, section: str, content: str) -> Path:
-    """Append content to a section of an existing entity page.
+def append_to_entity_path(path: Path, section: str, content: str) -> Path:
+    """Append content to a section of an entity file *addressed by path*.
 
-    If the section doesn't exist, creates it. Skips fact lines whose
-    normalised body already exists in the file (dedup) — fixes the
-    double-source repetition bug. Also bumps `last_updated` and
-    `source_count` in frontmatter.
+    Why a path-based variant: callers like `brain.dedupe.apply_merge`
+    already know the exact winner file (e.g. `2026-04-11-foo.md`) and
+    must NOT re-derive it from the frontmatter `name:` via slugify —
+    real slugs often carry date prefixes / disambiguators that the
+    plain `slugify(name)` round-trip can't reconstruct, which used to
+    surface as `Entity not found` errors mid-merge.
+
+    Same dedup-by-normalised-fact semantics as `append_to_entity`.
     """
-    path = entity_path(entity_type, name)
     if not path.exists():
-        raise FileNotFoundError(f"Entity not found: {entity_type}/{name}")
+        raise FileNotFoundError(f"Entity not found: {path}")
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     text = path.read_text()
@@ -165,6 +168,18 @@ def append_to_entity(entity_type: str, name: str, section: str, content: str) ->
 
     path.write_text(text)
     return path
+
+
+def append_to_entity(entity_type: str, name: str, section: str, content: str) -> Path:
+    """Append content to a section of an existing entity page, addressed
+    by `(entity_type, name)`. Thin wrapper over `append_to_entity_path`
+    that resolves the path via slugify — only safe when the caller
+    knows the entity was created from this exact name (no date prefix
+    or other disambiguator)."""
+    path = entity_path(entity_type, name)
+    if not path.exists():
+        raise FileNotFoundError(f"Entity not found: {entity_type}/{name}")
+    return append_to_entity_path(path, section, content)
 
 
 def list_entities(entity_type: str) -> list[str]:
