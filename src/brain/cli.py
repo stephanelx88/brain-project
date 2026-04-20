@@ -24,16 +24,16 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
 def _cmd_status(args: argparse.Namespace) -> int:
     config.ensure_dirs()
-    types = config._discover_entity_types()
-    print(f"Brain: {config.BRAIN_DIR}")
-    print(f"Index: {config.INDEX_FILE}")
-    print(f"Types ({len(types)}):")
-    for name, path in sorted(types.items()):
-        n = sum(1 for p in path.glob("*.md") if not p.name.startswith("_"))
-        print(f"  - {name:<20} {n:>4} entities")
-    raw = config.RAW_DIR
-    raw_count = sum(1 for _ in raw.glob("*")) if raw.exists() else 0
-    print(f"Raw pending: {raw_count}")
+    from brain import status as status_mod
+    report = status_mod.gather()
+    if getattr(args, "json", False):
+        print(status_mod.to_json(report))
+        return 0
+    print(status_mod.format_text(report))
+    if getattr(args, "verbose", False):
+        print("\nEntity types:")
+        for name, n in sorted(report.vault["by_type"].items()):
+            print(f"  - {name:<20} {n:>4}")
     return 0
 
 
@@ -84,7 +84,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="Overwrite identity/who-i-am.md even if it exists.")
     p_init.set_defaults(func=_cmd_init)
 
-    sub.add_parser("status", help="Vault stats").set_defaults(func=_cmd_status)
+    p_status = sub.add_parser("status", help="Operational + vault dashboard")
+    p_status.add_argument("--json", action="store_true",
+                          help="Emit JSON instead of the text dashboard")
+    p_status.add_argument("--verbose", "-v", action="store_true",
+                          help="Also print per-type entity counts")
+    p_status.set_defaults(func=_cmd_status)
     sub.add_parser("doctor", help="Diagnostics (bin/doctor.sh)").set_defaults(func=_cmd_doctor)
     sub.add_parser("config", help="Print brain-config.yaml").set_defaults(func=_cmd_config)
 

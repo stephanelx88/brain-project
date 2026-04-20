@@ -329,6 +329,22 @@ def brain_audit(limit: int = 3) -> str:
 
 
 @mcp.tool()
+def brain_status() -> str:
+    """Operational dashboard — is anything running in the background?
+
+    Returns JSON with: launchd job state, in-flight lock, last/next run
+    timing, currently-spawned brain/LLM processes, ledger sizes, pending
+    audit count, and vault counts.
+
+    Use this to answer 'is the brain doing anything right now?' without
+    the user having to know launchctl, the log path, the lock dir, etc.
+    Cheap (one launchctl + one ps call); safe to call freely.
+    """
+    from brain import status as status_mod
+    return status_mod.to_json(status_mod.gather())
+
+
+@mcp.tool()
 def brain_stats() -> str:
     """High-level counts. Useful sanity check."""
     with db.connect() as conn:
