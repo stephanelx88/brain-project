@@ -96,6 +96,20 @@ def test_low_confidence_oldest_first(tmp_vault):
     assert "Newish" in labels[2]
 
 
+def test_low_confidence_detail_includes_path(tmp_vault):
+    """Detail line must carry the relative entity path so the user can
+    click/paste it directly from the SessionStart audit block — the
+    title-cased label on its own isn't round-trippable through
+    `brain_get` (slugs are lowercase-hyphenated)."""
+    insights = tmp_vault / "entities" / "insights"
+    _write_entity(insights, "some-lowconf-slug",
+                  source_count=1, first_seen="2026-04-11")
+    items = audit.top_n(limit=3)
+    lc = [it for it in items if it.kind == "low_confidence"]
+    assert len(lc) == 1
+    assert "entities/insights/some-lowconf-slug.md" in lc[0].detail
+
+
 def test_contested_excludes_from_low_conf(tmp_vault):
     """An entity that's BOTH single-source and contested should appear
     only as contested (not double-counted)."""

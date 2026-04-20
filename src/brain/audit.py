@@ -229,10 +229,19 @@ def _low_confidence_items(max_items: int = 20) -> list[AuditItem]:
             name = f.stem.replace("-", " ").title()
             priority = 60 if type_key in HIGH_VALUE_TYPES else 40
             priority += _brain_boost(text, name)
+            # Include the relative path so the user can paste it straight
+            # into `brain_note_get` / an editor. The title-cased `name`
+            # above is for humans; slugs (lowercase-hyphenated) are what
+            # the tooling accepts, and they're only recoverable from the
+            # path, not from the display label.
+            try:
+                rel = f.relative_to(BRAIN_DIR)
+            except ValueError:
+                rel = f
             candidates.append((sort_key, AuditItem(
                 kind="low_confidence",
                 label=f"Confirm? · {name} ({type_key})",
-                detail=f"single-source, {sort_key}",
+                detail=f"single-source, {sort_key} · {rel}",
                 priority=priority,
             )))
 
