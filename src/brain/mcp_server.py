@@ -331,7 +331,7 @@ def _find_session_jsonl(session_id: str) -> Path | None:
 
 
 @mcp.tool()
-def brain_live_sessions(active_within_sec: int = 300) -> str:
+def brain_live_sessions(active_within_sec: int = 300, include_self: bool = False) -> str:
     """List Claude Code + Cursor sessions that are alive *right now*.
 
     Bypasses the harvest/extract pipeline (which is gated by 60-180 s
@@ -344,6 +344,14 @@ def brain_live_sessions(active_within_sec: int = 300) -> str:
       - Cursor:      transcript jsonl mtime within `active_within_sec` s
                      (Cursor exposes no PID file, so mtime is the proxy).
 
+    `active_within_sec` filters Cursor only. Alive Claude PIDs are always
+    returned regardless of recency.
+
+    By default, the calling session itself is excluded from results
+    (detected via os.getppid() against the registered Claude PID). Pass
+    `include_self=True` to include it. Cursor has no PID->session mapping,
+    so Cursor self-exclusion is not possible and is silently skipped.
+
     Returns JSON list of {source, session_id, project, cwd, last_write,
     age_sec, path}, newest write first. Cursor `session_id`s come back
     namespaced as `cursor:<uuid>` — pass them as-is to brain_live_tail.
@@ -354,7 +362,17 @@ def brain_live_sessions(active_within_sec: int = 300) -> str:
     now = datetime.now(timezone.utc)
     out: list[dict] = []
 
+    self_sid: str | None = None
+    if not include_self:
+        ppid = os.getppid()
+        for cs in harvest_session.claude_active_sessions():
+            if cs["pid"] == ppid:
+                self_sid = cs["session_id"]
+                break
+
     for cs in harvest_session.claude_active_sessions():
+        if cs["session_id"] == self_sid:
+            continue
         jsonl = _find_session_jsonl(cs["session_id"])
         last_write_iso = None
         age = None

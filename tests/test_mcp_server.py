@@ -257,3 +257,39 @@ def test_brain_live_tail_returns_claude_session(tmp_path, monkeypatch):
     assert out["session_id"] == "claude-tail-1"
     assert out["total_turns"] == 2
     assert out["turns"][-1]["text"] == "hello back"
+
+
+def test_brain_live_sessions_excludes_self_by_default(tmp_path, monkeypatch):
+    import os
+    from brain import harvest_session, mcp_server
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    self_pid = os.getppid()
+    peer_pid = os.getpid()
+    _write_claude_session(claude_root, "claude-self", self_pid, "/tmp/self")
+    _write_claude_session(claude_root, "claude-peer", peer_pid, "/tmp/peer")
+
+    out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300))
+    sids = {r["session_id"] for r in out}
+    assert sids == {"claude-peer"}
+
+
+def test_brain_live_sessions_include_self_returns_all(tmp_path, monkeypatch):
+    import os
+    from brain import harvest_session, mcp_server
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    self_pid = os.getppid()
+    peer_pid = os.getpid()
+    _write_claude_session(claude_root, "claude-self", self_pid, "/tmp/self")
+    _write_claude_session(claude_root, "claude-peer", peer_pid, "/tmp/peer")
+
+    out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300, include_self=True))
+    sids = {r["session_id"] for r in out}
+    assert sids == {"claude-self", "claude-peer"}
