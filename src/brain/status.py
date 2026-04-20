@@ -46,6 +46,7 @@ EXTRACT_LOCK_DIR = config.BRAIN_DIR / ".extract.lock.d"
 AUTO_EXTRACT_LOG = config.BRAIN_DIR / "logs" / "auto-extract.log"
 HARVEST_LEDGER = config.BRAIN_DIR / ".harvested"
 DEDUPE_LEDGER = config.BRAIN_DIR / ".dedupe.ledger.json"
+RECALL_LEDGER = config.BRAIN_DIR / "recall-ledger.jsonl"
 
 # Process names we care about when answering "is the brain spending
 # tokens right now?". `claude --print` is the LLM caller; the rest are
@@ -70,6 +71,7 @@ class StatusReport:
     ledgers: dict
     pending_audit: dict
     vault: dict
+    coverage: dict = field(default_factory=dict)
 
 
 # ---------- helpers --------------------------------------------------------
@@ -357,6 +359,74 @@ def _pending_audit() -> dict:
     return {"count": len(items), "by_kind": by_kind}
 
 
+def _coverage() -> dict:
+    """Tail the recall-ledger to surface Question Coverage Score.
+
+    Each autoresearch cycle appends a JSON line with `score` (miss rate,
+    lower is better) and `avg_top` (mean top-k similarity, higher is
+    better). We only need the latest two rows to show "current vs.
+    previous" — everything further back lives in the ledger for offline
+    analysis.
+
+    Tolerant of the ledger not existing (fresh install before the first
+    autoresearch run) and of malformed lines (hand-editing, partial
+    writes during a crash)."""
+    out: dict = {
+        "available": False,
+        "latest_score": None,
+        "latest_avg_top": None,
+        "prev_score": None,
+        "delta_score": None,
+        "last_ts": None,
+        "runs_logged": 0,
+        "threshold": None,
+    }
+    if not RECALL_LEDGER.exists():
+        return out
+    try:
+        with RECALL_LEDGER.open("rb") as f:
+            #  Read tail only — the ledger is append-only and a long
+            #  run can accumulate thousands of lines; 32 KB is plenty
+            #  to capture the last few runs without loading the world.
+            try:
+                size = f.seek(0, os.SEEK_END)
+                if size > 32_768:
+                    f.seek(-32_768, os.SEEK_END)
+                else:
+                    f.seek(0)
+            except OSError:
+                f.seek(0)
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return out
+    rows: list[dict] = []
+    for raw in tail.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("kind") == "eval" and "score" in obj:
+            rows.append(obj)
+    out["runs_logged"] = len(rows)
+    if not rows:
+        return out
+    latest = rows[-1]
+    out["available"] = True
+    out["latest_score"] = float(latest.get("score", 0.0))
+    out["last_ts"] = latest.get("ts")
+    out["threshold"] = latest.get("threshold")
+    if "avg_top" in latest:
+        out["latest_avg_top"] = float(latest["avg_top"])
+    if len(rows) >= 2:
+        prev = rows[-2]
+        out["prev_score"] = float(prev.get("score", 0.0))
+        out["delta_score"] = out["latest_score"] - out["prev_score"]
+    return out
+
+
 def _vault_counts() -> dict:
     """Cheap entity / raw counts. Reads filesystem only — no SQLite, so
     this still works when the mirror hasn't been built yet."""
@@ -398,6 +468,7 @@ def gather() -> StatusReport:
         ledgers=_ledgers(),
         pending_audit=_pending_audit(),
         vault=_vault_counts(),
+        coverage=_coverage(),
     )
 
 
@@ -451,6 +522,24 @@ def format_text(report: StatusReport) -> str:
     audit_line = (f"{A['count']} item(s) — {A['by_kind']}"
                   if A["count"] else "0 — clean")
 
+    C = report.coverage
+    if C.get("available"):
+        miss_pct = f"{C['latest_score'] * 100:.1f}%"
+        avg_top = (f"avg-top {C['latest_avg_top']:.3f}"
+                   if C.get("latest_avg_top") is not None else "avg-top n/a")
+        if C.get("delta_score") is not None:
+            d = C["delta_score"]
+            arrow = "↓" if d < 0 else ("↑" if d > 0 else "·")
+            delta = f"Δ{arrow}{abs(d) * 100:.1f}pp"
+        else:
+            delta = "Δ—"
+        thr = (f"@ thr {C['threshold']:.2f}"
+               if C.get("threshold") is not None else "")
+        coverage_line = (f"miss {miss_pct} ({delta}) · {avg_top} {thr}  "
+                         f"[{C['runs_logged']} eval runs logged]")
+    else:
+        coverage_line = "no autoresearch cycles logged yet"
+
     lines = [
         "🧠 Brain status",
         f"  vault       : {report.brain_dir}",
@@ -461,6 +550,7 @@ def format_text(report: StatusReport) -> str:
         f"  procs       : {procs_line}",
         f"  ledgers     : {LD['harvested']} harvested, "
         f"{LD['dedupe_verdicts']} dedupe verdicts cached",
+        f"  coverage    : {coverage_line}",
         f"  audit       : {audit_line}",
         f"  vault stats : {V['entities_total']} entities across "
         f"{len(V['by_type'])} types, {V['raw_pending']} raw pending",
