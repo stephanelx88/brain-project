@@ -1,13 +1,14 @@
 """Tests for `brain.audit` — the SessionStart top-N surface.
 
 Covers ranking (contested > dedupe > low-confidence), the empty-vault
-silent-stdout contract, the 7-day staleness cutoff for dedupe reports,
-and per-signal fault isolation (one broken signal must not crash the hook).
+silent-stdout contract, the ledger-driven freshness guarantee for dedupe
+items, and per-signal fault isolation (one broken signal must not crash
+the hook).
 """
 
 from __future__ import annotations
 
-import time
+import json
 from pathlib import Path
 
 import pytest
@@ -116,55 +117,74 @@ def test_skips_underscore_files(tmp_vault):
     assert items == []
 
 
+def _write_ledger(brain_dir: Path, entries: dict) -> Path:
+    """Write the canonical dedupe ledger that audit now reads."""
+    ledger = brain_dir / ".dedupe.ledger.json"
+    ledger.write_text(json.dumps(entries))
+    return ledger
+
+
 def test_dedupe_only_surfaces_merge_verdict(tmp_vault):
-    """Only `verdict: merge` entries from the dedupe report should appear."""
-    report = tmp_vault / "timeline" / "2026-04-20-dedupe-1200.md"
-    report.write_text(
-        "# Dedupe — 2026-04-20\n\n"
-        "## insights: foo  ⇄  bar\n"
-        "- LLM verdict: `merge`\n"
-        "- reason: same thing\n\n"
-        "## insights: alpha  ⇄  beta\n"
-        "- LLM verdict: `unsure`\n"
-        "- reason: ambiguous\n\n"
-        "## insights: zed  ⇄  qux\n"
-        "- LLM verdict: `split`\n"
-    )
-    # Make it fresh (within the 7-day window)
+    """Only `verdict: merge` ledger entries should appear."""
+    insights = tmp_vault / "entities" / "insights"
+    _write_entity(insights, "foo")
+    _write_entity(insights, "bar")
+    _write_entity(insights, "alpha")
+    _write_entity(insights, "beta")
+    _write_entity(insights, "zed")
+    _write_entity(insights, "qux")
+    _write_ledger(tmp_vault, {
+        "insights|foo|bar":   {"verdict": "merge",  "cosine": 0.92},
+        "insights|alpha|beta": {"verdict": "unsure", "cosine": 0.71},
+        "insights|zed|qux":   {"verdict": "split",  "cosine": 0.60},
+    })
     items = audit.top_n(limit=10)
     dedupe_items = [it for it in items if it.kind == "dedupe"]
     assert len(dedupe_items) == 1
     assert "foo ⇄ bar" in dedupe_items[0].label
 
 
-def test_dedupe_skips_stale_reports(tmp_vault):
-    """Reports older than 7 days are ignored — user already had a chance."""
-    report = tmp_vault / "timeline" / "2026-04-01-dedupe-1200.md"
-    report.write_text(
-        "## insights: foo  ⇄  bar\n- LLM verdict: `merge`\n"
-    )
-    # Force mtime > 7 days old
-    old = time.time() - 10 * 86400
-    import os
-    os.utime(report, (old, old))
-
+def test_dedupe_skips_applied_entries(tmp_vault):
+    """Once a merge has been applied, the ledger marks it and audit must
+    drop it — otherwise users get re-nagged about already-resolved items."""
+    insights = tmp_vault / "entities" / "insights"
+    _write_entity(insights, "foo")
+    _write_entity(insights, "bar")
+    _write_ledger(tmp_vault, {
+        "insights|foo|bar": {"verdict": "merge", "cosine": 0.9, "applied": True},
+    })
     items = audit.top_n(limit=10)
     assert all(it.kind != "dedupe" for it in items)
 
 
-def test_dedupe_picks_latest_report(tmp_vault):
-    """When multiple dedupe reports exist, only the newest one is read."""
-    timeline = tmp_vault / "timeline"
-    (timeline / "2026-04-15-dedupe-1000.md").write_text(
-        "## insights: stale-a  ⇄  stale-b\n- LLM verdict: `merge`\n"
-    )
-    (timeline / "2026-04-20-dedupe-1500.md").write_text(
-        "## insights: fresh-a  ⇄  fresh-b\n- LLM verdict: `merge`\n"
-    )
+def test_dedupe_skips_missing_entity_files(tmp_vault):
+    """If one side of the pair was archived/deleted on disk, the ledger
+    entry is stale and must not surface — file status is the tiebreaker."""
+    insights = tmp_vault / "entities" / "insights"
+    _write_entity(insights, "foo")
+    # note: `bar` is NOT written, simulating a completed/reverted merge
+    _write_ledger(tmp_vault, {
+        "insights|foo|bar": {"verdict": "merge", "cosine": 0.9},
+    })
     items = audit.top_n(limit=10)
-    dedupe_labels = " ".join(it.label for it in items if it.kind == "dedupe")
-    assert "fresh-a" in dedupe_labels
-    assert "stale-a" not in dedupe_labels
+    assert all(it.kind != "dedupe" for it in items)
+
+
+def test_dedupe_skips_superseded_pairs(tmp_vault):
+    """An entity whose frontmatter was flipped to `status: superseded`
+    is already resolved; the ledger row is stale — drop it."""
+    insights = tmp_vault / "entities" / "insights"
+    _write_entity(insights, "foo")
+    bar = insights / "bar.md"
+    bar.write_text(
+        "---\ntype: insight\nfirst_seen: 2026-04-10\n"
+        "source_count: 2\nstatus: superseded\n---\n\n# x\n"
+    )
+    _write_ledger(tmp_vault, {
+        "insights|foo|bar": {"verdict": "merge", "cosine": 0.9},
+    })
+    items = audit.top_n(limit=10)
+    assert all(it.kind != "dedupe" for it in items)
 
 
 def test_limit_is_respected(tmp_vault):

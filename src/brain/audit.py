@@ -6,9 +6,15 @@ hook can show them as a single screenful at the top of every Claude/Cursor
 session.
 
 Ranking: contested facts first (you've already flagged them as wrong),
-then high-confidence dedupe candidates from the most recent dedupe report
-(LLM judge already said "merge"), then the oldest single-source low-conf
-items (most likely to have decayed). Capped at `limit` total.
+then pending dedupe merges from the ledger (LLM judge already said
+"merge" but cosine fell below the auto-apply bar OR the prior auto-merge
+errored), then the oldest single-source low-conf items (most likely to
+have decayed). Capped at `limit` total.
+
+Pending merges are sourced from the dedupe ledger (canonical state) and
+cross-checked against on-disk file status — so an item disappears the
+moment its merge lands or one side gets archived, instead of nagging
+the user about already-resolved proposals.
 
 Output is intentionally <10 lines and *empty* when there's nothing to
 audit — empty stdout means the SessionStart hook adds zero context noise
@@ -22,13 +28,13 @@ Public API:
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
 import brain.config as config
-from brain.config import BRAIN_DIR, ENTITY_TYPES, TIMELINE_DIR
+from brain.config import BRAIN_DIR, ENTITY_TYPES, TIMELINE_DIR  # noqa: F401
 
 
 @dataclass
@@ -80,78 +86,125 @@ def _contested_items() -> list[AuditItem]:
                     kind="contested",
                     label=f"Contested · {name} ({type_dir.name})",
                     detail=str(rel),
-                    priority=100,
+                    priority=100 + _brain_boost(text, name),
                 ))
     return out
 
 
-_DEDUPE_HEADER = re.compile(
-    # Matches the section headers in the dedupe report:
-    #   "## insights: slug-a  ⇄  slug-b"
-    r"^##\s+([^:]+):\s*(\S+)\s+⇄\s+(\S+)\s*$",
-    re.MULTILINE,
-)
-_DEDUPE_VERDICT = re.compile(r"LLM verdict:\s*`?(\w+)`?", re.IGNORECASE)
+def _dedupe_ledger_path() -> Path:
+    """Computed lazily so monkey-patching `audit.BRAIN_DIR` in tests
+    actually redirects the lookup. A module-level constant captured at
+    import time would silently keep pointing at the real `~/.brain`."""
+    return BRAIN_DIR / ".dedupe.ledger.json"
 
 
-def _latest_dedupe_path() -> Path | None:
-    """Newest `~/.brain/timeline/YYYY-MM-DD-dedupe-HHMM.md` file, or None."""
-    if not TIMELINE_DIR.exists():
+def _entity_path_for(type_: str, slug: str) -> Path | None:
+    """Resolve <slug>.md under the right type folder. None if missing."""
+    type_dir = ENTITY_TYPES.get(type_)
+    if type_dir is None:
         return None
-    candidates = sorted(TIMELINE_DIR.glob("*-dedupe-*.md"))
-    return candidates[-1] if candidates else None
+    p = type_dir / f"{slug}.md"
+    return p if p.exists() else None
+
+
+def _is_pending_alive(path_a: Path | None, path_b: Path | None) -> bool:
+    """Both files must exist AND neither marked superseded/archived. Used
+    to filter out ledger entries whose merge already landed (loser file
+    archived) or whose target was deleted manually."""
+    for p in (path_a, path_b):
+        if p is None or not p.exists():
+            return False
+        try:
+            head = p.read_text(errors="replace")[:400]
+        except OSError:
+            return False
+        if "status: superseded" in head or "status: archived" in head:
+            return False
+    return True
 
 
 def _dedupe_items() -> list[AuditItem]:
-    """High-confidence merge candidates from the latest dedupe report.
+    """Pending merge decisions read from the dedupe ledger.
 
-    We rely on the dedupe pass having already filtered to
-    `verdict == merge`; we just surface the headers. Skipping reports
-    older than 7 days so we don't keep nagging about resolved items the
-    user already merged manually (the file stays around but is stale).
+    Source of truth is `~/.brain/.dedupe.ledger.json` rather than the
+    timeline/*.md proposal files. Why: proposal files are append-only
+    and quickly go stale — a candidate listed there gets auto-merged by
+    `drain_pending_ledger` on the next run, but the markdown file still
+    shows it as "needs decision". Reading the ledger + cross-checking
+    file status guarantees we only surface items that genuinely still
+    need the user's call.
+
+    A pair is "pending" when:
+      - ledger verdict == "merge"
+      - ledger `applied` is not True (None, False, missing, or an
+        error string from a failed prior attempt all qualify)
+      - both entity files still exist on disk
+      - neither file is marked `status: superseded` or `status: archived`
     """
-    path = _latest_dedupe_path()
-    if path is None:
-        return []
     try:
-        age_days = (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) / 86400
-        if age_days > 7:
-            return []
-        text = path.read_text()
-    except OSError:
+        led = json.loads(_dedupe_ledger_path().read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
         return []
 
     out: list[AuditItem] = []
-    # Walk header → next-header chunks so we can read the verdict per pair.
-    headers = list(_DEDUPE_HEADER.finditer(text))
-    for i, m in enumerate(headers):
-        ent_type, slug_a, slug_b = m.group(1).strip(), m.group(2), m.group(3)
-        chunk_end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
-        chunk = text[m.end():chunk_end]
-        verdict_match = _DEDUPE_VERDICT.search(chunk)
-        verdict = verdict_match.group(1).lower() if verdict_match else ""
-        if verdict != "merge":
+    for key, rec in led.items():
+        if rec.get("verdict") != "merge":
             continue
+        if rec.get("applied") is True:
+            continue
+        try:
+            type_, slug_a, slug_b = key.split("|", 2)
+        except ValueError:
+            continue
+        path_a = _entity_path_for(type_, slug_a)
+        path_b = _entity_path_for(type_, slug_b)
+        if not _is_pending_alive(path_a, path_b):
+            continue
+        boost = BRAIN_PRIORITY_BOOST if _BRAIN_RE.search(
+            f"{slug_a} {slug_b}"
+        ) else 0
         out.append(AuditItem(
             kind="dedupe",
-            label=f"Merge? · {ent_type} · {slug_a} ⇄ {slug_b}",
-            detail=f"see {path.relative_to(BRAIN_DIR)}",
-            priority=80,
+            label=f"Merge? · {type_} · {slug_a} ⇄ {slug_b}",
+            detail=f"cosine {float(rec.get('cosine', 0)):.3f} · "
+                   f"`brain audit` to walk",
+            priority=80 + boost,
         ))
+    # Highest cosine first so the most obvious merges surface in top-N.
+    out.sort(key=lambda it: it.detail, reverse=True)
     return out
 
 
 _FRONTMATTER_DATE = re.compile(r"first_seen:\s*(\d{4}-\d{2}-\d{2})")
 _SOURCE_COUNT = re.compile(r"source_count:\s*(\d+)")
 
+# User preference (2026-04-20): prioritize brain-related items first because
+# improving the brain tooling has compounding returns — fix the knowledge
+# capture layer before fixing facts captured by it. We match `brain` as a
+# whole word (not `brainstorm`, not `ebrain`) in the name or body.
+_BRAIN_RE = re.compile(r"\bbrain\b", re.IGNORECASE)
+BRAIN_PRIORITY_BOOST = 30
 
-def _low_confidence_items(max_items: int = 5) -> list[AuditItem]:
-    """Single-source entities, oldest first.
 
-    Capped because in a busy brain there can be hundreds of these — we
-    only need the most decayed ones to nudge the user into a quick
-    confirm/delete pass. Insights & decisions are weighted higher
-    than misc types because they're the ones whose accuracy matters most.
+def _brain_boost(text: str, name: str = "") -> int:
+    """+BRAIN_PRIORITY_BOOST if the entity is about the brain itself.
+
+    Cheap substring check — we read the first 2 KB of the body because a
+    fact-list entity that mentions 'brain' 10 paragraphs in is probably
+    incidentally tagged; the signal lives up top where the name + first
+    fact sit."""
+    hay = name + "\n" + text[:2000]
+    return BRAIN_PRIORITY_BOOST if _BRAIN_RE.search(hay) else 0
+
+
+def _low_confidence_items(max_items: int = 20) -> list[AuditItem]:
+    """Single-source entities, oldest first (with brain boost).
+
+    Capped because in a busy brain there can be hundreds of these. The
+    cap is intentionally wider than the SessionStart display limit so
+    the final priority sort in `top_n` can surface brain-boosted items
+    even when they aren't the N oldest. Insights & decisions weighted
+    higher than misc types because their accuracy matters most.
     """
     HIGH_VALUE_TYPES = {"insights", "decisions", "people", "projects", "clients"}
     candidates: list[tuple[str, AuditItem]] = []  # (sort_key, item)
@@ -175,6 +228,7 @@ def _low_confidence_items(max_items: int = 5) -> list[AuditItem]:
             sort_key = date_m.group(1) if date_m else "9999-99-99"
             name = f.stem.replace("-", " ").title()
             priority = 60 if type_key in HIGH_VALUE_TYPES else 40
+            priority += _brain_boost(text, name)
             candidates.append((sort_key, AuditItem(
                 kind="low_confidence",
                 label=f"Confirm? · {name} ({type_key})",
@@ -182,7 +236,8 @@ def _low_confidence_items(max_items: int = 5) -> list[AuditItem]:
                 priority=priority,
             )))
 
-    # Oldest single-source items first (most likely to be stale).
+    # Oldest single-source items first (most likely to be stale); the final
+    # priority sort in top_n will then float brain-boosted items to the top.
     candidates.sort(key=lambda kv: kv[0])
     return [item for _, item in candidates[:max_items]]
 
@@ -222,8 +277,8 @@ def format_for_session(items: list[AuditItem]) -> str:
         if it.detail:
             lines.append(f"     {it.detail}")
     lines.append("")
-    lines.append("Run `python -m brain.reconcile` for the full report, or "
-                 "ask the brain MCP tool `brain_audit` anytime.")
+    lines.append("Run `brain audit` to walk merges interactively, or "
+                 "`python -m brain.reconcile` for the full report.")
     return "\n".join(lines) + "\n"
 
 
