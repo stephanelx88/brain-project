@@ -5,7 +5,9 @@
 # Two guards against the dual-instance Mac freeze (incident 2026-04-11):
 #   1. flock singleton — never overlap two launchd runs
 #   2. active-session check — skip the LLM-calling stages while Claude Code
-#      is actively writing to ~/.claude/projects/
+#      *or Cursor Agent* is actively writing a transcript. Both are checked
+#      because either can end up spawning a Claude process under the hood
+#      (Cursor's brain MCP also calls `claude --print` for auto_extract).
 
 set -euo pipefail
 
@@ -29,15 +31,22 @@ fi
 echo $$ > "$LOCKDIR/pid"
 trap 'rm -rf "$LOCKDIR"' EXIT
 
-# Idle-time guard: only the LLM-calling stages skip when a Claude Code session
-# was actively typing in the last IDLE_THRESHOLD seconds. Pure-Python stages
-# always run — they don't spawn `claude --print` so they can't trigger the
-# dual-instance freeze, and we need them to keep the index fresh while you work.
+# Idle-time guard: only the LLM-calling stages skip when a Claude Code OR
+# Cursor agent session was actively typing in the last IDLE_THRESHOLD seconds.
+# Pure-Python stages always run — they don't spawn `claude --print` so they
+# can't trigger the dual-instance freeze, and we need them to keep the index
+# fresh while you work.
 IDLE_THRESHOLD=180
-NEWEST=$(find "{{HOME}}/.claude/projects" -name "*.jsonl" -type f -print0 2>/dev/null \
+NEWEST_CLAUDE=$(find "{{HOME}}/.claude/projects" -name "*.jsonl" -type f -print0 2>/dev/null \
   | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1)
+NEWEST_CURSOR=$(find "{{HOME}}/.cursor/projects" -path "*/agent-transcripts/*" -name "*.jsonl" -type f -print0 2>/dev/null \
+  | xargs -0 stat -f %m 2>/dev/null | sort -n | tail -1)
+NEWEST=0
+for ts in "$NEWEST_CLAUDE" "$NEWEST_CURSOR"; do
+  if [[ -n "$ts" && "$ts" -gt "$NEWEST" ]]; then NEWEST=$ts; fi
+done
 ACTIVE_SESSION=0
-if [[ -n "$NEWEST" ]] && (( $(date +%s) - NEWEST < IDLE_THRESHOLD )); then
+if (( NEWEST > 0 )) && (( $(date +%s) - NEWEST < IDLE_THRESHOLD )); then
   ACTIVE_SESSION=1
 fi
 
@@ -50,10 +59,15 @@ fi
 
   # LLM-calling stages — skip while a Claude session is actively writing.
   if (( ACTIVE_SESSION == 0 )); then
-    "$PYTHON" -m brain.auto_extract     || echo "auto_extract exited $?"
-    "$PYTHON" -m brain.reconcile        || echo "reconcile exited $?"
+    "$PYTHON" -m brain.auto_extract           || echo "auto_extract exited $?"
+    "$PYTHON" -m brain.reconcile              || echo "reconcile exited $?"
+    # Semantic dedupe — bounded LLM calls per run, ledger-skipped after.
+    # Catches the same-idea-different-wording dupes that brain.reconcile
+    # (slug-only) is blind to. Conservative thresholds per type; merges
+    # below the auto bar become proposal files in timeline/ for review.
+    "$PYTHON" -m brain.dedupe --apply --quiet || echo "dedupe exited $?"
   else
-    echo "skip auto_extract+reconcile: active claude session (last write $(($(date +%s) - NEWEST))s ago)"
+    echo "skip auto_extract+reconcile+dedupe: active session (last write $(($(date +%s) - NEWEST))s ago)"
   fi
   echo ""
 } >> "$LOG" 2>&1

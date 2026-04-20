@@ -482,11 +482,53 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
             return 1.1
         return 1.0
 
+    # Recency weighting — addresses Karpathy's "memory distraction" complaint
+    # (https://x.com/karpathy/status/2036836816654147718): irrelevant ancient
+    # context keeps surfacing as if it's a current interest. We give recent
+    # facts a small boost and old facts a small dampening, but never zero them
+    # out — the user can still recall things from years ago, they just won't
+    # crowd out fresh material on identical-similarity hits.
+    #
+    # Disable with BRAIN_TIME_DECAY=0; tune halflife via BRAIN_TIME_HALFLIFE_D.
+    _TIME_DECAY_ON = os.environ.get("BRAIN_TIME_DECAY", "1") != "0"
+    _HALFLIFE_DAYS = float(os.environ.get("BRAIN_TIME_HALFLIFE_D", "180"))
+
+    def _recency_factor(hit: dict) -> float:
+        if not _TIME_DECAY_ON:
+            return 1.0
+        # Try fact date first (sources are dated YYYY-MM-DD), then mtime, then path.
+        date_str = hit.get("date") or hit.get("last_updated")
+        ts: float | None = None
+        if date_str and isinstance(date_str, str) and len(date_str) >= 10:
+            try:
+                ts = time.mktime(time.strptime(date_str[:10], "%Y-%m-%d"))
+            except (ValueError, OverflowError):
+                ts = None
+        if ts is None:
+            mt = hit.get("mtime")
+            if isinstance(mt, (int, float)) and mt > 0:
+                ts = float(mt)
+        if ts is None:
+            path = hit.get("path")
+            if path:
+                fp = config.BRAIN_DIR / path
+                try:
+                    ts = fp.stat().st_mtime
+                except OSError:
+                    ts = None
+        if ts is None:
+            return 1.0
+        age_days = max(0.0, (time.time() - ts) / 86400.0)
+        # Smooth bell: 0d→1.20, halflife→1.0, 2*halflife→0.83, 4*halflife→0.69
+        # Implemented as a soft 0.5^(age/(2*halflife)) curve so we never go below ~0.4.
+        decay = 0.5 ** (age_days / (2.0 * _HALFLIFE_DAYS))
+        return 0.8 + 0.4 * decay  # ∈ [0.8, 1.2]
+
     fused = []
     for k_ in pool:
         hit = pool[k_]
         path = hit.get("path", "")
-        adj = scores[k_] * _path_penalty(path) * _density_boost(hit)
+        adj = scores[k_] * _path_penalty(path) * _density_boost(hit) * _recency_factor(hit)
         fused.append({**hit, "rrf": adj})
     fused.sort(key=lambda x: -x["rrf"])
     return fused[:k]

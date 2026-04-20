@@ -185,3 +185,52 @@ def write_reconciliation_file(content: str) -> Path:
     path = TIMELINE_DIR / filename
     path.write_text(content)
     return path
+
+
+def _format_report(data: dict) -> str:
+    return (
+        f"# Reconciliation — {data['date']}\n\n"
+        f"## Recent log\n{data['recent_log']}\n\n"
+        f"## Contested facts\n{data['contested_facts']}\n\n"
+        f"## Low-confidence facts\n{data['low_confidence_facts']}\n\n"
+        f"## Possible duplicates\n{data['possible_duplicates']}\n"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m brain.reconcile` — print the reconciliation report and,
+    when `--write` is passed, persist it under `timeline/`.
+
+    Without a main(), the launchd `auto-extract.sh` invocation
+    (`python -m brain.reconcile`) was a silent no-op: the module loaded,
+    no top-level code ran, and the shell got exit 0. Now the module
+    actually does the reconciliation work it advertises.
+    """
+    import argparse
+    import sys
+
+    p = argparse.ArgumentParser(description="Reconcile contested / duplicate / low-conf facts")
+    p.add_argument("--write", action="store_true",
+                   help="Persist the report under ~/.brain/timeline/")
+    p.add_argument("--quiet", action="store_true",
+                   help="Suppress stdout when there's nothing to reconcile")
+    args = p.parse_args(argv)
+
+    config.ensure_dirs()
+    if not has_items_to_reconcile():
+        if not args.quiet:
+            print("Nothing to reconcile.")
+        return 0
+
+    data = prepare_reconciliation()
+    report = _format_report(data)
+    print(report)
+    if args.write:
+        path = write_reconciliation_file(report)
+        print(f"\nWrote: {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
