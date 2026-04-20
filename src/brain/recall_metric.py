@@ -224,8 +224,11 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
     Failures are silenced — a logging hiccup must never break the
     user-facing recall path.
     """
+    q = (query or "").strip()
+    if len(q) < 2:
+        return  # don't pollute the ledger with empty / single-char pings
     try:
-        score, label = _top_score_for(query)
+        score, label = _top_score_for(q)
     except Exception:
         return
     try:
@@ -407,7 +410,38 @@ def main() -> int:
                     help="emit the full report as JSON instead of a summary")
     ap.add_argument("--no-persist", action="store_true",
                     help="don't append to recall-ledger.jsonl")
+    ap.add_argument("--live", action="store_true",
+                    help="print rolling live-ledger coverage instead of "
+                         "running the eval set (no LLM / embeddings called)")
+    ap.add_argument("--days", type=int, default=7,
+                    help="window (days) for --live mode (default 7)")
+    ap.add_argument("--top-miss", type=int, default=10,
+                    help="how many worst miss queries to surface in --live")
     args = ap.parse_args()
+    if args.live:
+        summary = live_coverage(days=args.days)
+        misses = top_miss_queries(days=args.days, n=args.top_miss)
+        if args.json:
+            print(json.dumps({"summary": summary,
+                              "top_miss_queries": misses},
+                             indent=2, ensure_ascii=False))
+            return 0
+        if not summary.get("available"):
+            print(f"live recall: no calls in last {args.days}d")
+            return 0
+        print(
+            f"live recall: miss {summary['score']*100:.1f}% "
+            f"({summary['misses']}/{summary['total_calls']}) · "
+            f"avg-top {summary['avg_top']:.3f}  "
+            f"[{summary['queries']} uniq queries, {args.days}d]"
+        )
+        if misses:
+            print()
+            print("top miss queries:")
+            for m in misses:
+                print(f"  {m['misses']}x  best={m['best_score']:.3f}  "
+                      f"{m['query'][:70]}")
+        return 0
     report = score_coverage(threshold=args.threshold, persist=not args.no_persist)
     if args.json:
         print(json.dumps(report.to_dict(), indent=2, ensure_ascii=False))

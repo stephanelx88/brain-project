@@ -56,6 +56,14 @@ def test_log_live_recall_truncates_long_queries(fake_ledger, monkeypatch):
     assert len(row["query"]) == 200
 
 
+def test_log_live_recall_skips_empty_queries(fake_ledger, monkeypatch):
+    _stub_top_score(monkeypatch, 0.9)
+    recall_metric.log_live_recall("")
+    recall_metric.log_live_recall("   ")
+    recall_metric.log_live_recall("a")  # 1 char, skipped
+    assert not fake_ledger.exists()
+
+
 def test_log_live_recall_swallows_errors(fake_ledger, monkeypatch):
     """Any failure in the log path must not propagate — it's off the
     user-facing recall hot path."""
