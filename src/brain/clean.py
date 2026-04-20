@@ -23,6 +23,43 @@ from pathlib import Path
 import brain.config as config
 from brain.config import ENTITY_TYPES
 
+# Optional write-through to the SQLite mirror. Imported lazily so the
+# clean script still works on a fresh install before db.py has been touched.
+try:
+    from brain.db import delete_entity_by_path, upsert_entity_from_file
+except Exception:  # pragma: no cover - db is optional at first run
+    delete_entity_by_path = None
+    upsert_entity_from_file = None
+
+
+def _db_forget(path: Path) -> None:
+    """Remove a vanished entity from the SQLite mirror.
+
+    Without this, `brain.db.search` and the `brain_get` MCP tool keep
+    returning rows that point to files this script just deleted —
+    producing 'file missing' errors in Claude until the next full
+    `brain.db rebuild`. Failures are silenced (the mirror is a cache,
+    not the source of truth).
+    """
+    if delete_entity_by_path is None:
+        return
+    try:
+        delete_entity_by_path(path)
+    except Exception:
+        pass
+
+
+def _db_move(old: Path, new: Path) -> None:
+    """Tell the SQLite mirror that an entity moved."""
+    _db_forget(old)
+    if upsert_entity_from_file is None or not new.exists():
+        return
+    try:
+        upsert_entity_from_file(new)
+    except Exception:
+        pass
+
+
 _SOURCE_RE = re.compile(r"\s*\(source:[^)]*\)")
 
 
@@ -51,6 +88,7 @@ def clean_empty_entities(execute: bool) -> int:
             if not text.strip():
                 if execute:
                     f.unlink()
+                    _db_forget(f)
                 removed += 1
                 continue
             if "source_count: 0" in text:
@@ -60,18 +98,42 @@ def clean_empty_entities(execute: bool) -> int:
                     if not body or body.count("\n") < 2:
                         if execute:
                             f.unlink()
+                            _db_forget(f)
                         removed += 1
     return removed
 
 
 def clean_stale_harvested(execute: bool) -> int:
+    """Drop ledger entries whose source jsonl no longer exists.
+
+    Both Claude and Cursor are scanned; Cursor IDs are stored as
+    `cursor:<uuid>` in the ledger so we have to check both shapes here.
+    Without this, every Cursor entry would look 'stale' to the
+    Claude-only check and get evicted on every run.
+
+    If neither source directory exists (fresh install on a system with no
+    Claude/Cursor history yet) we no-op rather than delete everything.
+    """
     harvested_file = config.BRAIN_DIR / ".harvested"
     if not harvested_file.exists():
         return 0
+
     claude_projects = Path.home() / ".claude" / "projects"
-    if not claude_projects.exists():
+    cursor_projects = Path.home() / ".cursor" / "projects"
+
+    existing_ids: set[str] = set()
+    if claude_projects.exists():
+        existing_ids.update(p.stem for p in claude_projects.rglob("*.jsonl"))
+    if cursor_projects.exists():
+        # Cursor jsonls live at .../agent-transcripts/<uuid>/<uuid>.jsonl
+        # and our ledger stores them with the `cursor:` prefix.
+        for p in cursor_projects.rglob("*.jsonl"):
+            existing_ids.add(f"cursor:{p.stem}")
+
+    if not existing_ids:
+        # Both source dirs missing — don't nuke the ledger.
         return 0
-    existing_ids = {p.stem for p in claude_projects.rglob("*.jsonl")}
+
     lines = harvested_file.read_text().strip().splitlines()
     kept = [sid for sid in lines if sid in existing_ids]
     removed = len(lines) - len(kept)
@@ -93,6 +155,7 @@ def clean_placeholder_files(execute: bool) -> int:
         for f in type_dir.glob("_placeholder.md"):
             if execute:
                 f.unlink()
+                _db_forget(f)
             removed += 1
     return removed
 
@@ -150,7 +213,12 @@ def archive_stale_entities(execute: bool) -> int:
             target_dir = archive_root / type_dir.name
             if execute:
                 target_dir.mkdir(parents=True, exist_ok=True)
-                f.rename(target_dir / f.name)
+                new_path = target_dir / f.name
+                f.rename(new_path)
+                # Drop the row pointing to the old path. The new location
+                # lives under entities/_archive/<type>/, which other code
+                # already excludes from indexing — so we don't re-insert.
+                _db_forget(f)
             moved += 1
     return moved
 

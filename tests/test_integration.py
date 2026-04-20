@@ -21,6 +21,10 @@ def test_harvest_then_extract_creates_entity(tmp_brain, sample_jsonl, monkeypatc
     monkeypatch.setattr(hs, "LEDGER_DB", tmp_brain / ".harvest.db")
     monkeypatch.setattr(hs, "PROJECTS_DIR", projects_dir)
     monkeypatch.setattr(hs, "CLAUDE_DIR", claude_dir)
+    # Cursor was added as a second harvest source; isolate it from the
+    # tester's real `~/.cursor/` so this test stays deterministic.
+    monkeypatch.setattr(hs, "CURSOR_PROJECTS_DIR",
+                        tmp_brain.parent / ".cursor" / "projects-empty")
 
     # Point config at temp dirs (all modules read from config at call time)
     temp_entity_types = {

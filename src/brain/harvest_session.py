@@ -32,6 +32,24 @@ LEDGER_DB = config.BRAIN_DIR / ".harvest.db"
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 
+# Cursor stores its agent transcripts at
+#   ~/.cursor/projects/<workspace-slug>/agent-transcripts/<uuid>/<uuid>.jsonl
+# Schema is similar to Claude's but uses `role` instead of `type` and has
+# no top-level `timestamp`. We harvest them alongside Claude sessions so
+# Cursor work shows up in the brain too.
+CURSOR_DIR = Path.home() / ".cursor"
+CURSOR_PROJECTS_DIR = CURSOR_DIR / "projects"
+
+# Cursor session IDs are namespaced (`cursor:<uuid>`) so they can't collide
+# with Claude UUIDs in the harvest ledger. Existing Claude entries stay
+# unprefixed for backward compatibility with the ledger written so far.
+CURSOR_PREFIX = "cursor:"
+
+# How recent a Cursor jsonl can be before we treat the session as still
+# active and skip it. Cursor has no per-session PID file like Claude, so
+# we fall back to a conservative mtime check.
+CURSOR_ACTIVE_WINDOW_SEC = 60
+
 MIN_MESSAGES = 4
 MAX_AGE_SECONDS = 86400
 MAX_MSG_CHARS = 3000
@@ -105,7 +123,11 @@ def rotate_harvested(max_entries: int = 2000) -> int:
 
 
 def find_all_session_jsonls() -> list[Path]:
-    """Find all session JSONL files across all projects."""
+    """Find all Claude session JSONL files across all projects.
+
+    Kept for backward compatibility; the harvester proper iterates the
+    union of Claude + Cursor via `_iter_all_sources()`.
+    """
     if not PROJECTS_DIR.exists():
         return []
     results = []
@@ -116,8 +138,50 @@ def find_all_session_jsonls() -> list[Path]:
     return results
 
 
+def find_cursor_session_jsonls() -> list[Path]:
+    """Find all Cursor agent transcripts.
+
+    Layout: `~/.cursor/projects/<workspace>/agent-transcripts/<uuid>/<uuid>.jsonl`.
+    The `subagents/` subdir under each transcript holds task-subagent
+    transcripts; we skip those for now (they're noisy and the parent
+    transcript already references the spawn).
+    """
+    if not CURSOR_PROJECTS_DIR.exists():
+        return []
+    results: list[Path] = []
+    for project_dir in CURSOR_PROJECTS_DIR.iterdir():
+        if not project_dir.is_dir():
+            continue
+        transcripts_root = project_dir / "agent-transcripts"
+        if not transcripts_root.is_dir():
+            continue
+        for session_dir in transcripts_root.iterdir():
+            if not session_dir.is_dir() or session_dir.name == "subagents":
+                continue
+            # Each session dir holds one `<uuid>.jsonl` file (and maybe a
+            # nested `subagents/` dir we ignore).
+            for jsonl in session_dir.glob("*.jsonl"):
+                results.append(jsonl)
+    return results
+
+
+def _is_cursor_path(jsonl_path: Path) -> bool:
+    try:
+        jsonl_path.relative_to(CURSOR_PROJECTS_DIR)
+        return True
+    except ValueError:
+        return False
+
+
 def get_session_id(jsonl_path: Path) -> str:
-    """Extract session ID from JSONL filename (filename minus .jsonl)."""
+    """Return the namespaced session ID for a transcript path.
+
+    Claude transcripts return their bare UUID (unchanged — keeps the
+    existing ledger valid). Cursor transcripts get a `cursor:` prefix so
+    they share the same harvest_state table without UUID collisions.
+    """
+    if _is_cursor_path(jsonl_path):
+        return f"{CURSOR_PREFIX}{jsonl_path.stem}"
     return jsonl_path.stem
 
 
@@ -156,7 +220,11 @@ def extract_messages(jsonl_path: Path, start_offset: int = 0) -> tuple[list[dict
             except json.JSONDecodeError:
                 continue
 
-            entry_type = entry.get("type")
+            # Claude uses `type`, Cursor uses `role` — accept either.
+            # If both are present (unlikely), `type` wins to preserve the
+            # historical semantics (Claude harvests are the established
+            # baseline).
+            entry_type = entry.get("type") or entry.get("role")
             if entry_type not in ("user", "assistant"):
                 continue
 
@@ -210,16 +278,45 @@ def extract_messages(jsonl_path: Path, start_offset: int = 0) -> tuple[list[dict
 
 
 def derive_project_name(jsonl_path: Path) -> str:
-    """Derive a human-readable project name from the JSONL path."""
-    project_dir_name = jsonl_path.parent.name
-    parts = project_dir_name.split("-")
-    meaningful = []
-    skip_prefixes = {"", "Users", "son", "Desktop", "Documents", "home"}
+    """Derive a human-readable project name from the JSONL path.
+
+    Claude lays out `~/.claude/projects/<dir-with-path-encoded>/<uuid>.jsonl`,
+    so the project name is `jsonl_path.parent.name`. Cursor lays out
+    `~/.cursor/projects/<workspace>/agent-transcripts/<uuid>/<uuid>.jsonl`,
+    so we walk one extra level up to reach the workspace dir. Either
+    way the directory is `Users-<user>-some-path` style; we strip the
+    leading filesystem-path prefix (`Users`, `home`, the current user,
+    common desktop folders) so the readable name is just `code/myproj`.
+
+    Username is resolved from `$USER` so this works for anyone — not
+    only the original author. (Previously hardcoded as "son".)
+
+    Cursor names get a `cursor/` prefix so it's obvious in the captured
+    `session-*.md` whether a turn came from Cursor or Claude Code.
+    """
+    if _is_cursor_path(jsonl_path):
+        # …/agent-transcripts/<uuid>/<uuid>.jsonl → workspace is 3 up.
+        try:
+            workspace_dir_name = jsonl_path.parents[2].name
+        except IndexError:
+            workspace_dir_name = jsonl_path.parent.name
+        prefix = "cursor/"
+    else:
+        workspace_dir_name = jsonl_path.parent.name
+        prefix = ""
+
+    parts = workspace_dir_name.split("-")
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    skip_prefixes = {"", "Users", "home", "Desktop", "Documents", "Downloads"}
+    if user:
+        skip_prefixes.add(user)
+    meaningful: list[str] = []
     for part in parts:
         if part in skip_prefixes and not meaningful:
             continue
         meaningful.append(part)
-    return "/".join(meaningful) if meaningful else project_dir_name
+    base = "/".join(meaningful) if meaningful else workspace_dir_name
+    return f"{prefix}{base}"
 
 
 def format_session_summary(messages: list[dict], project_name: str, session_id: str) -> str:
@@ -247,7 +344,14 @@ def format_session_summary(messages: list[dict], project_name: str, session_id: 
 
 
 def is_active_session(session_id: str) -> bool:
-    """Check if a session is currently active (has a PID file in sessions/)."""
+    """Check if a Claude Code session is currently active (PID still alive).
+
+    Cursor doesn't expose a per-session PID file, so for `cursor:` IDs
+    this returns False — the harvester instead uses an mtime guard
+    (`_cursor_recently_active`) to decide whether to skip a Cursor file.
+    """
+    if session_id.startswith(CURSOR_PREFIX):
+        return False
     sessions_dir = CLAUDE_DIR / "sessions"
     if not sessions_dir.exists():
         return False
@@ -268,23 +372,51 @@ def is_active_session(session_id: str) -> bool:
     return False
 
 
+def _cursor_recently_active(jsonl_path: Path, mtime: float) -> bool:
+    """Cursor-specific 'session is live' guard.
+
+    Cursor has no PID file, so we treat any transcript whose mtime is
+    within the last `CURSOR_ACTIVE_WINDOW_SEC` seconds as active and
+    skip it. The next harvest cycle will pick it up once it's quiet.
+
+    This is the equivalent of the active-session guard that prevents the
+    'dual-instance Mac freeze' from the Claude side — never spawn LLM
+    work on a session that's still being written.
+    """
+    return (time.time() - mtime) < CURSOR_ACTIVE_WINDOW_SEC
+
+
 def harvest_all() -> int:
     """Harvest all unprocessed, non-active sessions. Returns count harvested.
 
-    Two-tier dedup:
+    Sources scanned (union):
+      - `~/.claude/projects/*/*.jsonl`             (Claude Code)
+      - `~/.cursor/projects/*/agent-transcripts/*/*.jsonl`  (Cursor)
+
+    Two-tier dedup, shared across both sources:
       1. SQLite ledger (`get_offset` / `set_offset`) — authoritative,
          records *byte offset* so we resume long sessions incrementally.
+         Cursor IDs are namespaced (`cursor:<uuid>`) so they can't collide.
       2. Legacy `.harvested` text file — kept in sync so other tooling
          (e.g. `brain.clean.clean_stale_harvested`) still works.
 
     A session is harvested when:
-      - it's not currently active (PID still alive),
+      - it's not currently active (Claude PID alive, or Cursor file
+        touched in the last CURSOR_ACTIVE_WINDOW_SEC seconds),
       - its file mtime is within MAX_AGE_SECONDS, AND
       - either it has no offset yet OR new bytes appeared since last run.
+
+    Failures on one source never abort the other — Cursor is best-effort.
     """
     harvested = load_harvested()
     seen = set(harvested)
-    all_jsonls = find_all_session_jsonls()
+    all_jsonls = list(find_all_session_jsonls())
+    try:
+        all_jsonls.extend(find_cursor_session_jsonls())
+    except Exception:
+        # Cursor's directory layout could change without warning; we don't
+        # want a Cursor failure to break the (proven) Claude harvest path.
+        pass
     cutoff_time = time.time() - MAX_AGE_SECONDS
     count = 0
 
@@ -297,17 +429,23 @@ def harvest_all() -> int:
         session_id = get_session_id(jsonl_path)
 
         try:
-            mtime = jsonl_path.stat().st_mtime
-            size = jsonl_path.stat().st_size
+            stat = jsonl_path.stat()
         except OSError:
             continue
+        mtime = stat.st_mtime
+        size = stat.st_size
 
         if mtime < cutoff_time:
             mark(session_id)
             continue
 
-        if is_active_session(session_id):
-            continue
+        # Active-session guard — different mechanism per source.
+        if _is_cursor_path(jsonl_path):
+            if _cursor_recently_active(jsonl_path, mtime):
+                continue
+        else:
+            if is_active_session(session_id):
+                continue
 
         prior_offset = get_offset(session_id)
         if prior_offset >= size:
@@ -315,7 +453,11 @@ def harvest_all() -> int:
             mark(session_id)
             continue
 
-        messages, new_offset = extract_messages(jsonl_path, start_offset=prior_offset)
+        try:
+            messages, new_offset = extract_messages(jsonl_path, start_offset=prior_offset)
+        except Exception:
+            # A malformed Cursor transcript shouldn't block Claude harvest.
+            continue
         # Always advance the offset — even if this slice was too small —
         # so we don't reread the same prefix forever.
         set_offset(session_id, jsonl_path, new_offset)
@@ -333,7 +475,11 @@ def harvest_all() -> int:
 
         BRAIN_RAW.mkdir(parents=True, exist_ok=True)
         now = datetime.now()
-        filename = f"session-{now.strftime('%Y-%m-%d-%H%M%S')}-{session_id[:8]}.md"
+        # Strip the `cursor:` prefix for the filename slug (filesystem-safe)
+        # but keep it in the session-summary body (so the source is recorded).
+        slug = session_id.split(":", 1)[-1][:8]
+        source_tag = "cursor" if _is_cursor_path(jsonl_path) else "claude"
+        filename = f"session-{now.strftime('%Y-%m-%d-%H%M%S')}-{source_tag}-{slug}.md"
         output_path = BRAIN_RAW / filename
         output_path.write_text(summary)
 
