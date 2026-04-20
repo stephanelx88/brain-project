@@ -90,28 +90,26 @@ python ~/.brain/bin/x/ingest.py your-topic /tmp/x.jsonl
 # next launchd auto-extract pass picks it up automatically
 ```
 
-## Recommended schedule (launchd)
+## Schedule — shipped as Phase 0.5 (2026-04-20)
 
-Add to `~/Library/LaunchAgents/com.son.brain-autoresearch.plist`:
+Autoresearch runs autonomously via launchd. `brain init` now renders:
 
-```xml
-<key>StartCalendarInterval</key>
-<array>
-  <dict><key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer></dict>
-  <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>0</integer></dict>
-  <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>0</integer></dict>
-</array>
-<key>ProgramArguments</key>
-<array>
-  <string>/Users/son/.pyenv/versions/3.12.12/bin/python</string>
-  <string>-m</string>
-  <string>brain.autoresearch</string>
-  <string>--cycles</string>
-  <string>2</string>
-</array>
-```
+- `~/Library/LaunchAgents/com.$USER.brain-autoresearch.plist` —
+  `StartInterval=1800` (one cycle every 30 min), `Nice=15` (yields to
+  `auto-extract` + `semantic-worker`), `RunAtLoad=false` (no boot
+  thundering-herd), logs to `~/.brain/logs/autoresearch-launchd.log`.
+- `~/.brain/bin/autoresearch-tick.sh` — the tick entry point:
+  `flock` singleton → `program.md` existence check → `pgrep` guard
+  for concurrent `claude --print` (the dual-instance freeze risk) →
+  `python -m brain.autoresearch --cycles 1`.
 
-Three cycles a night, 2 questions per run = 6 cycles/morning. Per `program.md` 10-min budget, that's ~60 min total nightly compute, well under the 8-hour idle window.
+Each tick scores the eval set before + after the cycle and appends a
+row to `~/.brain/recall-ledger.jsonl`. `brain status` shows the latest
+miss rate + delta without the user having to read the ledger.
+
+`bin/doctor.sh` reports the three launchd jobs separately
+(`auto-extract`, `semantic-worker`, `autoresearch`), so a missing one
+isn't hidden behind a generic "loaded" message.
 
 ## Open knobs
 
@@ -120,11 +118,12 @@ Three cycles a night, 2 questions per run = 6 cycles/morning. Per `program.md` 1
 - **`BRAIN_TIME_DECAY`** (default 1) — set 0 to disable recency factor.
 - **`BRAIN_TIME_HALFLIFE_D`** (default 180) — recency halflife in days.
 - **`BRAIN_AR_IDLE_S`** (default 180) — seconds of inactivity before a cycle is allowed.
+- **`BRAIN_MISS_THRESHOLD`** (default 0.60) — per-query top-k cosine below which the recall counts as a miss in Question Coverage Score. 0.60 is calibrated for the multilingual-MiniLM encoder; Karpathy's 0.35 was for English MiniLM.
 
 ## Next likely upgrades (NOT yet built)
 
 1. **Reconcile-with-promote** — `brain reconcile --promote` walks `playground/` and pulls high-confidence items into `entities/` (currently the human does this by hand).
-2. **Question Coverage Score logger** — log every `brain_recall` call from real sessions with the top-3 scores so the metric in `program.md` becomes measurable rather than aspirational.
+2. ~~**Question Coverage Score logger** — log every `brain_recall` call from real sessions with the top-3 scores so the metric in `program.md` becomes measurable rather than aspirational.~~ **Partially shipped in Phase 0.5:** `src/brain/recall_metric.py` + `~/.brain/eval-queries.md` give the eval-set mode; the *live* mode (logging every real `brain_recall` via an MCP middleware hook) is still open.
 3. **Output renderers** — Marp slides + matplotlib figures from articles (per Karpathy's "render answers as markdown/Marp/png" pattern).
 4. **Multi-agent collaboration** — Karpathy's stated next step. SETI@home for personal brains. A negative-result protocol so multiple Sons (or Son's variants) don't repeat dead ends.
 5. **Synthetic data + finetuning** — once the playground has ~1000 high-quality articles, distill into a tiny LM that knows Son.

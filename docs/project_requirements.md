@@ -28,12 +28,31 @@ These predate the requirements log; captured here for context only.
 - **MCP tool surface** — `brain_recall`, `brain_get`, `brain_recent`, `brain_identity`, `brain_stats`, `brain_audit`, `brain_history`, `brain_semantic`, `brain_status`.
 - **Idle-gated launchd watcher** — `flock` singleton, skips LLM stages while a Claude/Cursor session is actively typing.
 - **Persona-aware `brain init`** — onboarding wizard with developer/researcher/student/lawyer/doctor/custom presets.
-- **Autoresearch loop** — `python -m brain.autoresearch` with fixed cycle budget (10-min wall-clock, 8 LLM calls), `playground/` agent sandbox, `program.md` spec.
+- **Autoresearch loop** — `python -m brain.autoresearch` with fixed cycle budget (10-min wall-clock, 8 LLM calls), `playground/` agent sandbox, `program.md` spec. Now runs autonomously via launchd every 30 min (see Phase 0.5 entry below).
 - **X crawler toolkit** — `~/.brain/bin/x/` (timeline, user_tweets, search, conversation) using authenticated Playwright session.
 
 ---
 
 ## Decision Log
+
+### 2026-04-20 — Phase 0.5 shipped: autonomous autoresearch + Question Coverage Score
+
+- **Decision:** Promote autoresearch from "manual `python -m brain.autoresearch`" to a launchd-driven background loop, and bolt on the first honest measurement harness so "did this cycle help?" is answerable without a human in the loop.
+- **Pieces shipped:**
+  - `templates/launchd/brain-autoresearch.plist.tmpl` + `templates/scripts/autoresearch-tick.sh.tmpl` — 30-min tick, `Nice=15` (yields to auto-extract + semantic-worker), `RunAtLoad=false`, flock + pgrep + `program.md` guards to avoid the Mac dual-instance freeze (incident 2026-04-11).
+  - `bin/install.sh` / `bin/uninstall.sh` / `bin/doctor.sh` — render + load + verify the new plist alongside the existing two (`com.son.brain-auto-extract`, `com.son.brain-semantic-worker`, `com.son.brain-autoresearch`).
+  - `src/brain/recall_metric.py` — new module implementing `program.md`'s Question Coverage Score. Loads an eval set from `~/.brain/eval-queries.md` (one `- query` line per prompt, 16-query default seeded on first run), scores each via semantic.search_facts + semantic.search_notes top-k, persists every run to `~/.brain/recall-ledger.jsonl`. Miss threshold **0.60** (tuned for the multilingual-MiniLM encoder the brain actually ships; Karpathy's spec of 0.35 was for English MiniLM and overfits on this encoder).
+  - `src/brain/autoresearch.py` — dedicated `call_claude()` with `--system-prompt` + `--tools ""` so the CLI can't wander into MCP lookups mid-synthesis; tougher `_parse_response()` that walks balanced braces so prose preambles don't break JSON parse; `run_cycle()` now measures pre/post coverage, re-ingests notes after writes so playground items are visible in the "after" score, logs a delta block per cycle, surfaces trajectory to stderr.
+  - `src/brain/audit.py` — dedupe items read `~/.brain/.dedupe.ledger.json` + cross-check file status (skip applied merges, missing files, `status: superseded`), and brain-related items get `BRAIN_PRIORITY_BOOST = +30` so fixing the brain itself surfaces first.
+  - `src/brain/status.py` — new `coverage` section on the dashboard:  `miss 6.7% (Δ↓6.7pp) · avg-top 0.695 @ thr 0.60  [17 eval runs logged]`.
+  - `src/brain/harvest_session.py` — Cursor active window 60s → 10s (byte-offset ledger makes partial harvests safe); `templates/scripts/auto-extract.sh.tmpl` swaps the 180s-mtime session guard for a pgrep-only check (the mtime gate never opened while Cursor was open all day, starving the LLM stages).
+- **Metric (live):** miss rate dropped from 13.3% → 6.7% across the baseline eval set during the build session itself; 1 miss remains (Vietnamese-tone preferences query).
+- **Status:** shipped — commits `dbcf5fa` (launchd) · `93dd9ec` (recall metric + autoresearch) · `5512f30` (audit ledger + brain boost) · `27031a2` (harvest + auto-extract guard) · `62ca71e` (audit detail path) · `632562e` (status coverage line). 133 unit tests pass.
+- **Explicitly not done (Phase 1 candidates):**
+  - Live recall-ledger mode — every real `brain_recall` call logged with top-k scores. The current harness is eval-set only; live mode needs an MCP middleware hook.
+  - Playground → `entities/` promotion CLI. Human still eyeballs `playground/hypotheses|insights|contradictions` before merging into the canonical vault.
+  - Realtime (≤10s) Obsidian sync (Goal 4). `harvest_session.CURSOR_ACTIVE_WINDOW_SEC` is now 10s; the ingest path still runs only on the 5-min auto-extract tick.
+- **Source:** this session (2026-04-20 night)
 
 ### 2026-04-20 — `brain status` becomes the operational dashboard
 
