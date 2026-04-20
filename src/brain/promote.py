@@ -387,6 +387,14 @@ def _render_entity(c: Candidate, src_rel: str) -> str:
             continue
         body_lines.append(line)
     body = "\n".join(body_lines).strip()
+    #  Drop any pre-existing `## Key Facts` block so we don't double-
+    #  render. Stops at the next `##` heading or EOF.
+    body = re.sub(
+        r"^##\s+Key Facts\s*$.*?(?=^##\s+|\Z)",
+        "",
+        body,
+        flags=re.MULTILINE | re.DOTALL,
+    ).strip()
     key_facts = _synthesize_key_facts(c)
     return (
         "\n".join(front)

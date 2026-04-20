@@ -366,6 +366,26 @@ def test_key_facts_falls_back_to_title_on_empty_body(vault):
     assert "Bare Bones" in text.split("## Key Facts")[1]
 
 
+def test_key_facts_replaces_existing_section(vault):
+    """If the playground item already has a `## Key Facts` block, it's
+    replaced (not doubled) so we never end up with two sections."""
+    _write_playground_item(
+        vault, "insights", "0001-foo.md",
+        title="Foo",
+        body=(
+            "## Key Facts\n"
+            "- stale bullet (source: old, 2026-01-01)\n\n"
+            "## Details\n\n"
+            "A meaningful paragraph about the important thing.\n"
+        ),
+    )
+    promote.run(apply=True)
+    text = (vault / "entities" / "insights" / "foo.md").read_text()
+    assert text.count("## Key Facts") == 1
+    assert "stale bullet" not in text
+    assert "## Details" in text  # unrelated sections preserved
+
+
 def test_extract_fact_paragraphs_respects_max_n():
     body = "\n\n".join(f"Sentence {i}. More text." for i in range(10))
     out = promote._extract_fact_paragraphs(body, max_n=3)
