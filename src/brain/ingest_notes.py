@@ -132,25 +132,31 @@ def ingest_all(verbose: bool = False) -> dict:
             print(f"  + {rel}", flush=True)
 
     # Notes that vanished from disk → delete from db
-    deleted = 0
+    deleted_paths: list[str] = []
     for rel in list(ledger.keys()):
         if rel in seen:
             continue
         if not (root / rel).exists():
             db.delete_note_by_path(rel)
-            deleted += 1
+            deleted_paths.append(rel)
             if verbose:
                 print(f"  - {rel}", flush=True)
 
-    # Push the diff into the semantic index (incremental — see semantic.py)
-    if changed or deleted:
+    # Push the diff into the semantic index (incremental — see semantic.py).
+    # Pass the *actually* deleted paths, not "everything in the ledger that
+    # we didn't see this run" — a transient stat() failure on a still-alive
+    # file would otherwise drop its embedding until the next full rebuild.
+    if changed or deleted_paths:
         try:
             from brain import semantic
-            semantic.update_notes(changed=[(r, t, b) for r, t, b in changed],
-                                  deleted_paths=[r for r in ledger if r not in seen])
+            semantic.update_notes(
+                changed=[(r, t, b) for r, t, b in changed],
+                deleted_paths=deleted_paths,
+            )
         except Exception as exc:
             if verbose:
                 print(f"  semantic update skipped: {exc}", flush=True)
+    deleted = len(deleted_paths)
 
     return {
         "scanned": scanned,

@@ -210,8 +210,25 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
         cur = conn.cursor()
         cur.execute("SELECT id FROM entities WHERE path = ?", (rel_path,))
         row = cur.fetchone()
-        if row:
+        is_update = row is not None
+        if is_update:
             entity_id = row[0]
+            # Capture previous fts_entity column values BEFORE the row's
+            # name/summary get overwritten — contentless FTS5 needs the
+            # exact previous values to delete the prior shadow row.
+            prev_row = cur.execute(
+                "SELECT name, COALESCE(summary,'') FROM entities WHERE id=?",
+                (entity_id,),
+            ).fetchone()
+            prev_aliases_row = cur.execute(
+                "SELECT GROUP_CONCAT(alias, ' ') FROM aliases WHERE entity_id=?",
+                (entity_id,),
+            ).fetchone()
+            prev_name = prev_row[0] if prev_row else name
+            prev_summary = prev_row[1] if prev_row else ""
+            prev_aliases = (
+                prev_aliases_row[0] if prev_aliases_row and prev_aliases_row[0] else ""
+            )
             cur.execute(
                 """UPDATE entities
                    SET type=?, slug=?, name=?, status=?, summary=?,
@@ -261,7 +278,20 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
                 (fid, fact_text, source or ""),
             )
 
-        cur.execute("DELETE FROM fts_entity WHERE rowid=?", (entity_id,))
+        # fts_entity is contentless (content=''), so a bare
+        # `DELETE FROM ... WHERE rowid=?` raises "cannot DELETE from
+        # contentless fts5 table". The FTS5-sanctioned drop is the
+        # 'delete' command, which requires the exact previous column
+        # values — and it MUST NOT be issued for a rowid that was never
+        # inserted, or it corrupts the index ("database disk image is
+        # malformed"). So delete only when this is an update of an
+        # existing row.
+        if is_update:
+            cur.execute(
+                "INSERT INTO fts_entity(fts_entity, rowid, name, aliases, summary) "
+                "VALUES('delete', ?, ?, ?, ?)",
+                (entity_id, prev_name, prev_aliases, prev_summary),
+            )
         cur.execute(
             "INSERT INTO fts_entity(rowid, name, aliases, summary) VALUES (?,?,?,?)",
             (entity_id, name, " ".join(aliases), summary or ""),
@@ -282,7 +312,23 @@ def delete_entity_by_path(path: Path | str) -> None:
             "DELETE FROM fts_facts WHERE rowid IN (SELECT id FROM facts WHERE entity_id=?)",
             (eid,),
         )
-        cur.execute("DELETE FROM fts_entity WHERE rowid=?", (eid,))
+        # Contentless FTS5 — must drop via the 'delete' command, not a
+        # bare DELETE. We need the previous column values, so re-read
+        # them from the entities row before we drop it below.
+        prev = cur.execute(
+            "SELECT name, COALESCE(summary,'') FROM entities WHERE id=?", (eid,)
+        ).fetchone()
+        if prev is not None:
+            prev_name, prev_summary = prev
+            aliases_row = cur.execute(
+                "SELECT GROUP_CONCAT(alias, ' ') FROM aliases WHERE entity_id=?", (eid,)
+            ).fetchone()
+            prev_aliases = (aliases_row[0] if aliases_row and aliases_row[0] else "")
+            cur.execute(
+                "INSERT INTO fts_entity(fts_entity, rowid, name, aliases, summary) "
+                "VALUES('delete', ?, ?, ?, ?)",
+                (eid, prev_name, prev_aliases, prev_summary),
+            )
         cur.execute("DELETE FROM facts WHERE entity_id=?", (eid,))
         cur.execute("DELETE FROM entities WHERE id=?", (eid,))
 
@@ -426,15 +472,25 @@ def search_entities(query: str, k: int = 10) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
-_FTS_SAFE = re.compile(r"[A-Za-z0-9_]+")
+_FTS_SAFE = re.compile(r"\w+", re.UNICODE)
 
 
 def _sanitize_fts(q: str) -> str:
-    """FTS5 MATCH is picky about punctuation; reduce to OR'd word tokens."""
+    """FTS5 MATCH is picky about punctuation; reduce to OR'd word tokens.
+
+    Uses Unicode `\\w` so non-ASCII queries (Vietnamese `Sơn`, Chinese
+    `长安`, Spanish `años`) survive intact. The previous ASCII-only
+    `[A-Za-z0-9_]+` chopped `Sơn` into `['S','n']`, returning garbage
+    matches for any accented or non-Latin term.
+
+    Each token is wrapped in double-quotes so FTS5 treats accented
+    chars literally; otherwise its default tokenizer would still
+    discard them at MATCH time.
+    """
     tokens = _FTS_SAFE.findall(q)
     if not tokens:
         return ""
-    return " OR ".join(tokens)
+    return " OR ".join(f'"{t}"' for t in tokens)
 
 
 def main():

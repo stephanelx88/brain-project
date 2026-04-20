@@ -7,10 +7,18 @@ import brain.config as config
 
 
 def _extract_frontmatter(text: str) -> dict:
-    """Extract YAML frontmatter as a simple dict."""
+    """Extract YAML frontmatter as a simple dict.
+
+    Tolerant of malformed files: a missing closing `---` returns `{}`
+    instead of raising ValueError (which previously crashed the entire
+    rebuild_index() call mid-loop).
+    """
     if not text.startswith("---"):
         return {}
-    end = text.index("---", 3)
+    try:
+        end = text.index("---", 3)
+    except ValueError:
+        return {}
     fm_text = text[3:end].strip()
     result = {}
     for line in fm_text.split("\n"):
@@ -52,7 +60,11 @@ def rebuild_index() -> None:
             sections.append(f"## {label}\n_No entities yet._\n")
             continue
 
-        files = sorted(type_dir.glob("*.md"))
+        # Skip machine-managed files (`_MOC.md`, `_placeholder.md`, etc.) —
+        # they're scaffolding, not entities. Other modules (auto_extract,
+        # clean) already filter them out; without this filter index.md
+        # ends up listing every type's MOC as if it were an entity.
+        files = sorted(p for p in type_dir.glob("*.md") if not p.name.startswith("_"))
         if not files:
             sections.append(f"## {label}\n_No entities yet._\n")
             continue
