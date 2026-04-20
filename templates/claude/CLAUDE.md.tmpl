@@ -36,6 +36,23 @@ about {{USERNAME}}. The brain is the source of truth.
 | `brain_recent` | Last N entities/facts |
 | `brain_identity` | Who-I-am snapshot |
 | `brain_stats` | Counts |
+| `brain_audit` | Top-N items needing a human decision (contested / dedupe / low-conf) |
+
+## Session-start audit (surface, don't dump)
+
+When the SessionStart hook prepends a `🧠 Brain audit —` block to the
+session context, **acknowledge it once at the top of your first reply**
+in a single line: e.g. *"FYI — your brain has 3 items pending review
+(1 contested, 2 merge candidates). Say `audit` if you want to walk
+through them."* Then proceed with the actual user request.
+
+Do not list every item, do not derail the user's task, do not nag on
+subsequent turns. If they ignore it, drop it. If they say "audit" /
+"show", call `brain_audit(limit=10)` and walk through them one at a time.
+
+In Cursor (no SessionStart hook), call `brain_audit(limit=3)` *only* on
+the first user message of a fresh session and apply the same surface-
+once rule.
 
 ## NEVER
 

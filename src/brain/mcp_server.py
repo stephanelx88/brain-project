@@ -247,6 +247,88 @@ def brain_semantic(query: str, k: int = 8, type: str | None = None) -> str:
 
 
 @mcp.tool()
+def brain_history(path: str, limit: int = 10) -> str:
+    """Return git commit history for one entity/note path.
+
+    Inspired by @shikhr_'s observation that git is already an episodic
+    memory layer for agents (https://x.com/shikhr_/status/...). Use this
+    to see how an entity evolved over time — author, date, subject, and
+    file diff stats — without leaving the brain MCP.
+
+    Args:
+      path: relative path under ~/.brain/ (e.g. `entities/people/madhav.md`)
+      limit: max commits (default 10, capped at 50)
+
+    Returns JSON list of {sha, date, author, subject, insertions, deletions}.
+    """
+    import subprocess
+    limit = max(1, min(int(limit), 50))
+    p = config.BRAIN_DIR / path
+    try:
+        p.resolve().relative_to(config.BRAIN_DIR.resolve())
+    except (ValueError, OSError):
+        return json.dumps({"error": f"path outside vault: {path}"})
+    try:
+        out = subprocess.check_output(
+            ["git", "log",
+             f"-{limit}",
+             "--pretty=format:%H\t%aI\t%an\t%s",
+             "--shortstat",
+             "--", path],
+            cwd=str(config.BRAIN_DIR),
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        ).decode("utf-8", errors="replace")
+    except subprocess.CalledProcessError as e:
+        return json.dumps({"error": f"git failed: {e.output.decode(errors='replace')}"})
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "git timed out"})
+    except FileNotFoundError:
+        return json.dumps({"error": "git not on PATH"})
+
+    commits: list[dict] = []
+    cur: dict | None = None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "\t" in line and len(line.split("\t", 3)) == 4:
+            if cur:
+                commits.append(cur)
+            sha, date, author, subject = line.split("\t", 3)
+            cur = {"sha": sha[:12], "date": date, "author": author,
+                   "subject": subject, "insertions": 0, "deletions": 0}
+        elif cur and ("insertion" in line or "deletion" in line):
+            for tok in line.replace(",", "").split():
+                if tok.isdigit():
+                    n = int(tok)
+                elif tok.startswith("insertion"):
+                    cur["insertions"] = n
+                elif tok.startswith("deletion"):
+                    cur["deletions"] = n
+    if cur:
+        commits.append(cur)
+    return json.dumps(commits, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def brain_audit(limit: int = 3) -> str:
+    """Top-N audit items the user should review (contested facts, high-confidence
+    merge candidates, decayed single-source claims). Call this at session start
+    and surface anything returned to the user as a brief 'brain has N items
+    needing a quick decision' nudge — don't list them all, just flag the count
+    and offer to walk through them on request.
+
+    Returns the same compact block the SessionStart hook prints. Empty string
+    when the brain is clean; in that case, surface nothing.
+    """
+    from brain import audit as audit_mod
+    limit = max(0, min(int(limit), 10))
+    items = audit_mod.top_n(limit=limit)
+    return audit_mod.format_for_session(items)
+
+
+@mcp.tool()
 def brain_stats() -> str:
     """High-level counts. Useful sanity check."""
     with db.connect() as conn:
