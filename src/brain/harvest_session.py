@@ -343,6 +343,39 @@ def format_session_summary(messages: list[dict], project_name: str, session_id: 
     return "\n".join(lines)
 
 
+def claude_active_sessions() -> list[dict]:
+    """Return all Claude Code sessions whose registered PID is still alive.
+
+    Walks `CLAUDE_DIR / "sessions" / *.json` once and yields, for every entry
+    whose recorded PID responds to `os.kill(pid, 0)`, a dict of:
+
+        {"session_id": str, "pid": int, "cwd": str}
+
+    JSON decode errors, missing fields, and dead PIDs are silently skipped.
+    Cursor sessions are not included (Cursor exposes no PID file).
+    """
+    sessions_dir = CLAUDE_DIR / "sessions"
+    if not sessions_dir.exists():
+        return []
+    out: list[dict] = []
+    for f in sessions_dir.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        sid = data.get("sessionId")
+        pid = data.get("pid")
+        cwd = data.get("cwd", "") or ""
+        if not sid or not pid:
+            continue
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError, TypeError):
+            continue
+        out.append({"session_id": sid, "pid": int(pid), "cwd": cwd})
+    return out
+
+
 def is_active_session(session_id: str) -> bool:
     """Check if a Claude Code session is currently active (PID still alive).
 
@@ -352,24 +385,7 @@ def is_active_session(session_id: str) -> bool:
     """
     if session_id.startswith(CURSOR_PREFIX):
         return False
-    sessions_dir = CLAUDE_DIR / "sessions"
-    if not sessions_dir.exists():
-        return False
-    for session_file in sessions_dir.glob("*.json"):
-        try:
-            data = json.loads(session_file.read_text())
-            if data.get("sessionId") == session_id:
-                # Check if the process is still running
-                pid = data.get("pid")
-                if pid:
-                    try:
-                        os.kill(pid, 0)  # signal 0 = check if alive
-                        return True
-                    except OSError:
-                        return False
-        except (json.JSONDecodeError, OSError):
-            continue
-    return False
+    return any(cs["session_id"] == session_id for cs in claude_active_sessions())
 
 
 def _cursor_recently_active(jsonl_path: Path, mtime: float) -> bool:

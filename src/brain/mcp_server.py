@@ -312,35 +312,6 @@ def brain_history(path: str, limit: int = 10) -> str:
     return json.dumps(commits, ensure_ascii=False, indent=2)
 
 
-def _claude_active_sessions() -> list[dict]:
-    """Claude sessions whose registered PID is still alive.
-
-    Mirrors the active-session check in `harvest_session.is_active_session`,
-    but returns the full set instead of yes/no for one ID. Reads from
-    `harvest_session.CLAUDE_DIR` so tests can monkeypatch one constant.
-    """
-    sessions_dir = harvest_session.CLAUDE_DIR / "sessions"
-    if not sessions_dir.exists():
-        return []
-    out: list[dict] = []
-    for f in sessions_dir.glob("*.json"):
-        try:
-            data = json.loads(f.read_text())
-        except (json.JSONDecodeError, OSError):
-            continue
-        sid = data.get("sessionId")
-        pid = data.get("pid")
-        cwd = data.get("cwd", "") or ""
-        if not sid or not pid:
-            continue
-        try:
-            os.kill(int(pid), 0)
-        except (OSError, ValueError, TypeError):
-            continue
-        out.append({"session_id": sid, "pid": int(pid), "cwd": cwd})
-    return out
-
-
 def _find_session_jsonl(session_id: str) -> Path | None:
     """Resolve a session_id (Claude UUID, `cursor:<uuid>`, or bare Cursor
     UUID) to its on-disk transcript jsonl. None if not found."""
@@ -383,7 +354,7 @@ def brain_live_sessions(active_within_sec: int = 300) -> str:
     now = datetime.now(timezone.utc)
     out: list[dict] = []
 
-    for cs in _claude_active_sessions():
+    for cs in harvest_session.claude_active_sessions():
         jsonl = _find_session_jsonl(cs["session_id"])
         last_write_iso = None
         age = None
