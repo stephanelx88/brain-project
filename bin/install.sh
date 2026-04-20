@@ -169,6 +169,12 @@ PLIST="$HOME_DIR/Library/LaunchAgents/com.${USERNAME}.brain-auto-extract.plist"
 mkdir -p "$(dirname "$PLIST")"
 render "$PROJECT_DIR/templates/launchd/brain-auto-extract.plist.tmpl" "$PLIST"
 
+# Persistent semantic-embedding worker — keeps sentence-transformers warm
+# so each ingest pays ~0.5 s instead of ~10 s cold-start. Optional, but
+# the only way to hit the ≤10 s sync goal.
+SEM_PLIST="$HOME_DIR/Library/LaunchAgents/com.${USERNAME}.brain-semantic-worker.plist"
+render "$PROJECT_DIR/templates/launchd/brain-semantic-worker.plist.tmpl" "$SEM_PLIST"
+
 CLAUDE_MD="$HOME_DIR/.claude/CLAUDE.md"
 mkdir -p "$(dirname "$CLAUDE_MD")"
 if [[ -f "$CLAUDE_MD" ]] && ! grep -q "Personal Brain — Mandatory Use" "$CLAUDE_MD" 2>/dev/null; then
@@ -269,14 +275,18 @@ echo "      ✓ index ready"
 # ──────────────────────────────────────────────────────────────────────
 # 7. Load launchd job (unload first so re-runs pick up plist changes)
 # ──────────────────────────────────────────────────────────────────────
-echo "[7/8] load launchd watcher"
+echo "[7/8] load launchd watcher + semantic worker"
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
+launchctl unload "$SEM_PLIST" 2>/dev/null || true
+launchctl load "$SEM_PLIST"
 # launchctl load is asynchronous — the job may take a beat to appear in
 # `launchctl list`. Poll briefly so the success message is honest.
 LAUNCHD_LABEL="com.${USERNAME}.brain-auto-extract"
+SEM_LABEL="com.${USERNAME}.brain-semantic-worker"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if launchctl list | grep -q "$LAUNCHD_LABEL"; then break; fi
+  if launchctl list | grep -q "$LAUNCHD_LABEL" \
+     && launchctl list | grep -q "$SEM_LABEL"; then break; fi
   sleep 0.3
 done
 if launchctl list | grep -q "$LAUNCHD_LABEL"; then
@@ -285,6 +295,11 @@ else
   echo "      ✗ launchctl load returned 0 but '$LAUNCHD_LABEL' is not visible."
   echo "        Check $PLIST then run: launchctl bootstrap gui/\$(id -u) $PLIST"
   exit 1
+fi
+if launchctl list | grep -q "$SEM_LABEL"; then
+  echo "      ✓ semantic worker live (cold-start once, warm forever)"
+else
+  echo "      ! semantic worker not visible — ingest will fall back to in-process embedding"
 fi
 
 # ──────────────────────────────────────────────────────────────────────

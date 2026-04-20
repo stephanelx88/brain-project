@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -272,6 +273,87 @@ def update_notes(changed: list[tuple[str, str, str]],
         META_JSON.write_text(json.dumps(m, indent=2))
 
     return {"changed": len(changed), "deleted": len(drop_idx)}
+
+
+def _worker_socket_path() -> Path:
+    """Resolve the persistent worker's UNIX socket. Indirected so tests can
+    point it at a temp socket without monkey-patching multiple call sites."""
+    return config.BRAIN_DIR / ".semantic.sock"
+
+
+def _readline_json(sock: socket.socket, max_bytes: int = 1 << 20) -> dict:
+    buf = b""
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise IOError("worker closed connection mid-reply")
+        buf += chunk
+        if b"\n" in buf:
+            line, _, _ = buf.partition(b"\n")
+            return json.loads(line)
+        if len(buf) > max_bytes:
+            raise IOError("worker reply exceeded max_bytes")
+
+
+def update_notes_via_worker(
+    changed: list[tuple[str, str, str]],
+    deleted_paths: list[str],
+    *,
+    connect_timeout: float = 0.5,
+    request_timeout: float = 30.0,
+) -> dict:
+    """Hand the diff to the persistent semantic worker over a UNIX socket.
+
+    Falls back to the in-process update_notes() on any failure (socket
+    missing, worker dead, timeout, malformed reply). The fallback path
+    pays the ~10 s cold-start exactly once, then keeps using the in-process
+    model — no worse than the pre-worker baseline.
+
+    Returns a dict shaped like update_notes() with an extra `via_worker`
+    flag so callers / tests can tell which path ran.
+    """
+    if not changed and not deleted_paths:
+        return {"changed": 0, "deleted": 0}
+
+    sock_path = _worker_socket_path()
+    if not sock_path.exists():
+        return update_notes(changed, deleted_paths)
+
+    s = None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(connect_timeout)
+        s.connect(str(sock_path))
+        s.settimeout(request_timeout)
+
+        result: dict = {"changed": 0, "deleted": 0, "via_worker": True}
+
+        if deleted_paths:
+            req = {"op": "delete_notes", "paths": deleted_paths}
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            r = _readline_json(s)
+            if not r.get("ok"):
+                raise RuntimeError(r.get("error", "worker error on delete"))
+            result["deleted"] = r.get("deleted", 0)
+
+        if changed:
+            items = [{"path": rel, "title": t, "body": b} for rel, t, b in changed]
+            req = {"op": "upsert_notes", "items": items}
+            s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+            r = _readline_json(s)
+            if not r.get("ok"):
+                raise RuntimeError(r.get("error", "worker error on upsert"))
+            result["changed"] = r.get("changed", 0)
+
+        return result
+    except Exception:
+        return update_notes(changed, deleted_paths)
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
 
 
 def _is_stale(threshold_seconds: float = 6 * 3600) -> bool:

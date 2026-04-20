@@ -149,7 +149,10 @@ def ingest_all(verbose: bool = False) -> dict:
     if changed or deleted_paths:
         try:
             from brain import semantic
-            semantic.update_notes(
+            # Prefer the persistent worker (model stays warm between launchd
+            # ticks → ~0.5 s instead of ~10 s cold-start). Falls back to
+            # in-process embedding when the worker isn't running.
+            semantic.update_notes_via_worker(
                 changed=[(r, t, b) for r, t, b in changed],
                 deleted_paths=deleted_paths,
             )

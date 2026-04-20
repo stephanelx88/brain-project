@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.{{USERNAME}}.brain-semantic-worker</string>
+
+    <!-- Persistent embedding worker. Holds sentence-transformers in memory
+         so each ingest pays ~0.5 s instead of cold-loading the model
+         (~10 s) every WatchPaths fire. See src/brain/semantic_worker.py
+         for the protocol. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PYTHON}}</string>
+        <string>-m</string>
+        <string>brain.semantic_worker</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>{{PROJECT_DIR}}/src</string>
+        <key>PATH</key>
+        <string>/Users/{{USERNAME}}/.local/bin:/Users/{{USERNAME}}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if the worker dies (OOM, embed bug, etc).
+         macOS will throttle to one launch / 10 s if the worker exits
+         immediately, which is the right backoff. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}/.brain</string>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/.brain/logs/semantic-worker.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.brain/logs/semantic-worker.log</string>
+</dict>
+</plist>
