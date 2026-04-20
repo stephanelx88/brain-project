@@ -42,16 +42,25 @@ echo "  PURGE VAULT: $PURGE"
 echo
 
 PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-auto-extract.plist"
+SEM_PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-semantic-worker.plist"
+AR_PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-autoresearch.plist"
 
 echo "[1/5] launchd"
-if launchctl list 2>/dev/null | grep -q "com\.${USERNAME}\.brain-auto-extract"; then
-  launchctl unload "$PLIST" 2>/dev/null || true
-  echo "      ✓ unloaded"
-fi
-if [[ -f "$PLIST" ]]; then
-  rm -f "$PLIST"
-  echo "      ✓ removed $PLIST"
-fi
+for label_plist in \
+    "com.${USERNAME}.brain-auto-extract:$PLIST" \
+    "com.${USERNAME}.brain-semantic-worker:$SEM_PLIST" \
+    "com.${USERNAME}.brain-autoresearch:$AR_PLIST"; do
+  label="${label_plist%%:*}"
+  plist="${label_plist#*:}"
+  if launchctl list 2>/dev/null | grep -q "$label"; then
+    launchctl unload "$plist" 2>/dev/null || true
+    echo "      ✓ unloaded $label"
+  fi
+  if [[ -f "$plist" ]]; then
+    rm -f "$plist"
+    echo "      ✓ removed $plist"
+  fi
+done
 
 echo "[2/5] MCP registrations"
 if command -v claude >/dev/null 2>&1; then
@@ -87,6 +96,7 @@ fi
 
 echo "[3/5] generated files"
 rm -f "$BRAIN_DIR/bin/auto-extract.sh" \
+      "$BRAIN_DIR/bin/autoresearch-tick.sh" \
       "$BRAIN_DIR/bin/doctor.sh" \
       "$BRAIN_DIR/.brain.conf" \
       "$BRAIN_DIR/cursor-user-rules.md"

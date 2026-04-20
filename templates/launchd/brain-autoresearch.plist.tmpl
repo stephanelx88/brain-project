@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.{{USERNAME}}.brain-autoresearch</string>
+
+    <!-- Phase 0.5: autonomous autoresearch. Runs one cycle every 30 min
+         on a pure timer (no WatchPaths — autoresearch reads the whole
+         vault on its own, and cycles are expensive, so we don't want
+         every file save to trigger one). The tick script does flock +
+         pgrep guards itself. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>{{HOME}}/.brain/bin/autoresearch-tick.sh</string>
+    </array>
+
+    <!-- 30 minutes. Coarser than auto-extract's 5-min safety poll
+         because one cycle can take 5-10 min of wall clock + LLM tokens;
+         we want breathing room between them. Override with
+         `launchctl setenv BRAIN_AR_BUDGET_S 300` for shorter budgets. -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <!-- RunAtLoad=false so `install.sh` doesn't kick off a 5-min cycle
+         right when the user runs it. First tick happens 30 min after
+         launchd loads the job (or immediately on `launchctl kickstart`). -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Lower priority than auto-extract (nice default) and the semantic
+         worker (nice 10). Autoresearch is opportunistic background
+         thinking; it should yield to anything the user-facing brain
+         needs. -->
+    <key>Nice</key>
+    <integer>15</integer>
+
+    <key>WorkingDirectory</key>
+    <string>{{HOME}}/.brain</string>
+
+    <key>StandardOutPath</key>
+    <string>{{HOME}}/.brain/logs/autoresearch-launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{HOME}}/.brain/logs/autoresearch-launchd.log</string>
+</dict>
+</plist>

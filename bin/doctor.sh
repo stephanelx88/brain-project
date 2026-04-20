@@ -65,10 +65,20 @@ fi
 
 hdr "2. launchd"
 if launchctl list | grep -q "com\.${USERNAME}\.brain-auto-extract"; then
-  ok "launchd job loaded"
+  ok "auto-extract launchd job loaded"
 else
-  bad "launchd job not loaded"
+  bad "auto-extract launchd job not loaded"
   warn "  fix: launchctl load $PLIST"
+fi
+if launchctl list | grep -q "com\.${USERNAME}\.brain-semantic-worker"; then
+  ok "semantic-worker launchd job loaded"
+else
+  warn "semantic-worker not loaded — ingest will cold-start the model each run"
+fi
+if launchctl list | grep -q "com\.${USERNAME}\.brain-autoresearch"; then
+  ok "autoresearch launchd job loaded (one cycle / 30 min)"
+else
+  warn "autoresearch not loaded — cycles will need manual runs"
 fi
 
 if [[ -f "$LOG" ]]; then
