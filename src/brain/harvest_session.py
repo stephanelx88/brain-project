@@ -47,8 +47,11 @@ CURSOR_PREFIX = "cursor:"
 
 # How recent a Cursor jsonl can be before we treat the session as still
 # active and skip it. Cursor has no per-session PID file like Claude, so
-# we fall back to a conservative mtime check.
-CURSOR_ACTIVE_WINDOW_SEC = 60
+# we fall back to an mtime check. Shorter = faster recall loop (vault sees
+# new facts sooner); longer = fewer partial-turn harvests. The byte-offset
+# ledger makes partial harvests safe — the next pass picks up the delta —
+# so 10s is a reasonable "near-realtime" default.
+CURSOR_ACTIVE_WINDOW_SEC = 10
 
 MIN_MESSAGES = 4
 MAX_AGE_SECONDS = 86400
