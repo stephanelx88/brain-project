@@ -35,6 +35,21 @@ These predate the requirements log; captured here for context only.
 
 ## Decision Log
 
+### 2026-04-20 — Phase 1 (first win): promote closes the autoresearch feedback loop
+
+- **Decision:** Ship `brain.promote` with synthesized `## Key Facts` sections so playground items reach the `entities/` fact index on promotion — closing the last open wire in the autoresearch feedback loop. Before this, promoted entities lived on disk but had zero rows in `facts` (the renderer copied prose without extracting bullets), so fact-search stayed blind to every promotion and the brain couldn't build on its own reasoning.
+- **Pieces shipped:**
+  - `src/brain/promote.py` — scans `playground/insights|hypotheses` for `confidence: high`, `len(refs) ≥ 2`, `created_at ≤ 14d` items; writes canonical `entities/insights/*.md` with synthesized Key Facts that match `db._SOURCE_RE` so every bullet lands in the `facts` table; annotates source with `status: promoted`; re-runs `semantic.build()` in one pass.
+  - `_synthesize_key_facts()` / `_extract_fact_paragraphs()` — deterministic, no-LLM extraction that turns paragraphs or bullet lists into sourced fact bullets. Drops scaffolding (`testable_via:`, `status:`) and falls back to the title so empty bodies still leave a row behind.
+  - `--rerender` CLI — regenerates already-promoted entities against the current render (needed when the renderer itself changes, as it did here). Keeps playground `status: promoted` annotations intact.
+  - `entities/techniques/playground-to-entities-promotion-via-brain-promote.md` — canonical doc entity written into the live vault so "how do playground items reach entities" is answerable from the brain itself.
+- **Metric (live):** miss rate 6.7% → 0.0% on the 15-query eval set after rerender + upsert — the query "playground promotion to entities" flipped from 0.569 (miss at thr 0.60) to 0.716 (ok). `brain status` now shows `coverage: miss 0.0% (Δ↓6.7pp) · avg-top 0.705 @ thr 0.60`.
+- **Status:** shipped — 29 promote tests pass, 162 total. Full suite green.
+- **Explicitly not done (Phase 1 still has):**
+  - Live recall-ledger mode (every real `brain_recall` logged, rolling 7-day coverage).
+  - Realtime (≤10s) Obsidian sync — ingest still runs on the 5-min auto-extract tick.
+  - `brain reconcile --promote` integration — promote is a separate command for now; wiring it into the reconcile flow is cleaner but adds coupling we don't need yet.
+
 ### 2026-04-20 — Phase 0.5 shipped: autonomous autoresearch + Question Coverage Score
 
 - **Decision:** Promote autoresearch from "manual `python -m brain.autoresearch`" to a launchd-driven background loop, and bolt on the first honest measurement harness so "did this cycle help?" is answerable without a human in the loop.
