@@ -3,7 +3,7 @@
 Covers the integration added when Cursor was added as a second harvest
 source alongside Claude Code:
   * `extract_messages` accepts Cursor's `role` schema as a synonym for `type`.
-  * `_is_cursor_path` correctly identifies cursor-rooted transcripts.
+  * `is_cursor_path` correctly identifies cursor-rooted transcripts.
   * `get_session_id` namespaces cursor IDs with `cursor:` so they can't
     collide with Claude UUIDs.
   * `derive_project_name` walks one level higher for cursor's nested
@@ -71,12 +71,12 @@ def test_is_cursor_path(tmp_path, monkeypatch):
         tmp_path, "Users-x-foo", "abcd1234",
         [{"role": "user", "message": {"content": "x"}}],
     )
-    assert hs._is_cursor_path(cursor_jsonl) is True
+    assert hs.is_cursor_path(cursor_jsonl) is True
 
     claude_jsonl = tmp_path / "claude" / "abcd1234.jsonl"
     claude_jsonl.parent.mkdir(parents=True)
     claude_jsonl.write_text("{}\n")
-    assert hs._is_cursor_path(claude_jsonl) is False
+    assert hs.is_cursor_path(claude_jsonl) is False
 
 
 def test_get_session_id_namespaces_cursor(tmp_path, monkeypatch):

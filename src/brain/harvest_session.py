@@ -165,7 +165,7 @@ def find_cursor_session_jsonls() -> list[Path]:
     return results
 
 
-def _is_cursor_path(jsonl_path: Path) -> bool:
+def is_cursor_path(jsonl_path: Path) -> bool:
     try:
         jsonl_path.relative_to(CURSOR_PROJECTS_DIR)
         return True
@@ -180,7 +180,7 @@ def get_session_id(jsonl_path: Path) -> str:
     existing ledger valid). Cursor transcripts get a `cursor:` prefix so
     they share the same harvest_state table without UUID collisions.
     """
-    if _is_cursor_path(jsonl_path):
+    if is_cursor_path(jsonl_path):
         return f"{CURSOR_PREFIX}{jsonl_path.stem}"
     return jsonl_path.stem
 
@@ -294,7 +294,7 @@ def derive_project_name(jsonl_path: Path) -> str:
     Cursor names get a `cursor/` prefix so it's obvious in the captured
     `session-*.md` whether a turn came from Cursor or Claude Code.
     """
-    if _is_cursor_path(jsonl_path):
+    if is_cursor_path(jsonl_path):
         # …/agent-transcripts/<uuid>/<uuid>.jsonl → workspace is 3 up.
         try:
             workspace_dir_name = jsonl_path.parents[2].name
@@ -440,7 +440,7 @@ def harvest_all() -> int:
             continue
 
         # Active-session guard — different mechanism per source.
-        if _is_cursor_path(jsonl_path):
+        if is_cursor_path(jsonl_path):
             if _cursor_recently_active(jsonl_path, mtime):
                 continue
         else:
@@ -478,7 +478,7 @@ def harvest_all() -> int:
         # Strip the `cursor:` prefix for the filename slug (filesystem-safe)
         # but keep it in the session-summary body (so the source is recorded).
         slug = session_id.split(":", 1)[-1][:8]
-        source_tag = "cursor" if _is_cursor_path(jsonl_path) else "claude"
+        source_tag = "cursor" if is_cursor_path(jsonl_path) else "claude"
         filename = f"session-{now.strftime('%Y-%m-%d-%H%M%S')}-{source_tag}-{slug}.md"
         output_path = BRAIN_RAW / filename
         output_path.write_text(summary)
