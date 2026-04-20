@@ -72,6 +72,7 @@ class StatusReport:
     pending_audit: dict
     vault: dict
     coverage: dict = field(default_factory=dict)
+    live_coverage: dict = field(default_factory=dict)
 
 
 # ---------- helpers --------------------------------------------------------
@@ -427,6 +428,32 @@ def _coverage() -> dict:
     return out
 
 
+def _live_coverage(days: int = 7) -> dict:
+    """Rolling-window coverage computed from real `brain_recall` calls
+    the MCP server logged with `kind: "live"`. Complements `_coverage()`
+    (which reads synthetic eval-set rows) by answering "how well is
+    the brain serving actual queries this week?".
+
+    Tolerant of missing ledger, missing/malformed rows, and no live
+    calls yet (returns `available: False` — the formatter hides the
+    line entirely)."""
+    out = {
+        "available": False, "days": days, "total_calls": 0,
+        "misses": 0, "score": 0.0, "avg_top": 0.0,
+    }
+    if not RECALL_LEDGER.exists():
+        return out
+    try:
+        from brain import recall_metric
+    except Exception:
+        return out
+    try:
+        data = recall_metric.live_coverage(days=days)
+    except Exception:
+        return out
+    return data
+
+
 def _vault_counts() -> dict:
     """Cheap entity / raw counts. Reads filesystem only — no SQLite, so
     this still works when the mirror hasn't been built yet."""
@@ -469,6 +496,7 @@ def gather() -> StatusReport:
         pending_audit=_pending_audit(),
         vault=_vault_counts(),
         coverage=_coverage(),
+        live_coverage=_live_coverage(),
     )
 
 
@@ -540,6 +568,16 @@ def format_text(report: StatusReport) -> str:
     else:
         coverage_line = "no autoresearch cycles logged yet"
 
+    L = report.live_coverage or {}
+    if L.get("available"):
+        live_miss_pct = f"{L['score'] * 100:.1f}%"
+        live_avg = f"avg-top {L['avg_top']:.3f}"
+        live_line = (f"miss {live_miss_pct} · {live_avg}  "
+                     f"[{L['total_calls']} calls, "
+                     f"{L.get('queries', 0)} uniq, last {L['days']}d]")
+    else:
+        live_line = None  # hidden until the MCP has logged real calls
+
     lines = [
         "🧠 Brain status",
         f"  vault       : {report.brain_dir}",
@@ -551,10 +589,14 @@ def format_text(report: StatusReport) -> str:
         f"  ledgers     : {LD['harvested']} harvested, "
         f"{LD['dedupe_verdicts']} dedupe verdicts cached",
         f"  coverage    : {coverage_line}",
+    ]
+    if live_line is not None:
+        lines.append(f"  live recall : {live_line}")
+    lines.extend([
         f"  audit       : {audit_line}",
         f"  vault stats : {V['entities_total']} entities across "
         f"{len(V['by_type'])} types, {V['raw_pending']} raw pending",
-    ]
+    ])
     return "\n".join(lines)
 
 

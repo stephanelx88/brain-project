@@ -237,11 +237,17 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     """
     k = max(1, min(int(k), 25))
     semantic.ensure_built()
-    return json.dumps(
-        semantic.hybrid_search(query, k=k, type=type),
-        ensure_ascii=False,
-        indent=2,
-    )
+    results = semantic.hybrid_search(query, k=k, type=type)
+    #  Live recall-ledger mode: every real call Son fires lands in
+    #  ~/.brain/recall-ledger.jsonl with its top cosine score, so
+    #  `recall_metric.live_coverage()` can report rolling coverage
+    #  computed from actual usage (not the synthetic eval set).
+    try:
+        from brain import recall_metric
+        recall_metric.log_live_recall(query)
+    except Exception:
+        pass
+    return json.dumps(results, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -250,11 +256,13 @@ def brain_semantic(query: str, k: int = 8, type: str | None = None) -> str:
     paraphrase recall and don't care about exact keyword matches."""
     k = max(1, min(int(k), 25))
     semantic.ensure_built()
-    return json.dumps(
-        semantic.search_facts(query, k=k, type=type),
-        ensure_ascii=False,
-        indent=2,
-    )
+    results = semantic.search_facts(query, k=k, type=type)
+    try:
+        from brain import recall_metric
+        recall_metric.log_live_recall(query)
+    except Exception:
+        pass
+    return json.dumps(results, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

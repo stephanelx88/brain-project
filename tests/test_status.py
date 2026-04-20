@@ -207,6 +207,56 @@ def test_coverage_tolerates_corrupt_lines(fake_vault, monkeypatch):
     assert rep.coverage["latest_score"] == 0.05
 
 
+def test_live_coverage_hidden_when_no_live_rows(fake_vault, monkeypatch):
+    """eval-only ledger → live line hidden (available=False)."""
+    _stub_launchctl_not_loaded(monkeypatch)
+    (fake_vault / "recall-ledger.jsonl").write_text(
+        '{"ts":"2026-04-20T14:00:00Z","kind":"eval","score":0.1,'
+        '"total":10,"misses":1,"avg_top":0.7,"threshold":0.6}\n'
+    )
+    # Point recall_metric at the fake ledger too — it reads directly.
+    from brain import recall_metric
+    monkeypatch.setattr(recall_metric, "LEDGER", fake_vault / "recall-ledger.jsonl")
+    rep = status.gather()
+    assert rep.live_coverage["available"] is False
+    out = status.format_text(rep)
+    assert "live recall" not in out
+
+
+def test_live_coverage_parsed_and_rendered(fake_vault, monkeypatch):
+    """live rows within the window show up in the dashboard."""
+    _stub_launchctl_not_loaded(monkeypatch)
+    from datetime import datetime, timezone
+    recent = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (fake_vault / "recall-ledger.jsonl").write_text(
+        f'{{"ts":"{recent}","kind":"live","query":"a","top_score":0.8,'
+        '"miss":false,"threshold":0.6}\n'
+        f'{{"ts":"{recent}","kind":"live","query":"b","top_score":0.4,'
+        '"miss":true,"threshold":0.6}\n'
+    )
+    from brain import recall_metric
+    monkeypatch.setattr(recall_metric, "LEDGER", fake_vault / "recall-ledger.jsonl")
+    rep = status.gather()
+    assert rep.live_coverage["available"] is True
+    assert rep.live_coverage["total_calls"] == 2
+    assert rep.live_coverage["misses"] == 1
+    out = status.format_text(rep)
+    assert "live recall" in out
+    assert "50.0%" in out
+
+
+def test_live_coverage_ignores_rows_outside_window(fake_vault, monkeypatch):
+    _stub_launchctl_not_loaded(monkeypatch)
+    (fake_vault / "recall-ledger.jsonl").write_text(
+        '{"ts":"2020-01-01T00:00:00Z","kind":"live","query":"old",'
+        '"top_score":0.8,"miss":false,"threshold":0.6}\n'
+    )
+    from brain import recall_metric
+    monkeypatch.setattr(recall_metric, "LEDGER", fake_vault / "recall-ledger.jsonl")
+    rep = status.gather()
+    assert rep.live_coverage["available"] is False
+
+
 def test_delta_str_formats():
     assert status._delta_str(None) is None
     assert status._delta_str(5) == "5s"

@@ -213,6 +213,94 @@ def score_coverage(
     return report
 
 
+def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
+    """Append one `kind: "live"` row to the recall ledger.
+
+    Called from the MCP `brain_recall` handler on every real query Son
+    fires at the brain. The ledger is the data source for
+    `live_coverage()`, which gives rolling-window coverage computed
+    from actual usage (as opposed to the synthetic eval set).
+
+    Failures are silenced — a logging hiccup must never break the
+    user-facing recall path.
+    """
+    try:
+        score, label = _top_score_for(query)
+    except Exception:
+        return
+    try:
+        LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with LEDGER.open("a") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "kind": "live",
+                "query": query[:200],
+                "top_score": round(score, 4),
+                "top_hit": label,
+                "miss": score < threshold,
+                "threshold": threshold,
+            }) + "\n")
+    except Exception:
+        return
+
+
+def live_coverage(days: int = 7) -> dict:
+    """Compute rolling coverage over `kind: "live"` ledger entries
+    within the last `days`. Returns a small dict ready to render.
+
+    Unlike the eval-set score, this reflects *actual* usage. A high
+    miss rate here means Son keeps hitting topics the brain doesn't
+    cover, regardless of how well it scores on the fixed eval set.
+    """
+    cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
+    hits = 0
+    misses = 0
+    score_sum = 0.0
+    queries: set[str] = set()
+    if not LEDGER.exists():
+        return {
+            "available": False, "days": days, "queries": 0,
+            "total_calls": 0, "misses": 0, "hits": 0,
+            "score": 0.0, "avg_top": 0.0,
+        }
+    for raw in LEDGER.read_text(errors="replace").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            row = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if row.get("kind") != "live":
+            continue
+        ts = row.get("ts", "")
+        try:
+            t = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            ).timestamp()
+        except ValueError:
+            continue
+        if t < cutoff:
+            continue
+        score_sum += float(row.get("top_score", 0.0))
+        if row.get("miss"):
+            misses += 1
+        else:
+            hits += 1
+        queries.add(row.get("query", ""))
+    total = hits + misses
+    return {
+        "available": total > 0,
+        "days": days,
+        "queries": len(queries),
+        "total_calls": total,
+        "misses": misses,
+        "hits": hits,
+        "score": (misses / total) if total else 0.0,
+        "avg_top": (score_sum / total) if total else 0.0,
+    }
+
+
 def diff_reports(before: CoverageReport, after: CoverageReport) -> dict:
     """Compute a structured delta between two coverage reports run on the
     same eval set."""
