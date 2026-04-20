@@ -235,3 +235,25 @@ def test_brain_live_tail_unknown_session(tmp_path, monkeypatch):
 
     out = json.loads(mcp_server.brain_live_tail("does-not-exist"))
     assert out["error"].startswith("session not found")
+
+
+def test_brain_live_tail_returns_claude_session(tmp_path, monkeypatch):
+    import os
+    from brain import harvest_session, mcp_server
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    my_pid = os.getpid()
+    _write_claude_session(claude_root, "claude-tail-1", my_pid, "/tmp/work", entries=[
+        {"type": "user", "message": {"content": [{"type": "text", "text": "hello claude"}]}},
+        {"type": "assistant", "message": {"content": [{"type": "text", "text": "hello back"}]}},
+    ])
+
+    out = json.loads(mcp_server.brain_live_tail("claude-tail-1", n=5))
+    assert "error" not in out
+    assert out["source"] == "claude"
+    assert out["session_id"] == "claude-tail-1"
+    assert out["total_turns"] == 2
+    assert out["turns"][-1]["text"] == "hello back"

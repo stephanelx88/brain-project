@@ -473,7 +473,7 @@ def brain_live_tail(session_id: str, n: int = 20) -> str:
     except OSError:
         last_write = None
 
-    source = "cursor" if str(jsonl).startswith(str(harvest_session.CURSOR_PROJECTS_DIR)) else "claude"
+    source = "cursor" if harvest_session.is_cursor_path(jsonl) else "claude"
     return json.dumps({
         "source": source,
         "session_id": session_id,
