@@ -35,6 +35,15 @@ These predate the requirements log; captured here for context only.
 
 ## Decision Log
 
+### 2026-04-20 — Phase 1 (second push): autoresearch auto-promotes + live recall-ledger
+
+Two follow-ups the moment Phase 1 first win flipped the miss rate to 0.0%.
+
+- **Autoresearch auto-promotes every cycle.** `run_cycle()` now calls `brain.promote.run(apply=True, limit=1)` right after `_refresh_index_after_writes()` and before the post-cycle `score_coverage()`. A cap of 1/cycle keeps the bar high (promote itself still requires `confidence: high` + ≥2 refs + ≤14d), and because promotion happens *before* re-scoring, a freshly-promoted entity's Key Facts contribute to the same cycle's "after" number — the loop closes in one launchd tick instead of waiting for the next. Commit: `b89ba40`.
+- **Live recall-ledger mode.** Every real MCP `brain_recall` / `brain_semantic` call now appends a `kind: "live"` row to `~/.brain/recall-ledger.jsonl` with `query`, `top_score`, and `miss` flag. `recall_metric.live_coverage(days=7)` aggregates into a rolling window; `brain status` shows it as a second line: `live recall : miss 23.1% · avg-top 0.578  [44 calls, 31 uniq, last 7d]`. Complements the eval-set score by answering "does the brain actually serve the questions Son keeps asking?" — a high eval score + high live miss rate is the signal to expand the eval set. Commit: `f055ba6`.
+- **Docs note:** `docs/100x-autoresearch.md` still calls live mode "next likely upgrades" — leave that bullet there as a history of the plan and let this entry be the "shipped" marker instead of editing backwards.
+- **Status:** 176 tests pass (14 new in `test_recall_metric.py`, 3 new in `test_status.py`). Doctor green.
+
 ### 2026-04-20 — Phase 1 (first win): promote closes the autoresearch feedback loop
 
 - **Decision:** Ship `brain.promote` with synthesized `## Key Facts` sections so playground items reach the `entities/` fact index on promotion — closing the last open wire in the autoresearch feedback loop. Before this, promoted entities lived on disk but had zero rows in `facts` (the renderer copied prose without extracting bullets), so fact-search stayed blind to every promotion and the brain couldn't build on its own reasoning.
