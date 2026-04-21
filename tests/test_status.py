@@ -171,25 +171,49 @@ def test_coverage_absent_when_no_ledger(fake_vault, monkeypatch):
 
 
 def test_coverage_parsed_and_delta(fake_vault, monkeypatch):
-    """Two eval rows in the ledger → latest_score + delta computed."""
+    """Two new-schema eval rows → continuous `latest_score` + delta computed,
+    and the binary `latest_miss_rate` is surfaced alongside."""
     _stub_launchctl_not_loaded(monkeypatch)
     ledger = fake_vault / "recall-ledger.jsonl"
+    #  New ledger schema (post 2026-04-21): `score` is continuous
+    #  (1 - avg_top), `miss_rate` is the binary spec metric.
     ledger.write_text(
-        '{"ts":"2026-04-20T14:00:00Z","kind":"eval","score":0.2,"avg_top":0.60,'
-        '"misses":3,"total":15,"threshold":0.6}\n'
-        '{"ts":"2026-04-20T14:30:00Z","kind":"eval","score":0.0667,'
+        '{"ts":"2026-04-20T14:00:00Z","kind":"eval","score":0.40,"miss_rate":0.20,'
+        '"avg_top":0.60,"misses":3,"total":15,"threshold":0.6}\n'
+        '{"ts":"2026-04-20T14:30:00Z","kind":"eval","score":0.31,"miss_rate":0.0667,'
         '"avg_top":0.69,"misses":1,"total":15,"threshold":0.6}\n'
     )
     rep = status.gather()
     assert rep.coverage["available"] is True
     assert rep.coverage["runs_logged"] == 2
-    assert abs(rep.coverage["latest_score"] - 0.0667) < 1e-6
-    assert abs(rep.coverage["prev_score"] - 0.2) < 1e-6
-    assert rep.coverage["delta_score"] < 0  # improved (fewer misses)
+    assert abs(rep.coverage["latest_score"] - 0.31) < 1e-6
+    assert abs(rep.coverage["prev_score"] - 0.40) < 1e-6
+    assert rep.coverage["delta_score"] < 0  # continuous score dropped → improved
+    assert abs(rep.coverage["latest_miss_rate"] - 0.0667) < 1e-6
     assert rep.coverage["latest_avg_top"] == 0.69
     out = status.format_text(rep)
     assert "coverage" in out
-    assert "6.7%" in out or "6.67%" in out
+    assert "score 0.310" in out  # continuous primary
+    assert "6.7%" in out or "6.67%" in out  # binary miss-rate still shown
+
+
+def test_coverage_legacy_ledger_falls_back_to_miss_rate(fake_vault, monkeypatch):
+    """Pre-2026-04-21 ledger rows have only `score` (binary). Make sure
+    the dashboard still works: `latest_score` becomes None (no continuous
+    signal available) and the line falls back to the miss-rate display."""
+    _stub_launchctl_not_loaded(monkeypatch)
+    (fake_vault / "recall-ledger.jsonl").write_text(
+        '{"ts":"2026-04-19T14:00:00Z","kind":"eval","score":0.20,"avg_top":0.60,'
+        '"misses":3,"total":15,"threshold":0.6}\n'
+        '{"ts":"2026-04-19T14:30:00Z","kind":"eval","score":0.0667,'
+        '"avg_top":0.69,"misses":1,"total":15,"threshold":0.6}\n'
+    )
+    rep = status.gather()
+    assert rep.coverage["available"] is True
+    assert rep.coverage["latest_score"] is None  # no continuous signal in legacy
+    assert abs(rep.coverage["latest_miss_rate"] - 0.0667) < 1e-6
+    out = status.format_text(rep)
+    assert "legacy schema" in out
 
 
 def test_coverage_tolerates_corrupt_lines(fake_vault, monkeypatch):
@@ -197,14 +221,15 @@ def test_coverage_tolerates_corrupt_lines(fake_vault, monkeypatch):
     silently rather than erroring out the whole dashboard."""
     _stub_launchctl_not_loaded(monkeypatch)
     (fake_vault / "recall-ledger.jsonl").write_text(
-        '{"ts":"x","kind":"eval","score":0.1,"total":10,"misses":1}\n'
+        '{"ts":"x","kind":"eval","score":0.5,"miss_rate":0.1,"total":10,"misses":1}\n'
         'not json at all\n'
         '{"ts":"y","kind":"something-else","score":"ignored"}\n'
-        '{"ts":"z","kind":"eval","score":0.05,"total":20,"misses":1}\n'
+        '{"ts":"z","kind":"eval","score":0.45,"miss_rate":0.05,"total":20,"misses":1}\n'
     )
     rep = status.gather()
     assert rep.coverage["runs_logged"] == 2
-    assert rep.coverage["latest_score"] == 0.05
+    assert rep.coverage["latest_score"] == 0.45
+    assert rep.coverage["latest_miss_rate"] == 0.05
 
 
 def test_live_coverage_hidden_when_no_live_rows(fake_vault, monkeypatch):

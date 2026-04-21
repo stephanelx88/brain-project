@@ -374,10 +374,16 @@ def _coverage() -> dict:
     writes during a crash)."""
     out: dict = {
         "available": False,
+        #  Continuous score (1 - avg_top), the val_bpb analog the
+        #  autoresearch loop optimises against. Lower is better.
         "latest_score": None,
-        "latest_avg_top": None,
         "prev_score": None,
         "delta_score": None,
+        #  Binary spec metric (misses / total above threshold). Lower
+        #  is better. Floor-saturates at 0 once every eval query clears
+        #  threshold; that's why `score` is the primary trajectory signal.
+        "latest_miss_rate": None,
+        "latest_avg_top": None,
         "last_ts": None,
         "runs_logged": 0,
         "threshold": None,
@@ -416,15 +422,27 @@ def _coverage() -> dict:
         return out
     latest = rows[-1]
     out["available"] = True
-    out["latest_score"] = float(latest.get("score", 0.0))
     out["last_ts"] = latest.get("ts")
     out["threshold"] = latest.get("threshold")
     if "avg_top" in latest:
         out["latest_avg_top"] = float(latest["avg_top"])
+    #  Ledger row schema changed on 2026-04-21: rows written before that
+    #  date have `score` = binary miss-rate; rows after that date have
+    #  `score` = continuous (1 - avg_top) AND `miss_rate` = binary. Read
+    #  both so the dashboard works on any history.
+    out["latest_miss_rate"] = (
+        float(latest["miss_rate"]) if "miss_rate" in latest
+        else float(latest.get("score", 0.0))  # legacy: score WAS miss-rate
+    )
+    out["latest_score"] = (
+        float(latest["score"]) if "miss_rate" in latest  # new schema
+        else None  # legacy rows have no continuous score
+    )
     if len(rows) >= 2:
         prev = rows[-2]
-        out["prev_score"] = float(prev.get("score", 0.0))
-        out["delta_score"] = out["latest_score"] - out["prev_score"]
+        if "miss_rate" in prev and out["latest_score"] is not None:
+            out["prev_score"] = float(prev["score"])
+            out["delta_score"] = out["latest_score"] - out["prev_score"]
     return out
 
 
@@ -439,7 +457,7 @@ def _live_coverage(days: int = 7) -> dict:
     line entirely)."""
     out = {
         "available": False, "days": days, "total_calls": 0,
-        "misses": 0, "score": 0.0, "avg_top": 0.0,
+        "misses": 0, "miss_rate": 0.0, "avg_top": 0.0,
     }
     if not RECALL_LEDGER.exists():
         return out
@@ -552,25 +570,38 @@ def format_text(report: StatusReport) -> str:
 
     C = report.coverage
     if C.get("available"):
-        miss_pct = f"{C['latest_score'] * 100:.1f}%"
         avg_top = (f"avg-top {C['latest_avg_top']:.3f}"
                    if C.get("latest_avg_top") is not None else "avg-top n/a")
-        if C.get("delta_score") is not None:
-            d = C["delta_score"]
-            arrow = "↓" if d < 0 else ("↑" if d > 0 else "·")
-            delta = f"Δ{arrow}{abs(d) * 100:.1f}pp"
-        else:
-            delta = "Δ—"
+        miss_pct = f"{C['latest_miss_rate'] * 100:.1f}%"
         thr = (f"@ thr {C['threshold']:.2f}"
                if C.get("threshold") is not None else "")
-        coverage_line = (f"miss {miss_pct} ({delta}) · {avg_top} {thr}  "
-                         f"[{C['runs_logged']} eval runs logged]")
+        #  Prefer the continuous score for the headline + delta — it
+        #  moves on every cycle even when no query crosses the binary
+        #  threshold, so the trajectory is actually visible.
+        if C.get("latest_score") is not None:
+            score_str = f"score {C['latest_score']:.3f}"
+            if C.get("delta_score") is not None:
+                d = C["delta_score"]
+                arrow = "↓" if d < 0 else ("↑" if d > 0 else "·")
+                delta = f"Δ{arrow}{abs(d):.3f}"
+            else:
+                delta = "Δ—"
+            coverage_line = (
+                f"{score_str} ({delta}) · miss {miss_pct} · {avg_top} {thr}  "
+                f"[{C['runs_logged']} eval runs logged]"
+            )
+        else:
+            #  Legacy ledger only — no continuous score to display.
+            coverage_line = (
+                f"miss {miss_pct} · {avg_top} {thr}  "
+                f"[{C['runs_logged']} eval runs logged, legacy schema]"
+            )
     else:
         coverage_line = "no autoresearch cycles logged yet"
 
     L = report.live_coverage or {}
     if L.get("available"):
-        live_miss_pct = f"{L['score'] * 100:.1f}%"
+        live_miss_pct = f"{L['miss_rate'] * 100:.1f}%"
         live_avg = f"avg-top {L['avg_top']:.3f}"
         live_line = (f"miss {live_miss_pct} · {live_avg}  "
                      f"[{L['total_calls']} calls, "

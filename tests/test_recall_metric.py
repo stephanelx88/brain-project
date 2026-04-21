@@ -95,7 +95,10 @@ def test_live_coverage_counts_hits_and_misses(fake_ledger):
     assert data["hits"] == 2
     assert data["misses"] == 1
     assert data["queries"] == 2  # deduped
-    assert abs(data["score"] - 1 / 3) < 1e-6
+    #  `live_coverage` returns the binary miss-rate under `miss_rate`
+    #  (renamed from the old `score` key on 2026-04-21 to disambiguate
+    #  it from the eval-set continuous `score` metric).
+    assert abs(data["miss_rate"] - 1 / 3) < 1e-6
     assert abs(data["avg_top"] - (0.8 + 0.8 + 0.3) / 3) < 1e-6
 
 
@@ -145,13 +148,15 @@ def _mk_report(scores: list[tuple[str, float, bool]]) -> recall_metric.CoverageR
              for q, s, m in scores]
     total = len(per_q)
     misses = sum(1 for p in per_q if p["miss"])
+    avg_top = sum(p["top_score"] for p in per_q) / total if total else 0.0
     return recall_metric.CoverageReport(
         timestamp="2026-04-20T00:00:00Z",
         threshold=0.6,
         total=total,
         misses=misses,
-        score=(misses / total) if total else 0.0,
-        avg_top_score=sum(p["top_score"] for p in per_q) / total if total else 0.0,
+        score=max(0.0, min(1.0, 1.0 - avg_top)),  # continuous (1 - avg_top)
+        miss_rate=(misses / total) if total else 0.0,  # binary spec metric
+        avg_top_score=avg_top,
         per_query=per_q,
     )
 
@@ -206,10 +211,47 @@ def test_diff_reports_flags_flipped_queries():
 
 def test_diff_reports_marks_improvement_on_avg_top_only():
     """Even when no queries cross the threshold, a real avg-top gain
-    should register as 'improved' — lets us see incremental progress."""
+    should register as 'improved' — lets us see incremental progress.
+
+    Regression for the "score = 0.0 saturated" bug: now that `score` is
+    `1 - avg_top` instead of binary miss-rate, `score_delta` should also
+    move (negative = improvement) when avg-top moves, even if no query
+    flips. `miss_rate_delta` stays at 0 because the binary signal is
+    floor-saturated."""
     before = _mk_report([("a", 0.3, True), ("b", 0.4, True)])
     after = _mk_report([("a", 0.4, True), ("b", 0.5, True)])
     d = recall_metric.diff_reports(before, after)
     assert d["improved"] is True
-    assert d["score_delta"] == 0.0
+    assert d["score_delta"] < 0  # continuous score dropped
+    assert d["miss_rate_delta"] == 0.0  # binary metric unchanged
     assert d["avg_top_delta"] > 0
+
+
+def test_score_is_continuous_one_minus_avg_top():
+    """Spec lock-in: `score` is `1 - avg_top`, lower-is-better, never
+    saturates. This catches any future revert to binary `score`."""
+    rep = _mk_report([("a", 0.5, True), ("b", 0.7, False), ("c", 0.9, False)])
+    expected_avg_top = (0.5 + 0.7 + 0.9) / 3
+    assert abs(rep.avg_top_score - expected_avg_top) < 1e-9
+    assert abs(rep.score - (1.0 - expected_avg_top)) < 1e-9
+    #  Binary spec metric is preserved separately.
+    assert abs(rep.miss_rate - (1 / 3)) < 1e-9
+
+
+def test_score_does_not_saturate_when_all_queries_pass():
+    """Regression for the 2026-04-21 bug: every eval query above the
+    threshold → binary `miss_rate` is 0, but `score` MUST still reflect
+    the gap from perfect avg_top so cycle-to-cycle improvement is
+    visible. Prior to the fix the headline showed `score=0.0` next to
+    `avg_top=0.712`, hiding all subsequent progress."""
+    saturated = _mk_report([("a", 0.71, False), ("b", 0.72, False), ("c", 0.70, False)])
+    assert saturated.miss_rate == 0.0
+    assert saturated.score > 0  # NOT floor-saturated
+    assert abs(saturated.score - (1.0 - 0.71)) < 1e-9
+    #  And it MUST move when avg_top moves, even with both states
+    #  fully-passing on the binary metric.
+    better = _mk_report([("a", 0.81, False), ("b", 0.82, False), ("c", 0.80, False)])
+    d = recall_metric.diff_reports(saturated, better)
+    assert d["miss_rate_delta"] == 0.0  # both at zero misses
+    assert d["score_delta"] < -0.05  # but continuous score clearly improved
+    assert d["improved"] is True

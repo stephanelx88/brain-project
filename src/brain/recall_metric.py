@@ -6,6 +6,18 @@ Per `~/.brain/program.md`:
   > Question Coverage Score = unanswered_recall_misses / total_recalls
   > (single scalar, monotone, lower-is-better)
 
+The spec metric (binary miss-rate) is preserved as `miss_rate` and still
+reported, but it floor-saturates at 0 the moment every eval query clears
+the threshold — at which point the brain looks "done" even though
+semantic recall quality keeps drifting up or down. To keep `val_bpb`
+behaviour (smooth, monotone, never-saturated), the **primary** scalar
+`score` is now `1.0 - avg_top_score`: it tracks the gap-from-perfect on
+the same lower-is-better axis as the binary metric, but moves on every
+cycle that nudges semantic similarity even slightly. The two agree at
+the extremes (perfect avg_top → score 0; everything misses → score
+close to 1) and never contradict each other the way the old binary-only
+ledger entries did (`score=0.0` next to `avg_top=0.712`).
+
 Two ways to drive it:
 
   1. **Eval set mode** (used by autoresearch run/cycle): a fixed list of
@@ -114,7 +126,14 @@ class CoverageReport:
     threshold: float
     total: int
     misses: int
-    score: float          # misses / total — lower is better (binary metric)
+    #  Continuous primary metric: 1 - avg_top_score, clamped to [0, 1].
+    #  Lower-is-better, monotone with semantic recall quality, and never
+    #  floor-saturates while the brain has any room to improve. This is
+    #  the val_bpb analog the autoresearch loop optimises against.
+    score: float
+    #  Binary spec metric (program.md): misses / total. Preserved for
+    #  back-compat and as a "did any query cross the threshold?" signal.
+    miss_rate: float
     avg_top_score: float  # mean of per-query top scores — higher is better
     per_query: list[dict] = field(default_factory=list)
     duration_ms: int = 0
@@ -126,17 +145,20 @@ class CoverageReport:
             "total": self.total,
             "misses": self.misses,
             "score": round(self.score, 4),
+            "miss_rate": round(self.miss_rate, 4),
             "avg_top_score": round(self.avg_top_score, 4),
             "duration_ms": self.duration_ms,
             "per_query": self.per_query,
         }
 
     def headline(self) -> str:
-        #  Binary metric (program.md spec) + continuous metric (smoother
-        #  signal for cycle-to-cycle progress when nothing flips).
+        #  Continuous primary score + binary miss-rate, both
+        #  lower-is-better, on a single line so trajectory tail logs
+        #  are unambiguous.
         return (
-            f"coverage={self.score:.3f} "
-            f"({self.misses}/{self.total} miss @ thr={self.threshold:.2f}) "
+            f"score={self.score:.3f} "
+            f"miss={self.miss_rate:.3f} "
+            f"({self.misses}/{self.total} @ thr={self.threshold:.2f}) "
             f"avg_top={self.avg_top_score:.3f}"
         )
 
@@ -186,14 +208,19 @@ def score_coverage(
             "miss": is_miss,
         })
     total = len(qs)
-    score = (misses / total) if total else 0.0
+    miss_rate = (misses / total) if total else 0.0
     avg_top = sum(p["top_score"] for p in per_query) / total if total else 0.0
+    #  Clamp into [0, 1]: cosine top-scores can dip slightly below 0 on
+    #  unrelated queries, which would push score above 1; the inverse
+    #  bound (avg_top > 1) is impossible in practice but cheap to guard.
+    score = max(0.0, min(1.0, 1.0 - avg_top))
     report = CoverageReport(
         timestamp=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         threshold=threshold,
         total=total,
         misses=misses,
         score=score,
+        miss_rate=miss_rate,
         avg_top_score=avg_top,
         per_query=per_query,
         duration_ms=int((time.time() - t0) * 1000),
@@ -204,7 +231,12 @@ def score_coverage(
             f.write(json.dumps({
                 "ts": report.timestamp,
                 "kind": "eval",
-                "score": report.score,
+                #  `score` was binary miss-rate before 2026-04-21 and is
+                #  continuous (1 - avg_top) from then on. Older rows still
+                #  parse as `score` + `avg_top`; new rows additionally
+                #  carry `miss_rate` so consumers can disambiguate.
+                "score": round(report.score, 4),
+                "miss_rate": round(report.miss_rate, 4),
                 "avg_top": round(avg_top, 4),
                 "misses": report.misses,
                 "total": report.total,
@@ -264,7 +296,7 @@ def live_coverage(days: int = 7) -> dict:
         return {
             "available": False, "days": days, "queries": 0,
             "total_calls": 0, "misses": 0, "hits": 0,
-            "score": 0.0, "avg_top": 0.0,
+            "miss_rate": 0.0, "avg_top": 0.0,
         }
     for raw in LEDGER.read_text(errors="replace").splitlines():
         raw = raw.strip()
@@ -299,7 +331,7 @@ def live_coverage(days: int = 7) -> dict:
         "total_calls": total,
         "misses": misses,
         "hits": hits,
-        "score": (misses / total) if total else 0.0,
+        "miss_rate": (misses / total) if total else 0.0,
         "avg_top": (score_sum / total) if total else 0.0,
     }
 
@@ -381,16 +413,23 @@ def diff_reports(before: CoverageReport, after: CoverageReport) -> dict:
             score_gains.append((q, round(delta, 4)))
     score_gains.sort(key=lambda x: -x[1])
     avg_delta = round(after.avg_top_score - before.avg_top_score, 4)
+    score_delta = round(after.score - before.score, 4)
+    miss_rate_delta = round(after.miss_rate - before.miss_rate, 4)
     return {
         "score_before": before.score,
         "score_after": after.score,
-        "score_delta": round(after.score - before.score, 4),
+        "score_delta": score_delta,
+        "miss_rate_before": round(before.miss_rate, 4),
+        "miss_rate_after": round(after.miss_rate, 4),
+        "miss_rate_delta": miss_rate_delta,
         "avg_top_before": round(before.avg_top_score, 4),
         "avg_top_after": round(after.avg_top_score, 4),
         "avg_top_delta": avg_delta,
-        #  "improved" = either fewer misses, or strictly higher avg top
-        #  score (a real per-query gain even when no query crosses thr).
-        "improved": (after.score < before.score) or (avg_delta > 0),
+        #  Now that `score` is continuous (1 - avg_top), it moves whenever
+        #  semantic recall does, so `score_delta < 0` ≡ `avg_delta > 0` to
+        #  4-dp precision. We still also accept `miss_rate_delta < 0` so a
+        #  threshold-flip without an avg_top change registers as progress.
+        "improved": (score_delta < 0) or (miss_rate_delta < 0),
         "flipped_to_hit": flipped_to_hit,
         "flipped_to_miss": flipped_to_miss,
         "biggest_score_gains": score_gains[:5],
@@ -430,7 +469,7 @@ def main() -> int:
             print(f"live recall: no calls in last {args.days}d")
             return 0
         print(
-            f"live recall: miss {summary['score']*100:.1f}% "
+            f"live recall: miss {summary['miss_rate']*100:.1f}% "
             f"({summary['misses']}/{summary['total_calls']}) · "
             f"avg-top {summary['avg_top']:.3f}  "
             f"[{summary['queries']} uniq queries, {args.days}d]"
