@@ -99,6 +99,27 @@ CREATE INDEX IF NOT EXISTS notes_mtime_idx ON notes(mtime);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_notes USING fts5(
     title, body, path, tokenize='porter'
 );
+
+-- Reverse index: which vault notes are responsible for which extracted
+-- entity facts. Populated when `apply_extraction` is invoked with an
+-- explicit `source_note_paths=[...]`. When a note disappears from the
+-- vault, `ingest_notes.invalidate_facts_for_note` looks up rows here
+-- and strikethroughs the matching fact lines in the entity files —
+-- so deleting `where-is-son.md` retracts the "Son in Long Xuyen" fact
+-- from `entities/people/son.md` instead of leaving it frozen forever.
+--
+-- `fact_hash` is sha256 of the canonical (lower, whitespace-stripped,
+-- source-suffix-removed) fact text — stable across re-extractions of
+-- the same fact phrasing.
+CREATE TABLE IF NOT EXISTS fact_provenance (
+    entity_path  TEXT NOT NULL,
+    fact_hash    TEXT NOT NULL,
+    note_path    TEXT NOT NULL,
+    recorded_at  REAL NOT NULL,
+    PRIMARY KEY (entity_path, fact_hash, note_path)
+);
+CREATE INDEX IF NOT EXISTS fact_provenance_note_idx
+    ON fact_provenance(note_path);
 """
 
 _SOURCE_RE = re.compile(r"\(source:\s*([^,)]+?)(?:,\s*([\d-]+))?\s*\)")
@@ -149,8 +170,13 @@ def _summary(body: str, limit: int = 200) -> str:
 
 
 def _facts_from_body(body: str) -> Iterable[tuple[str, str | None, str | None]]:
-    """Yield (text, source, date) for each fact bullet under a Key Facts-ish
-    section. Tolerant of any `- ...` bullet anywhere in the body."""
+    """Yield (text, source, date) for each LIVE fact bullet.
+
+    Strikethrough bullets (`- ~~…~~`) are treated as invalidated and
+    skipped — they remain in the markdown for human auditability and
+    git history, but the search index pretends they don't exist so
+    deleted-source facts stop showing up in recall.
+    """
     for raw in body.split("\n"):
         line = raw.strip()
         if not line.startswith("- "):
@@ -158,6 +184,8 @@ def _facts_from_body(body: str) -> Iterable[tuple[str, str | None, str | None]]:
         body_text = line[2:].strip()
         if not body_text:
             continue
+        if body_text.startswith("~~"):
+            continue  # invalidated — see ingest_notes.invalidate_facts_for_note
         m = _SOURCE_RE.search(body_text)
         source = m.group(1).strip() if m else None
         date = m.group(2).strip() if m and m.group(2) else None
@@ -427,6 +455,101 @@ def search_notes(query: str, k: int = 10) -> list[dict]:
         d["snippet"] = (d["body"] or "")[:200]
         out.append(d)
     return out
+
+
+def canonical_fact_hash(fact_text: str) -> str:
+    """Sha256 of normalised fact text — stable across re-extractions.
+
+    Normalisation strips: leading dash, the `(source: …)` suffix, and
+    surrounding whitespace, then lowercases. Two extractions of "Son in
+    Long Xuyen" with different source-session ids hash to the same key,
+    so provenance rows survive identical re-extractions.
+    """
+    import hashlib
+    s = fact_text.strip()
+    if s.startswith("- "):
+        s = s[2:].strip()
+    s = _SOURCE_RE.sub("", s).strip().lower()
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def record_fact_provenance(
+    entity_path: Path | str,
+    fact_text: str,
+    note_paths: Iterable[str | Path],
+) -> int:
+    """Link `fact_text` to one or more source notes. Idempotent."""
+    import time as _time
+
+    paths_norm: list[str] = []
+    for p in note_paths:
+        pp = Path(p)
+        if pp.is_absolute():
+            try:
+                pp = pp.relative_to(config.BRAIN_DIR)
+            except ValueError:
+                continue
+        paths_norm.append(str(pp))
+    if not paths_norm:
+        return 0
+
+    epath = entity_path
+    if isinstance(epath, Path) and epath.is_absolute():
+        try:
+            epath = epath.relative_to(config.BRAIN_DIR)
+        except ValueError:
+            return 0
+    epath = str(epath)
+
+    fh = canonical_fact_hash(fact_text)
+    now = _time.time()
+    written = 0
+    with connect() as conn:
+        cur = conn.cursor()
+        for np_ in paths_norm:
+            cur.execute(
+                """INSERT OR IGNORE INTO fact_provenance
+                   (entity_path, fact_hash, note_path, recorded_at)
+                   VALUES (?,?,?,?)""",
+                (epath, fh, np_, now),
+            )
+            written += cur.rowcount
+    return written
+
+
+def facts_invalidated_by_note(
+    note_path: str | Path,
+) -> list[tuple[str, str]]:
+    """Return [(entity_path, fact_hash), ...] sourced from `note_path`."""
+    np_ = note_path
+    if isinstance(np_, Path) and np_.is_absolute():
+        try:
+            np_ = np_.relative_to(config.BRAIN_DIR)
+        except ValueError:
+            return []
+    np_ = str(np_)
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT entity_path, fact_hash FROM fact_provenance WHERE note_path=?",
+            (np_,),
+        ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+def forget_note_provenance(note_path: str | Path) -> int:
+    """Drop all provenance rows for `note_path`. Returns rows deleted."""
+    np_ = note_path
+    if isinstance(np_, Path) and np_.is_absolute():
+        try:
+            np_ = np_.relative_to(config.BRAIN_DIR)
+        except ValueError:
+            return 0
+    np_ = str(np_)
+    with connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM fact_provenance WHERE note_path=?", (np_,)
+        )
+        return cur.rowcount
 
 
 def search(query: str, k: int = 10, type: str | None = None) -> list[dict]:

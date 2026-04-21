@@ -653,10 +653,25 @@ def run(
         _ledger_save(led)
         if merged:
             entity_lines = [f"{m['winner']} ← {m['loser']}" for m in merged]
+            # Stage only what dedupe actually rewrote (winner + loser
+            # entity files) plus log.md. The previous `git add -A`
+            # behaviour committed unrelated user changes (e.g.
+            # `where-is-son.md` deleted manually right before this
+            # job ran) under the "merged N entities" message — see
+            # git_ops.commit docstring for the postmortem.
+            touched_paths: list[str] = ["log.md"]
+            for m in merged:
+                w = _entity_file_for(m["type"], m["winner"])
+                l_ = _entity_file_for(m["type"], m["loser"])
+                if w is not None:
+                    touched_paths.append(str(w))
+                if l_ is not None:
+                    touched_paths.append(str(l_))
             commit(
                 "brain: dedupe — merged "
                 f"{len(merged)} entit{'y' if len(merged)==1 else 'ies'}\n\n"
-                + "\n".join(entity_lines[:20])
+                + "\n".join(entity_lines[:20]),
+                paths=touched_paths,
             )
             append_log(
                 "dedupe",

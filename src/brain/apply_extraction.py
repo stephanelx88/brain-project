@@ -29,6 +29,11 @@ try:
 except Exception:  # pragma: no cover - db is optional at first run
     upsert_entity_from_file = None
 
+try:
+    from brain.db import record_fact_provenance
+except Exception:  # pragma: no cover
+    record_fact_provenance = None
+
 
 def _render_frontmatter_value(v) -> str:
     """Render a metadata value for YAML frontmatter."""
@@ -66,8 +71,18 @@ def _apply_entity(
     created: list[str],
     updated: list[str],
     touched_paths: set | None = None,
+    source_note_paths: list[str] | None = None,
 ) -> None:
-    """Apply one generic entity from the extraction payload."""
+    """Apply one generic entity from the extraction payload.
+
+    `source_note_paths` (optional) lists vault-relative note paths that
+    this extraction was *derived from*. When supplied, each fact gets a
+    provenance row in the `fact_provenance` table linking it back to
+    those notes — so deleting one of those notes later will retract the
+    fact (see `ingest_notes.invalidate_facts_for_note`). Sessions that
+    don't pin a source note skip provenance and remain accumulator-only,
+    matching pre-existing behaviour.
+    """
     entity_type = (item.get("type") or "").strip().lower()
     name = (item.get("name") or "").strip()
     if not entity_type or not name:
@@ -104,6 +119,18 @@ def _apply_entity(
 
     if path is not None and touched_paths is not None:
         touched_paths.add(path)
+
+    if (
+        path is not None
+        and source_note_paths
+        and record_fact_provenance is not None
+        and facts
+    ):
+        for fact_text in facts:
+            try:
+                record_fact_provenance(path, fact_text, source_note_paths)
+            except Exception as exc:
+                print(f"provenance write failed for {path}: {exc}")
 
 
 def _apply_corrections(corrections: list[dict], source_label: str, now: str) -> None:
@@ -148,6 +175,7 @@ def apply_extraction(
     *,
     do_commit: bool = True,
     do_rebuild_index: bool = True,
+    source_note_paths: list[str] | None = None,
 ) -> dict:
     """Apply an extraction payload to the brain.
 
@@ -156,6 +184,11 @@ def apply_extraction(
           "entities": [ {type, name, is_new, facts, metadata}, ... ],
           "corrections": [ {pattern, correction, rule}, ... ]
         }
+
+    `source_note_paths` (optional) — vault-relative paths of user notes
+    this extraction was derived from. Each fact added gets a row in
+    `fact_provenance` so deleting any of those notes will later retract
+    the fact. Leave empty for session-only extractions (current default).
 
     Set `do_commit=False` and `do_rebuild_index=False` for batched callers
     that want to apply many extractions and then commit/rebuild once at
@@ -168,7 +201,10 @@ def apply_extraction(
     touched: set = set()
 
     for entity in extraction.get("entities", []):
-        _apply_entity(entity, source_label, now, created, updated, touched)
+        _apply_entity(
+            entity, source_label, now, created, updated, touched,
+            source_note_paths=source_note_paths,
+        )
 
     _apply_corrections(extraction.get("corrections", []), source_label, now)
 
@@ -195,7 +231,16 @@ def apply_extraction(
         commit_msg = f"brain: extract from {source_label} — {summary}"
         if entity_names:
             commit_msg += f"\n\nEntities: {', '.join(entity_names[:10])}"
-        commit(commit_msg)
+        # Explicit allowlist: only stage what this extraction actually
+        # touched + the side-effect files (log, index, corrections).
+        # Never `git add -A` — that swept user-deleted root notes into
+        # automated commits in the past (see git_ops.commit docstring).
+        paths = list(touched) + [
+            "log.md",
+            "index.md",
+            "identity/corrections.md",
+        ]
+        commit(commit_msg, paths=paths)
 
     return {
         "created": created,

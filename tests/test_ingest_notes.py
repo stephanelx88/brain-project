@@ -126,3 +126,145 @@ def test_db_search_notes_returns_filename_match(tmp_vault):
     assert res
     # filename → title → searchable
     assert any("tokyo" in r["title"].lower() for r in res)
+
+
+# ---------------------------------------------------------------------------
+# Note → fact provenance + invalidation
+#
+# Pins the 2026-04-21 fix: when a vault note is deleted, every entity
+# fact whose provenance points back at that note is strikethroughed
+# (not silently retained, as the legacy pipeline did with the
+# Long-Xuyen/Saigon location data).
+# ---------------------------------------------------------------------------
+
+def _make_entity(vault, type_: str, slug: str, body: str):
+    """Helper: drop a minimal entity markdown into the temp vault."""
+    type_dir = vault / "entities" / type_
+    type_dir.mkdir(parents=True, exist_ok=True)
+    p = type_dir / f"{slug}.md"
+    p.write_text(
+        f"---\ntype: {type_[:-1] if type_.endswith('s') else type_}\n"
+        f"name: {slug}\n---\n\n# {slug}\n\n## Key Facts\n{body}\n"
+    )
+    return p
+
+
+def test_provenance_round_trip(tmp_vault):
+    """record_fact_provenance → facts_invalidated_by_note → forget."""
+    from brain import db
+
+    epath = _make_entity(tmp_vault, "people", "son", "- Son is in Long Xuyen")
+    fact = "Son is in Long Xuyen"
+    n = db.record_fact_provenance(epath, fact, ["where-is-son.md"])
+    assert n == 1
+
+    rows = db.facts_invalidated_by_note("where-is-son.md")
+    assert len(rows) == 1
+    assert rows[0][0] == "entities/people/son.md"
+    assert rows[0][1] == db.canonical_fact_hash(fact)
+
+    dropped = db.forget_note_provenance("where-is-son.md")
+    assert dropped == 1
+    assert db.facts_invalidated_by_note("where-is-son.md") == []
+
+
+def test_canonical_fact_hash_strips_source_suffix(tmp_vault):
+    """Two extractions of the same fact with different source labels
+    hash to the same key — provenance survives re-extraction."""
+    from brain import db
+
+    h1 = db.canonical_fact_hash("Son is in Long Xuyen (source: session-1, 2026-04-19)")
+    h2 = db.canonical_fact_hash("Son is in Long Xuyen (source: session-2, 2026-04-21)")
+    assert h1 == h2
+
+
+def test_note_delete_strikethroughs_provenance_linked_facts(tmp_vault):
+    """End-to-end: provenance row + note delete → fact invalidated."""
+    from brain import db, ingest_notes
+
+    epath = _make_entity(
+        tmp_vault, "people", "son",
+        "- Son is in Long Xuyen (source: session-x, 2026-04-19)\n"
+        "- Son likes bun rieu (source: session-y, 2026-04-19)",
+    )
+    note = tmp_vault / "where-is-son.md"
+    note.write_text("Son is in Long Xuyen, Vietnam.")
+
+    ingest_notes.ingest_all()  # populate notes ledger
+    db.record_fact_provenance(
+        epath, "Son is in Long Xuyen", ["where-is-son.md"]
+    )
+
+    note.unlink()
+    out = ingest_notes.ingest_all()
+    assert out["deleted"] == 1
+    assert out["facts_invalidated"] == 1
+    assert out["entities_touched_by_invalidation"] == 1
+
+    body = epath.read_text()
+    assert "~~Son is in Long Xuyen~~" in body
+    assert "[invalidated" in body
+    assert "where-is-son.md` deleted" in body
+    assert "Son likes bun rieu" in body  # unrelated fact untouched
+    assert "~~Son likes bun rieu~~" not in body
+
+
+def test_strikethrough_excludes_fact_from_db_facts_view(tmp_vault):
+    """Once strikethroughed, the fact must drop out of `_facts_from_body`
+    (so FTS recall stops returning it)."""
+    from brain import db
+
+    body = (
+        "- ~~Son is in Long Xuyen~~ (source: s, 2026-04-19) "
+        "[invalidated 2026-04-21: source note `where-is-son.md` deleted]\n"
+        "- Son likes bun rieu (source: s, 2026-04-19)"
+    )
+    facts = list(db._facts_from_body(body))
+    assert len(facts) == 1
+    assert facts[0][0] == "Son likes bun rieu"
+
+
+def test_invalidation_is_idempotent(tmp_vault):
+    """A second ingest pass after the note is gone must not re-strikethrough."""
+    from brain import db, ingest_notes
+
+    epath = _make_entity(
+        tmp_vault, "people", "son",
+        "- Son is in Long Xuyen (source: session-x, 2026-04-19)",
+    )
+    note = tmp_vault / "where-is-son.md"
+    note.write_text("Son is in Long Xuyen.")
+    ingest_notes.ingest_all()
+    db.record_fact_provenance(epath, "Son is in Long Xuyen", ["where-is-son.md"])
+
+    note.unlink()
+    out1 = ingest_notes.ingest_all()
+    assert out1["facts_invalidated"] == 1
+
+    out2 = ingest_notes.ingest_all()
+    assert out2["facts_invalidated"] == 0  # provenance row already cleared
+
+    body = epath.read_text()
+    assert body.count("~~Son is in Long Xuyen~~") == 1  # not double-wrapped
+
+
+def test_no_provenance_means_no_silent_invalidation(tmp_vault):
+    """Notes without provenance rows must NOT touch entity files when
+    they vanish — silent rewrites of unrelated facts would be worse
+    than the original bug.
+    """
+    from brain import ingest_notes
+
+    epath = _make_entity(
+        tmp_vault, "people", "son",
+        "- Son is in Long Xuyen (source: session-x, 2026-04-19)",
+    )
+    note = tmp_vault / "completely-unrelated.md"
+    note.write_text("nothing about son")
+    ingest_notes.ingest_all()
+
+    note.unlink()
+    out = ingest_notes.ingest_all()
+    assert out["deleted"] == 1
+    assert out["facts_invalidated"] == 0
+    assert "~~" not in epath.read_text()

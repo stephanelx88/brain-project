@@ -348,6 +348,8 @@ def main():
             print(f"  semantic rebuild skipped: {exc}", flush=True)
         summary = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
         append_log("extract-batch", summary)
+        # Auto-managed allowlist (entities/, log.md, index.md, etc.) —
+        # never `git add -A` from a scheduled job. See git_ops.commit.
         commit(f"brain: batch extract — {summary}")
 
     summary = ", ".join(f"{k}={v}" for k, v in counts.items() if v)

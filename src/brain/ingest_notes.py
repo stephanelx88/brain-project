@@ -79,6 +79,114 @@ def _sha(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _strikethrough_fact_in_entity(
+    entity_path: Path,
+    target_hashes: set[str],
+    note_rel: str,
+    today: str,
+) -> int:
+    """Wrap matching fact lines in `~~…~~` and append an invalidation tag.
+
+    A fact "matches" when `db.canonical_fact_hash` of the line's text
+    (after the `- ` and minus the source suffix) is in `target_hashes`.
+    Returns the number of lines actually modified.
+
+    Lines already strikethroughed are left alone (idempotent — repeated
+    note-delete events on the same provenance won't double-mark).
+    """
+    try:
+        text = entity_path.read_text(errors="replace")
+    except OSError:
+        return 0
+
+    new_lines: list[str] = []
+    changed = 0
+    for raw in text.split("\n"):
+        line = raw
+        stripped = line.lstrip()
+        # Preserve original leading whitespace (Obsidian sub-bullets).
+        indent = line[: len(line) - len(stripped)]
+        if not stripped.startswith("- "):
+            new_lines.append(line)
+            continue
+        body_text = stripped[2:]
+        if body_text.lstrip().startswith("~~"):
+            new_lines.append(line)  # already invalidated
+            continue
+        h = db.canonical_fact_hash(body_text)
+        if h not in target_hashes:
+            new_lines.append(line)
+            continue
+        # Wrap the fact text in strikethrough but keep the source suffix
+        # outside the marker so the trail of provenance stays readable.
+        import re as _re
+        m = _re.search(r"\(source:[^)]*\)", body_text)
+        if m:
+            head = body_text[: m.start()].rstrip()
+            tail = body_text[m.start():]
+            new_body = (
+                f"~~{head}~~ {tail} "
+                f"[invalidated {today}: source note `{note_rel}` deleted]"
+            )
+        else:
+            new_body = (
+                f"~~{body_text.rstrip()}~~ "
+                f"[invalidated {today}: source note `{note_rel}` deleted]"
+            )
+        new_lines.append(f"{indent}- {new_body}")
+        changed += 1
+
+    if changed:
+        entity_path.write_text("\n".join(new_lines))
+    return changed
+
+
+def invalidate_facts_for_note(note_rel: str, verbose: bool = False) -> dict:
+    """Strikethrough every fact whose provenance points at `note_rel`.
+
+    Called after a note is detected as gone from disk. Walks the
+    `fact_provenance` table, edits the affected entity files, then
+    drops the provenance rows so a subsequent deletion of a different
+    note doesn't re-process them. Re-upserts each touched entity to
+    refresh the FTS index (struck-through facts are excluded by
+    `db._facts_from_body`).
+    """
+    from datetime import datetime, timezone
+
+    rows = db.facts_invalidated_by_note(note_rel)
+    if not rows:
+        return {"facts_invalidated": 0, "entities_touched": 0}
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    by_entity: dict[str, set[str]] = {}
+    for entity_rel, fact_hash in rows:
+        by_entity.setdefault(entity_rel, set()).add(fact_hash)
+
+    facts_changed = 0
+    entities_touched = 0
+    for entity_rel, hashes in by_entity.items():
+        epath = config.BRAIN_DIR / entity_rel
+        if not epath.exists():
+            continue
+        n = _strikethrough_fact_in_entity(epath, hashes, note_rel, today)
+        if n > 0:
+            facts_changed += n
+            entities_touched += 1
+            try:
+                db.upsert_entity_from_file(epath)  # refresh FTS index
+            except Exception as exc:
+                if verbose:
+                    print(f"  fts refresh failed for {entity_rel}: {exc}")
+            if verbose:
+                print(f"  ~~ invalidated {n} fact(s) in {entity_rel}")
+
+    db.forget_note_provenance(note_rel)
+    return {
+        "facts_invalidated": facts_changed,
+        "entities_touched": entities_touched,
+    }
+
+
 def _title_from(path: Path, body: str) -> str:
     """Use the first `# heading` if present, else humanise the filename.
 
@@ -131,12 +239,24 @@ def ingest_all(verbose: bool = False) -> dict:
         if verbose:
             print(f"  + {rel}", flush=True)
 
-    # Notes that vanished from disk → delete from db
+    # Notes that vanished from disk → delete from db AND retract any
+    # entity facts whose provenance points back at them. Without this
+    # second step, deleting `where-is-son.md` left the extracted fact
+    # "Son in Long Xuyen" frozen in `entities/people/son.md` forever —
+    # see the 2026-04-21 postmortem in git_ops.commit's docstring.
     deleted_paths: list[str] = []
+    invalidation_summary = {"facts": 0, "entities": 0}
     for rel in list(ledger.keys()):
         if rel in seen:
             continue
         if not (root / rel).exists():
+            try:
+                inv = invalidate_facts_for_note(rel, verbose=verbose)
+                invalidation_summary["facts"] += inv["facts_invalidated"]
+                invalidation_summary["entities"] += inv["entities_touched"]
+            except Exception as exc:
+                if verbose:
+                    print(f"  invalidation skipped for {rel}: {exc}", flush=True)
             db.delete_note_by_path(rel)
             deleted_paths.append(rel)
             if verbose:
@@ -166,6 +286,8 @@ def ingest_all(verbose: bool = False) -> dict:
         "changed": len(changed),
         "deleted": deleted,
         "skipped_large": skipped_large,
+        "facts_invalidated": invalidation_summary["facts"],
+        "entities_touched_by_invalidation": invalidation_summary["entities"],
     }
 
 
@@ -178,11 +300,16 @@ def main():
     t0 = time.time()
     out = ingest_all(verbose=args.verbose)
     out["elapsed_ms"] = int((time.time() - t0) * 1000)
-    print(
+    inv = out.get("facts_invalidated", 0)
+    inv_ent = out.get("entities_touched_by_invalidation", 0)
+    msg = (
         f"notes: scanned={out['scanned']} changed={out['changed']} "
-        f"deleted={out['deleted']} skipped_large={out['skipped_large']} "
-        f"in {out['elapsed_ms']} ms"
+        f"deleted={out['deleted']} skipped_large={out['skipped_large']}"
     )
+    if inv:
+        msg += f" invalidated={inv}/{inv_ent}entities"
+    msg += f" in {out['elapsed_ms']} ms"
+    print(msg)
 
 
 if __name__ == "__main__":
