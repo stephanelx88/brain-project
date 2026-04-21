@@ -197,6 +197,89 @@ def list_failures(
     return rows[:limit]
 
 
+def list_miss_patterns(
+    *,
+    days: int = 14,
+    min_count: int = 3,
+    limit: int = 10,
+) -> list[dict]:
+    """Group `source=recall_miss` failures by (normalised) query over the
+    last `days`, return only queries that missed at least `min_count`
+    times, newest-event first within each bucket, capped at `limit`.
+
+    This is the read side of the close-the-loop mechanism: `brain_recall`
+    appends a recall_miss row every time a query scores below threshold,
+    and this function surfaces the *repeated* misses so son can decide
+    whether to note something about those topics. The pipeline NEVER
+    auto-generates content for these gaps — it only surfaces them.
+
+    Normalisation is deliberately coarse: lowercased, whitespace-collapsed.
+    Typos and minor rewordings bucket together; full paraphrase matching
+    is left to the consumer if needed.
+
+    Returns:
+        [
+          {
+            "query": "<representative form, lowercased>",
+            "miss_count": <int>,
+            "last_seen": "<iso-8601>",
+            "best_score": <float | None>,    # highest top_score seen
+            "recent_queries": [<str>, ...],  # up to 3 raw forms
+          },
+          ...
+        ]
+    """
+    if days < 0 or min_count < 1 or limit < 0:
+        return []
+    cutoff_ts = datetime.now(timezone.utc).timestamp() - days * 86400
+    rows = _read_all_rows(_ledger_path())
+    buckets: dict[str, dict] = {}
+    for row in rows:
+        if row.get("source") != "recall_miss":
+            continue
+        ts_str = row.get("ts") or ""
+        try:
+            # failures.py uses microsecond precision; strptime handles both.
+            fmt = "%Y-%m-%dT%H:%M:%S.%fZ" if "." in ts_str else "%Y-%m-%dT%H:%M:%SZ"
+            ts = datetime.strptime(ts_str, fmt).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+        if ts < cutoff_ts:
+            continue
+        raw_q = (row.get("query") or "").strip()
+        if not raw_q:
+            continue
+        key = " ".join(raw_q.lower().split())
+        bucket = buckets.setdefault(key, {
+            "query": key,
+            "miss_count": 0,
+            "last_seen": ts_str,
+            "best_score": None,
+            "recent_queries": [],
+        })
+        bucket["miss_count"] += 1
+        if ts_str > (bucket["last_seen"] or ""):
+            bucket["last_seen"] = ts_str
+        extra = row.get("extra") or {}
+        score = extra.get("top_score")
+        if isinstance(score, (int, float)):
+            if bucket["best_score"] is None or score > bucket["best_score"]:
+                bucket["best_score"] = float(score)
+        # Preserve up to 3 distinct raw forms for the surface message.
+        if raw_q not in bucket["recent_queries"] and len(bucket["recent_queries"]) < 3:
+            bucket["recent_queries"].append(raw_q)
+
+    out = [b for b in buckets.values() if b["miss_count"] >= min_count]
+    out.sort(key=lambda b: (-b["miss_count"], b["last_seen"]), reverse=False)
+    #  The sort key puts highest miss_count first AND newest last_seen first
+    #  within a tie. `reverse=False` keeps negation on miss_count doing the
+    #  descending work while last_seen ascends — we want newest first, so
+    #  flip after sorting.
+    out.sort(key=lambda b: b["last_seen"], reverse=True)
+    out.sort(key=lambda b: b["miss_count"], reverse=True)
+    return out[: max(0, int(limit))]
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
     """Write `text` to `path` atomically via tmpfile + os.replace.
 

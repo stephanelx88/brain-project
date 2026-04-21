@@ -19,6 +19,7 @@ on-demand retrieval. Tools:
   brain_audit(limit)                   → top-N items needing a human decision
   brain_failure_record(...)            → append a row to the failure ledger
   brain_failure_list(...)              → list recorded failures (newest first)
+  brain_learning_gaps(...)             → repeated recall misses to surface
   brain_status()                       → operational dashboard
   brain_stats()                        → high-level counts
 
@@ -525,6 +526,36 @@ def brain_failure_list(
         limit=int(limit),
     )
     return json.dumps(rows, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def brain_learning_gaps(
+    days: int = 14,
+    min_count: int = 3,
+    limit: int = 10,
+) -> str:
+    """Surface queries son has repeatedly asked the brain but that
+    keep scoring below the miss threshold — the "close the loop"
+    signal. Returns JSON list of `{query, miss_count, last_seen,
+    best_score, recent_queries}` newest-first within each miss count.
+
+    Usage: call this at session-start (or when son asks "what's the
+    brain bad at?") to decide whether to prompt him to note something
+    about those topics. DO NOT auto-generate entities to answer these
+    gaps — that's the autoresearch fabrication trap. Surface only;
+    son decides what becomes memory.
+
+    Backed by `source=recall_miss` rows in `failures.jsonl`, which are
+    appended automatically by the `brain_recall` path when a query's
+    top score falls below `BRAIN_MISS_THRESHOLD`.
+    """
+    from brain import failures
+    patterns = failures.list_miss_patterns(
+        days=int(days),
+        min_count=int(min_count),
+        limit=int(limit),
+    )
+    return json.dumps(patterns, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

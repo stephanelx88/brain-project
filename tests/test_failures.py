@@ -256,3 +256,69 @@ def test_cli_resolve_unknown_id_exits_nonzero(tmp_path):
     )
     assert res.returncode == 1
     assert "No failure" in res.stderr
+
+
+# ---------------------------------------------------------------------------
+# list_miss_patterns — close-the-loop read side
+# ---------------------------------------------------------------------------
+
+def test_list_miss_patterns_groups_by_normalised_query(tmp_ledger):
+    from brain import failures
+    #  Same underlying query with different casing/whitespace/typo-ish
+    #  variants — they should collapse into one bucket.
+    for q in ["Brain refactoring", "brain  refactoring", "BRAIN REFACTORING"]:
+        failures.record_failure(
+            source="recall_miss", tool="brain_recall", query=q,
+            extra={"top_score": 0.42, "threshold": 0.45},
+        )
+    out = failures.list_miss_patterns(min_count=2)
+    assert len(out) == 1
+    assert out[0]["query"] == "brain refactoring"
+    assert out[0]["miss_count"] == 3
+    assert sorted(out[0]["recent_queries"]) == sorted(
+        ["Brain refactoring", "brain  refactoring", "BRAIN REFACTORING"]
+    )
+
+
+def test_list_miss_patterns_respects_min_count(tmp_ledger):
+    from brain import failures
+    failures.record_failure(source="recall_miss", query="asked twice")
+    failures.record_failure(source="recall_miss", query="asked twice")
+    failures.record_failure(source="recall_miss", query="asked once only")
+    out = failures.list_miss_patterns(min_count=2)
+    assert [b["query"] for b in out] == ["asked twice"]
+
+
+def test_list_miss_patterns_ignores_non_recall_sources(tmp_ledger):
+    from brain import failures
+    failures.record_failure(source="extraction", query="should not appear", tags=["dlq"])
+    failures.record_failure(source="extraction", query="should not appear", tags=["dlq"])
+    failures.record_failure(source="extraction", query="should not appear", tags=["dlq"])
+    assert failures.list_miss_patterns(min_count=2) == []
+
+
+def test_list_miss_patterns_sorts_by_count_desc_then_recency(tmp_ledger):
+    from brain import failures
+    #  "low-count" has 2 events (below min_count=2 threshold below would
+    #  cut it; we keep min_count=2 so both surface). "high-count" has 3.
+    failures.record_failure(source="recall_miss", query="high-count")
+    failures.record_failure(source="recall_miss", query="low-count")
+    failures.record_failure(source="recall_miss", query="high-count")
+    failures.record_failure(source="recall_miss", query="low-count")
+    failures.record_failure(source="recall_miss", query="high-count")
+    out = failures.list_miss_patterns(min_count=2)
+    assert [b["query"] for b in out] == ["high-count", "low-count"]
+    assert out[0]["miss_count"] == 3
+    assert out[1]["miss_count"] == 2
+
+
+def test_list_miss_patterns_captures_best_score(tmp_ledger):
+    from brain import failures
+    failures.record_failure(source="recall_miss", query="X",
+                            extra={"top_score": 0.42})
+    failures.record_failure(source="recall_miss", query="X",
+                            extra={"top_score": 0.51})
+    failures.record_failure(source="recall_miss", query="X",
+                            extra={"top_score": 0.38})
+    out = failures.list_miss_patterns(min_count=2)
+    assert out[0]["best_score"] == 0.51

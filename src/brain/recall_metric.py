@@ -35,13 +35,14 @@ from brain import semantic
 EVAL_FILE = config.BRAIN_DIR / "eval-queries.md"
 LEDGER = config.BRAIN_DIR / "recall-ledger.jsonl"
 
-#  program.md says 0.35, but that was tuned for English MiniLM. The brain
-#  ships paraphrase-multilingual-MiniLM-L12-v2, whose cosine distribution
-#  for related-but-loose pairs sits ~0.55-0.65. Empirically 0.60 splits
-#  Son's eval set roughly in half on a clean brain — leaving room for the
-#  agent to actually move the needle. Override with BRAIN_MISS_THRESHOLD.
+#  The brain ships paraphrase-multilingual-MiniLM-L12-v2. Empirical
+#  recall-ledger over 14 days showed 6/10 top-miss queries scored in
+#  [0.44, 0.55] with the correct target at rank 1 — a ranker hit being
+#  flagged as a miss by a too-strict threshold. 0.45 splits real hits
+#  from noise on code-mixed VI/EN + technical queries without flipping
+#  unrelated hits into false positives. Override via BRAIN_MISS_THRESHOLD.
 import os as _os
-MISS_THRESHOLD = float(_os.environ.get("BRAIN_MISS_THRESHOLD", "0.60"))
+MISS_THRESHOLD = float(_os.environ.get("BRAIN_MISS_THRESHOLD", "0.45"))
 
 
 DEFAULT_EVAL_QUERIES = [
@@ -236,6 +237,12 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
     `live_coverage()`, which gives rolling-window coverage computed
     from actual usage (as opposed to the synthetic eval set).
 
+    When the query misses (score < threshold), also mirror the event
+    into `failures.jsonl` with source=`recall_miss`, so the failure
+    ledger can aggregate repeated-miss topics (see `learning_gaps`).
+    This closes the loop between what son asks and what the brain
+    surfaces as "you keep missing X — want to note something?".
+
     Failures are silenced — a logging hiccup must never break the
     user-facing recall path.
     """
@@ -246,6 +253,7 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
         score, label = _top_score_for(q)
     except Exception:
         return
+    is_miss = score < threshold
     try:
         LEDGER.parent.mkdir(parents=True, exist_ok=True)
         with LEDGER.open("a") as f:
@@ -255,11 +263,23 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
                 "query": query[:200],
                 "top_score": round(score, 4),
                 "top_hit": label,
-                "miss": score < threshold,
+                "miss": is_miss,
                 "threshold": threshold,
             }) + "\n")
     except Exception:
-        return
+        pass
+    if is_miss:
+        try:
+            from brain import failures
+            failures.record_failure(
+                source="recall_miss",
+                tool="brain_recall",
+                query=query[:200],
+                result_digest=f"top_score={round(score, 4)} top_hit={label}",
+                extra={"top_score": round(score, 4), "threshold": threshold},
+            )
+        except Exception:
+            pass
 
 
 def live_coverage(days: int = 7) -> dict:

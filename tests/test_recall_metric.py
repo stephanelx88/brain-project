@@ -38,7 +38,7 @@ def test_log_live_recall_writes_one_row(fake_ledger, monkeypatch):
     assert row["kind"] == "live"
     assert row["query"] == "what is the brain vault"
     assert row["top_score"] == 0.82
-    assert row["miss"] is False  # 0.82 > default 0.60
+    assert row["miss"] is False  # 0.82 > default 0.45
     assert row["threshold"] == recall_metric.MISS_THRESHOLD
 
 
@@ -73,6 +73,38 @@ def test_log_live_recall_swallows_errors(fake_ledger, monkeypatch):
     # Must not raise
     recall_metric.log_live_recall("anything")
     assert not fake_ledger.exists()
+
+
+def test_log_live_recall_mirrors_miss_into_failures_ledger(fake_ledger, tmp_path, monkeypatch):
+    """Close-the-loop: a miss in recall-ledger.jsonl must also append
+    one `source=recall_miss` row to failures.jsonl, so
+    `brain.failures.list_miss_patterns` can aggregate repeated-miss
+    topics. Hits must NOT mirror — failures ledger is miss-only."""
+    import brain.config as config
+    brain_dir = tmp_path / ".brain"
+    brain_dir.mkdir()
+    monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
+    _stub_top_score(monkeypatch, 0.30)  # below default threshold → miss
+    recall_metric.log_live_recall("what the brain doesn't know")
+    failures_path = brain_dir / "failures.jsonl"
+    assert failures_path.exists()
+    rows = [json.loads(l) for l in failures_path.read_text().splitlines() if l.strip()]
+    assert len(rows) == 1
+    assert rows[0]["source"] == "recall_miss"
+    assert rows[0]["tool"] == "brain_recall"
+    assert rows[0]["query"] == "what the brain doesn't know"
+    assert rows[0]["extra"]["top_score"] == 0.3
+
+
+def test_log_live_recall_hit_does_not_mirror(fake_ledger, tmp_path, monkeypatch):
+    import brain.config as config
+    brain_dir = tmp_path / ".brain"
+    brain_dir.mkdir()
+    monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
+    _stub_top_score(monkeypatch, 0.9)  # well above threshold → hit
+    recall_metric.log_live_recall("fresh hit")
+    failures_path = brain_dir / "failures.jsonl"
+    assert not failures_path.exists()
 
 
 def test_live_coverage_empty_ledger(fake_ledger):
