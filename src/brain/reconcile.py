@@ -6,6 +6,7 @@ from pathlib import Path
 
 import brain.config as config
 from brain.config import BRAIN_DIR, ENTITIES_DIR, ENTITY_TYPES, TIMELINE_DIR
+from brain.io import atomic_write_text
 
 
 def get_recent_log(hours: int = 2) -> str:
@@ -183,7 +184,7 @@ def write_reconciliation_file(content: str) -> Path:
     now = datetime.now(timezone.utc)
     filename = f"{now.strftime('%Y-%m-%d')}-reconcile-{now.strftime('%H%M')}.md"
     path = TIMELINE_DIR / filename
-    path.write_text(content)
+    atomic_write_text(path, content)
     return path
 
 

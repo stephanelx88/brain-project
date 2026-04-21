@@ -31,6 +31,7 @@ from typing import Any
 
 import yaml
 
+from brain.io import atomic_write_text
 from brain.presets import list_presets, load_preset
 
 BRAIN_DIR = Path.home() / ".brain"
@@ -196,9 +197,10 @@ def _merge_config(
 
 
 def _write_config(cfg: dict[str, Any]) -> None:
-    CONFIG_PATH.write_text(
+    atomic_write_text(
+        CONFIG_PATH,
         "# Generated and updated by `brain init`. Hand-edits preserved on re-run.\n"
-        + yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False)
+        + yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False),
     )
     _ok(f"wrote {CONFIG_PATH}")
 
@@ -250,7 +252,7 @@ def _render_who_i_am(
         "-->",
         "",
     ]
-    dst.write_text("\n".join(body))
+    atomic_write_text(dst, "\n".join(body))
     _ok(f"wrote {dst}")
 
 

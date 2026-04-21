@@ -25,6 +25,7 @@ Public API:
 """
 from __future__ import annotations
 
+import io as _io
 import json
 import os
 import socket
@@ -37,6 +38,7 @@ import numpy as np
 
 import brain.config as config
 from brain import db
+from brain.io import atomic_write_bytes, atomic_write_text
 
 VEC_DIR = config.BRAIN_DIR / ".vec"
 FACTS_NPY = VEC_DIR / "facts.npy"
@@ -90,6 +92,20 @@ def _embed(texts: list[str], batch_size: int = 64) -> np.ndarray:
 
 def _ensure_dir():
     VEC_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _atomic_save_npy(path: Path, arr: np.ndarray) -> None:
+    """Atomic `np.save` equivalent.
+
+    `np.save(tmp, arr)` would silently rewrite the name to `<tmp>.npy`
+    because numpy auto-appends the `.npy` extension when it's missing
+    from the target. Serialise through a BytesIO buffer first, then let
+    `atomic_write_bytes` own the temp-file + rename dance — that way the
+    final name is exactly whatever we asked for.
+    """
+    buf = _io.BytesIO()
+    np.save(buf, arr, allow_pickle=False)
+    atomic_write_bytes(path, buf.getvalue())
 
 
 def build() -> dict:
@@ -147,15 +163,16 @@ def build() -> dict:
     fact_vecs = _embed(fact_texts)
     ent_vecs = _embed(ent_texts)
 
-    np.save(FACTS_NPY, fact_vecs)
-    np.save(ENT_NPY, ent_vecs)
-    FACTS_JSON.write_text(json.dumps(fact_meta))
-    ENT_JSON.write_text(json.dumps(ent_meta))
+    _atomic_save_npy(FACTS_NPY, fact_vecs)
+    _atomic_save_npy(ENT_NPY, ent_vecs)
+    atomic_write_text(FACTS_JSON, json.dumps(fact_meta))
+    atomic_write_text(ENT_JSON, json.dumps(ent_meta))
 
     # Notes — second corpus, indexed alongside facts/entities.
     note_count = _build_notes_full()
 
-    META_JSON.write_text(
+    atomic_write_text(
+        META_JSON,
         json.dumps(
             {
                 "model": DEFAULT_MODEL,
@@ -167,7 +184,7 @@ def build() -> dict:
                 "build_seconds": round(time.time() - t0, 2),
             },
             indent=2,
-        )
+        ),
     )
 
     return {
@@ -189,15 +206,15 @@ def _build_notes_full() -> int:
         {"id": r[0], "path": r[1], "title": r[2], "body": r[3]} for r in rows
     ]
     if not meta:
-        np.save(NOTES_NPY, np.zeros((0, DIM), dtype=np.float32))
-        NOTES_JSON.write_text(json.dumps([]))
+        _atomic_save_npy(NOTES_NPY, np.zeros((0, DIM), dtype=np.float32))
+        atomic_write_text(NOTES_JSON, json.dumps([]))
         return 0
     # Embed title + truncated body (first 1500 chars). Long-tail content is
     # still keyword-searchable via fts_notes; semantic captures the gist.
     texts = [f"{m['title']}\n{m['body'][:1500]}" for m in meta]
     vecs = _embed(texts)
-    np.save(NOTES_NPY, vecs)
-    NOTES_JSON.write_text(json.dumps(meta))
+    _atomic_save_npy(NOTES_NPY, vecs)
+    atomic_write_text(NOTES_JSON, json.dumps(meta))
     return len(meta)
 
 
@@ -259,8 +276,8 @@ def update_notes(changed: list[tuple[str, str, str]],
         else final_vecs
     )
 
-    np.save(NOTES_NPY, final_vecs.astype(np.float32))
-    NOTES_JSON.write_text(json.dumps(final_meta))
+    _atomic_save_npy(NOTES_NPY, final_vecs.astype(np.float32))
+    atomic_write_text(NOTES_JSON, json.dumps(final_meta))
 
     # Bump build_at so `status()` reflects freshness.
     if META_JSON.exists():
@@ -270,7 +287,7 @@ def update_notes(changed: list[tuple[str, str, str]],
             m = {}
         m["built_at"] = time.time()
         m["note_count"] = len(final_meta)
-        META_JSON.write_text(json.dumps(m, indent=2))
+        atomic_write_text(META_JSON, json.dumps(m, indent=2))
 
     return {"changed": len(changed), "deleted": len(drop_idx)}
 

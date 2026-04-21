@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 
 import brain.config as config
+from brain.io import atomic_write_text
 
 
 def _extract_frontmatter(text: str) -> dict:
@@ -88,4 +89,4 @@ def rebuild_index() -> None:
     content = "# Brain Index\n\nEntity catalog for fast lookup. Updated automatically.\n\n"
     content += "\n".join(sections)
 
-    config.INDEX_FILE.write_text(content)
+    atomic_write_text(config.INDEX_FILE, content)
