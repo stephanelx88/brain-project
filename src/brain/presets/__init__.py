@@ -26,6 +26,8 @@ def list_presets() -> list[dict[str, Any]]:
     for path in sorted(PRESETS_DIR.glob("*.yaml")):
         with path.open() as f:
             data = yaml.safe_load(f) or {}
+        if "display_name" not in data:
+            continue
         data["_slug"] = path.stem
         out.append(data)
     out.sort(key=lambda d: d.get("order", 999))

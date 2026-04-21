@@ -411,7 +411,11 @@ def main(argv: list[str] | None = None) -> int:
     else:
         q = _ensure_questionary()
         try:
-            # Existing-vault confirmation (only if user didn't pass --vault)
+            # Existing-vault confirmation (only if user didn't pass --vault).
+            # If the user declines the detected vault, ask for the new path
+            # immediately — don't make them sit through the Profile step
+            # wondering where their "No" went.
+            step = 1
             if vault is None:
                 detected = _detect_existing_vault()
                 if detected and detected.exists():
@@ -421,8 +425,11 @@ def main(argv: list[str] | None = None) -> int:
                     ).unsafe_ask()
                     if keep:
                         vault = detected
+                    else:
+                        _header(f"{step}. Vault")
+                        vault = _ask_vault_path(q)
+                        step += 1
 
-            step = 1
             _header(f"{step}. Profile")
             preset = _pick_preset(q, args.preset)
             step += 1
