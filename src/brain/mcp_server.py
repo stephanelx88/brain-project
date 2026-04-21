@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -228,18 +229,40 @@ def brain_recent(hours: int = 48, type: str | None = None, k: int = 20) -> str:
     return json.dumps([dict(zip(cols, r)) for r in rows], ensure_ascii=False, indent=2)
 
 
+_CORRECTIONS_CAP = 20  # most-recent entries to include; rest are recall-able
+
+
 @mcp.tool()
 def brain_identity() -> str:
-    """Return identity + corrections — what to load at session start.
+    """Return identity + recent corrections — what to load at session start.
 
-    Concatenates identity/who-i-am.md, identity/preferences.md, and
-    identity/corrections.md so you don't have to fetch them separately.
+    Returns who-i-am.md and preferences.md in full, plus the most recent
+    `_CORRECTIONS_CAP` entries from corrections.md. Older corrections are
+    still searchable via brain_recall("corrections <topic>").
     """
     out = []
-    for name in ("who-i-am.md", "preferences.md", "corrections.md"):
+    for name in ("who-i-am.md", "preferences.md"):
         p = config.IDENTITY_DIR / name
         if p.exists():
             out.append(f"# {name}\n\n{p.read_text(errors='replace')}")
+
+    corrections_path = config.IDENTITY_DIR / "corrections.md"
+    if corrections_path.exists():
+        raw = corrections_path.read_text(errors="replace")
+        # Split on lines that start a new bullet entry ("- **")
+        parts = re.split(r"\n(?=- \*\*)", raw)
+        header = parts[0]  # frontmatter + section heading
+        entries = [p for p in parts[1:] if p.strip().startswith("- **")]
+        recent = entries[-_CORRECTIONS_CAP:]
+        older = len(entries) - len(recent)
+        body = header + "\n" + "\n".join(recent)
+        if older:
+            body += (
+                f"\n\n<!-- {older} older corrections omitted — "
+                "use brain_recall('corrections <topic>') to find them -->"
+            )
+        out.append(f"# corrections.md\n\n{body}")
+
     return "\n\n---\n\n".join(out) if out else "(no identity files)"
 
 
