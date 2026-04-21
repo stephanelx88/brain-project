@@ -34,6 +34,36 @@ try:
 except Exception:  # pragma: no cover
     record_fact_provenance = None
 
+TRIPLE_CONFIDENCE_THRESHOLD = 0.8
+
+
+def _apply_triples(triples: list[dict], source_label: str) -> None:
+    """Route extracted triples by confidence: high → RDF store, low → pending queue."""
+    if not triples:
+        return
+    try:
+        from brain.graph import add_triple, VALID_PREDICATES
+        from brain.triple_audit import add_pending
+        from brain.triple_rules import adjusted_confidence
+    except Exception:
+        return  # graph layer is optional; don't break extraction if missing
+
+    high, low = [], []
+    for t in triples:
+        pred = t.get("predicate", "")
+        if pred not in VALID_PREDICATES:
+            continue
+        raw = float(t.get("confidence", 0.5))
+        adj = adjusted_confidence(pred, raw)
+        t = dict(t, confidence=adj)
+        (high if adj >= TRIPLE_CONFIDENCE_THRESHOLD else low).append(t)
+
+    for t in high:
+        add_triple(t["subject"], t["predicate"], t["object"], source=source_label)
+
+    if low:
+        add_pending(low, source=source_label)
+
 
 def _render_frontmatter_value(v) -> str:
     """Render a metadata value for YAML frontmatter."""
@@ -105,7 +135,11 @@ def _apply_entity(
 
     path = None
     if is_new or not exists:
-        body = f"## Key Facts\n{facts_body}\n" if facts_body else ""
+        # Every entity must have ## Key Facts so db.upsert_entity_from_file
+        # can index it. If the LLM returned no facts, synthesize a minimal
+        # one from the entity name so the entity is findable from day one.
+        effective_facts_body = facts_body or f"- {name} (source: {source_label}, {now})"
+        body = f"## Key Facts\n{effective_facts_body}\n"
         path = create_entity(entity_type, name, frontmatter=fm, body=body)
         created.append(f"{_singular_type(entity_type)}:{name}")
     elif facts_body:
@@ -207,6 +241,7 @@ def apply_extraction(
         )
 
     _apply_corrections(extraction.get("corrections", []), source_label, now)
+    _apply_triples(extraction.get("triples", []), source_label)
 
     if upsert_entity_from_file is not None:
         for p in touched:

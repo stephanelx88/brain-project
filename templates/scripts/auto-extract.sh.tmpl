@@ -34,43 +34,59 @@ fi
 echo $$ > "$LOCKDIR/pid"
 trap 'rm -rf "$LOCKDIR"' EXIT
 
-# Process-level guard: skip LLM stages only when another `claude --print`
-# is already running (the actual dual-instance freeze risk). The old mtime
-# heuristic — skip while *any* Claude/Cursor transcript was written in the
-# last 180s — was too coarse: with Cursor open all day the gate never opens
-# and `<vault>/raw/` accumulates indefinitely. Files in raw/ are already
-# proof of an idle session (harvest gates on 60s idle per source), so we
-# don't need to re-check session activity here. Pure-Python stages always
-# run — they don't spawn `claude --print` so they can't trigger the freeze.
+# Resource-aware clearance gate.
+# Level 1 (CPU<60%)             — pure-Python stages (no LLM)
+# Level 2 (CPU<40% + idle 60s)  — LLM extract, note_extract, reconcile
+# Level 3 (CPU<20% + idle 180s + AC) — dedupe (heavier LLM, longer per run)
+#
+# Process-level dual-instance guard: skip LLM stages while another
+# `claude --print` is running to avoid the Mac GPU freeze (incident 2026-04-11).
+LEVEL=$("$PYTHON" -m brain.resource_guard 2>/dev/null || echo 0)
 ACTIVE_SESSION=0
 if pgrep -f "claude --print" >/dev/null 2>&1; then
   ACTIVE_SESSION=1
 fi
 
 {
-  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) auto-extract run (active_session=$ACTIVE_SESSION) ==="
-  # Always-safe stages (pure Python, no LLM subprocess):
-  "$PYTHON" -m brain.harvest_session || echo "harvest exited $?"
-  "$PYTHON" -m brain.ingest_notes     || echo "ingest_notes exited $?"
-  "$PYTHON" -m brain.clean --execute  || echo "clean exited $?"
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) auto-extract run (level=$LEVEL active_session=$ACTIVE_SESSION) ==="
 
-  # LLM-calling stages — skip while a Claude session is actively writing.
-  if (( ACTIVE_SESSION == 0 )); then
-    "$PYTHON" -m brain.auto_extract           || echo "auto_extract exited $?"
+  # Level 0 — always (harvest is pure I/O, no CPU spike)
+  "$PYTHON" -m brain.harvest_session || echo "harvest exited $?"
+
+  # Level 1 — pure Python, no LLM
+  if (( LEVEL >= 1 )); then
+    "$PYTHON" -m brain.ingest_notes    || echo "ingest_notes exited $?"
+    "$PYTHON" -m brain.clean --execute || echo "clean exited $?"
+  else
+    echo "skip ingest_notes+clean: CPU too high (level=$LEVEL)"
+  fi
+
+  # Level 2 — LLM stages; also blocked while another claude --print runs
+  if (( LEVEL >= 2 && ACTIVE_SESSION == 0 )); then
+    "$PYTHON" -m brain.auto_extract  || echo "auto_extract exited $?"
     # Note extraction: turn user-typed vault notes into entity facts with
     # provenance, so deleting a note auto-retracts the fact (see
     # brain/note_extract.py + brain/ingest_notes.invalidate_facts_for_note).
     # Capped at MAX_NOTES_PER_RUN=30 inside the module so this never
     # dominates the launchd window.
-    "$PYTHON" -m brain.note_extract           || echo "note_extract exited $?"
-    "$PYTHON" -m brain.reconcile              || echo "reconcile exited $?"
-    # Semantic dedupe — bounded LLM calls per run, ledger-skipped after.
-    # Catches the same-idea-different-wording dupes that brain.reconcile
-    # (slug-only) is blind to. Conservative thresholds per type; merges
-    # below the auto bar become proposal files in timeline/ for review.
-    "$PYTHON" -m brain.dedupe --apply --quiet || echo "dedupe exited $?"
+    "$PYTHON" -m brain.note_extract  || echo "note_extract exited $?"
+    "$PYTHON" -m brain.reconcile     || echo "reconcile exited $?"
+  elif (( LEVEL < 2 )); then
+    echo "skip auto_extract+note_extract+reconcile: level=$LEVEL (need 2)"
   else
-    echo "skip auto_extract+note_extract+reconcile+dedupe: another claude --print is running"
+    echo "skip auto_extract+note_extract+reconcile: another claude --print is running"
   fi
+
+  # Level 3 — heavier LLM (dedupe); also blocked while another claude --print runs
+  if (( LEVEL >= 3 && ACTIVE_SESSION == 0 )); then
+    # Semantic dedupe — bounded LLM calls per run, ledger-skipped after.
+    # Catches same-idea-different-wording dupes that brain.reconcile is blind to.
+    "$PYTHON" -m brain.dedupe --apply --quiet || echo "dedupe exited $?"
+  elif (( LEVEL < 3 )); then
+    echo "skip dedupe: level=$LEVEL (need 3)"
+  else
+    echo "skip dedupe: another claude --print is running"
+  fi
+
   echo ""
 } >> "$LOG" 2>&1

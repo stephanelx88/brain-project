@@ -107,6 +107,63 @@ def commit(
         return False
 
 
+def entity_history(path: str, limit: int = 10) -> list[dict] | dict:
+    """Return git commit history for one entity/note path.
+
+    `path` is relative to BRAIN_DIR. Returns a list of
+    {sha, date, author, subject, insertions, deletions} or {error: ...}.
+    """
+    import subprocess
+    limit = max(1, min(int(limit), 50))
+    p = config.BRAIN_DIR / path
+    try:
+        p.resolve().relative_to(config.BRAIN_DIR.resolve())
+    except (ValueError, OSError):
+        return {"error": f"path outside vault: {path}"}
+    try:
+        out = subprocess.check_output(
+            ["git", "log",
+             f"-{limit}",
+             "--pretty=format:%H\t%aI\t%an\t%s",
+             "--shortstat",
+             "--", path],
+            cwd=str(config.BRAIN_DIR),
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        ).decode("utf-8", errors="replace")
+    except subprocess.CalledProcessError as e:
+        return {"error": f"git failed: {e.output.decode(errors='replace')}"}
+    except subprocess.TimeoutExpired:
+        return {"error": "git timed out"}
+    except FileNotFoundError:
+        return {"error": "git not on PATH"}
+
+    commits: list[dict] = []
+    cur: dict | None = None
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "\t" in line and len(line.split("\t", 3)) == 4:
+            if cur:
+                commits.append(cur)
+            sha, date, author, subject = line.split("\t", 3)
+            cur = {"sha": sha[:12], "date": date, "author": author,
+                   "subject": subject, "insertions": 0, "deletions": 0}
+        elif cur and ("insertion" in line or "deletion" in line):
+            n = 0
+            for tok in line.replace(",", "").split():
+                if tok.isdigit():
+                    n = int(tok)
+                elif tok.startswith("insertion"):
+                    cur["insertions"] = n
+                elif tok.startswith("deletion"):
+                    cur["deletions"] = n
+    if cur:
+        commits.append(cur)
+    return commits
+
+
 def commit_all(message: str) -> bool:
     """Escape hatch: stage everything (legacy `git add -A`) and commit.
 

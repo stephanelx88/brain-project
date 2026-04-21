@@ -218,6 +218,25 @@ def _write_config(vault: Path, cfg: dict[str, Any]) -> None:
     _ok(f"wrote {config_path}")
 
 
+def _write_auto_clean(vault: Path) -> None:
+    """Copy the default auto_clean.yaml into the vault (skip if already present).
+
+    The vault copy is the live rules file — users edit it to customise their
+    own patterns. We never overwrite an existing file so hand-edits survive
+    `brain init` re-runs.
+    """
+    dst = vault / "auto_clean.yaml"
+    if dst.exists():
+        _info(f"skipped {dst} (exists; edit to customise auto-clean rules)")
+        return
+    src = Path(__file__).parent / "presets" / "auto_clean.yaml"
+    if not src.exists():
+        _warn("presets/auto_clean.yaml not found — skipping auto-clean setup")
+        return
+    atomic_write_text(dst, src.read_text())
+    _ok(f"wrote {dst}")
+
+
 def _create_entity_dirs(vault: Path, types: list[dict[str, str]]) -> None:
     ent = vault / "entities"
     ent.mkdir(parents=True, exist_ok=True)
@@ -441,6 +460,7 @@ def main(argv: list[str] | None = None) -> int:
     _write_config(vault, cfg)
     _create_entity_dirs(vault, types)
     _render_who_i_am(vault, preset, identity, force=args.force_identity)
+    _write_auto_clean(vault)
     _persist_brain_dir_to_shell_rc(vault)
 
     if not args.no_install:

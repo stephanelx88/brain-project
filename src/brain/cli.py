@@ -205,6 +205,17 @@ def main(argv: list[str] | None = None) -> int:
                       help="Outcome label (e.g. fixed, wontfix, duplicate)")
     p_fx.set_defaults(func=_cmd_failure_resolve)
 
+    p_ac = sub.add_parser("auto-clean",
+                          help="Apply auto-clean rules to brain entities")
+    p_ac.add_argument("--dry-run", action="store_true",
+                      help="Show what would be deleted without deleting.")
+    p_ac.add_argument("--rules-file", metavar="PATH",
+                      help="Override rules file path.")
+    p_ac.set_defaults(func=lambda a: __import__(
+        "brain.auto_clean", fromlist=["main"]).main(
+        (["--dry-run"] if a.dry_run else []) +
+        (["--rules-file", a.rules_file] if a.rules_file else [])))
+
     args = p.parse_args(argv)
     if args.version:
         try:

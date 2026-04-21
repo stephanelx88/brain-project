@@ -37,12 +37,11 @@ import json
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
 import brain.config as config
-from brain import db, harvest_session
+from brain import db
 
 # NOTE: `brain.semantic` is intentionally NOT imported here. It pulls
 # torch + sentence-transformers (~2.8 s cold import on M-series Macs),
@@ -380,9 +379,9 @@ def brain_history(path: str, limit: int = 10) -> str:
     """Return git commit history for one entity/note path.
 
     Inspired by @shikhr_'s observation that git is already an episodic
-    memory layer for agents (https://x.com/shikhr_/status/...). Use this
-    to see how an entity evolved over time — author, date, subject, and
-    file diff stats — without leaving the brain MCP.
+    memory layer for agents. Use this to see how an entity evolved over
+    time — author, date, subject, and file diff stats — without leaving
+    the brain MCP.
 
     Args:
       path: relative path under ~/.brain/ (e.g. `entities/people/madhav.md`)
@@ -390,72 +389,8 @@ def brain_history(path: str, limit: int = 10) -> str:
 
     Returns JSON list of {sha, date, author, subject, insertions, deletions}.
     """
-    import subprocess
-    limit = max(1, min(int(limit), 50))
-    p = config.BRAIN_DIR / path
-    try:
-        p.resolve().relative_to(config.BRAIN_DIR.resolve())
-    except (ValueError, OSError):
-        return json.dumps({"error": f"path outside vault: {path}"})
-    try:
-        out = subprocess.check_output(
-            ["git", "log",
-             f"-{limit}",
-             "--pretty=format:%H\t%aI\t%an\t%s",
-             "--shortstat",
-             "--", path],
-            cwd=str(config.BRAIN_DIR),
-            stderr=subprocess.STDOUT,
-            timeout=10,
-        ).decode("utf-8", errors="replace")
-    except subprocess.CalledProcessError as e:
-        return json.dumps({"error": f"git failed: {e.output.decode(errors='replace')}"})
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": "git timed out"})
-    except FileNotFoundError:
-        return json.dumps({"error": "git not on PATH"})
-
-    commits: list[dict] = []
-    cur: dict | None = None
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if "\t" in line and len(line.split("\t", 3)) == 4:
-            if cur:
-                commits.append(cur)
-            sha, date, author, subject = line.split("\t", 3)
-            cur = {"sha": sha[:12], "date": date, "author": author,
-                   "subject": subject, "insertions": 0, "deletions": 0}
-        elif cur and ("insertion" in line or "deletion" in line):
-            for tok in line.replace(",", "").split():
-                if tok.isdigit():
-                    n = int(tok)
-                elif tok.startswith("insertion"):
-                    cur["insertions"] = n
-                elif tok.startswith("deletion"):
-                    cur["deletions"] = n
-    if cur:
-        commits.append(cur)
-    return json.dumps(commits, ensure_ascii=False, indent=2)
-
-
-def _find_session_jsonl(session_id: str) -> Path | None:
-    """Resolve a session_id (Claude UUID, `cursor:<uuid>`, or bare Cursor
-    UUID) to its on-disk transcript jsonl. None if not found."""
-    want_cursor_only = session_id.startswith(harvest_session.CURSOR_PREFIX)
-    bare = session_id.split(":", 1)[-1]
-    candidates: list[Path] = []
-    if not want_cursor_only:
-        candidates.extend(harvest_session.find_all_session_jsonls())
-    try:
-        candidates.extend(harvest_session.find_cursor_session_jsonls())
-    except Exception:
-        pass
-    for p in candidates:
-        if p.stem == bare:
-            return p
-    return None
+    from brain.git_ops import entity_history
+    return json.dumps(entity_history(path, limit), ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -486,71 +421,11 @@ def brain_live_sessions(active_within_sec: int = 300, include_self: bool = False
 
     Caps `active_within_sec` to [1, 86400].
     """
-    window = max(1, min(int(active_within_sec), 86400))
-    now = datetime.now(timezone.utc)
-    out: list[dict] = []
-
-    self_sid: str | None = None
-    if not include_self:
-        ppid = os.getppid()
-        for cs in harvest_session.claude_active_sessions():
-            if cs["pid"] == ppid:
-                self_sid = cs["session_id"]
-                break
-
-    for cs in harvest_session.claude_active_sessions():
-        if cs["session_id"] == self_sid:
-            continue
-        jsonl = _find_session_jsonl(cs["session_id"])
-        last_write_iso = None
-        age = None
-        path_str = None
-        project = ""
-        if jsonl is not None:
-            try:
-                mtime = jsonl.stat().st_mtime
-                last_write_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-                age = int(now.timestamp() - mtime)
-                path_str = str(jsonl)
-                project = harvest_session.derive_project_name(jsonl)
-            except OSError:
-                pass
-        out.append({
-            "source": "claude",
-            "session_id": cs["session_id"],
-            "project": project,
-            "cwd": cs["cwd"],
-            "pid": cs["pid"],
-            "last_write": last_write_iso,
-            "age_sec": age,
-            "path": path_str,
-        })
-
-    cutoff = now.timestamp() - window
-    try:
-        cursor_jsonls = harvest_session.find_cursor_session_jsonls()
-    except Exception:
-        cursor_jsonls = []
-    for jsonl in cursor_jsonls:
-        try:
-            mtime = jsonl.stat().st_mtime
-        except OSError:
-            continue
-        if mtime < cutoff:
-            continue
-        out.append({
-            "source": "cursor",
-            "session_id": f"{harvest_session.CURSOR_PREFIX}{jsonl.stem}",
-            "project": harvest_session.derive_project_name(jsonl),
-            "cwd": None,
-            "pid": None,
-            "last_write": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
-            "age_sec": int(now.timestamp() - mtime),
-            "path": str(jsonl),
-        })
-
-    out.sort(key=lambda r: r.get("age_sec") if r.get("age_sec") is not None else 10**9)
-    return json.dumps(out, ensure_ascii=False, indent=2)
+    from brain.live_sessions import list_live_sessions
+    return json.dumps(
+        list_live_sessions(active_within_sec=active_within_sec, include_self=include_self),
+        ensure_ascii=False, indent=2,
+    )
 
 
 @mcp.tool()
@@ -570,35 +445,8 @@ def brain_live_tail(session_id: str, n: int = 20) -> str:
     Returns JSON {source, session_id, project, last_write, turns:
     [{role, text, timestamp}]} or {error}.
     """
-    n = max(1, min(int(n), 200))
-    session_id = (session_id or "").strip()
-    if not session_id:
-        return json.dumps({"error": "session_id is required"})
-
-    jsonl = _find_session_jsonl(session_id)
-    if jsonl is None:
-        return json.dumps({"error": f"session not found: {session_id}"})
-
-    try:
-        messages, _ = harvest_session.extract_messages(jsonl, start_offset=0)
-    except Exception as e:
-        return json.dumps({"error": f"failed to read transcript: {e}"})
-
-    try:
-        mtime = jsonl.stat().st_mtime
-        last_write = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-    except OSError:
-        last_write = None
-
-    source = "cursor" if harvest_session.is_cursor_path(jsonl) else "claude"
-    return json.dumps({
-        "source": source,
-        "session_id": session_id,
-        "project": harvest_session.derive_project_name(jsonl),
-        "last_write": last_write,
-        "turns": messages[-n:],
-        "total_turns": len(messages),
-    }, ensure_ascii=False, indent=2)
+    from brain.live_sessions import tail_live_session
+    return json.dumps(tail_live_session(session_id, n), ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -708,6 +556,49 @@ def brain_stats() -> str:
         {"entities": ents, "facts": facts, "by_type": by_type},
         indent=2,
     )
+
+
+@mcp.tool()
+def brain_graph_query(sparql: str) -> str:
+    """Execute a SPARQL SELECT query against the brain's RDF triple store.
+
+    The store holds typed relationships extracted from sessions and notes:
+      worksAt, workedAt, knows, manages, reportsTo, partOf, locatedIn,
+      builds, uses, involves, relatedTo, about, decidedOn, learnedFrom,
+      contradicts
+
+    Namespace prefix for convenience:
+      PREFIX b: <http://brain.local/>
+      Entities: b:e/<slug>   Predicates: b:p/<predicate>
+
+    Example — who does Son work with?
+      PREFIX b: <http://brain.local/>
+      SELECT ?org WHERE { b:e/son b:p/worksAt ?org }
+
+    Returns JSON list of binding dicts, or {error: ...} on bad SPARQL.
+    """
+    from brain.graph import query as gq
+    return json.dumps(gq(sparql), ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def brain_graph_neighbors(
+    entity: str,
+    predicate: str | None = None,
+    depth: int = 1,
+) -> str:
+    """Return all triples reachable from `entity` (optionally filtered by predicate).
+
+    Traverses the RDF graph up to `depth` hops (capped at 3). Returns
+    JSON list of {subject, predicate, object} dicts.
+
+    `entity` is the entity name or slug (e.g. "Son", "aitomatic").
+    `predicate` filters to one relationship type (e.g. "worksAt").
+    `depth=2` follows direct neighbours one more step (multi-hop).
+    """
+    from brain.graph import neighbors as gn
+    return json.dumps(gn(entity, predicate=predicate, depth=depth),
+                      ensure_ascii=False, indent=2)
 
 
 @mcp.resource("brain://identity")

@@ -290,8 +290,15 @@ def _process_single(raw_file: Path, existing: str) -> str:
     """Per-file fallback (the original behaviour, minus the per-call commit)."""
     template = _load("extract_session.md")
     body = filter_session_text(raw_file.read_text(errors="replace"))
-    prompt = template.replace("{existing_entities}", existing).replace(
-        "{conversation_summary}", body
+    try:
+        from brain.triple_rules import rules_for_prompt as _rp
+        triple_rules = _rp()
+    except Exception:
+        triple_rules = ""
+    prompt = (template
+        .replace("{existing_entities}", existing)
+        .replace("{conversation_summary}", body)
+        .replace("{triple_rules}", triple_rules or "(no learned rules yet)")
     )
     output = call_claude(prompt)
     if not output:

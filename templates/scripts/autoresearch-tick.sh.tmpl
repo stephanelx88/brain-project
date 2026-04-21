@@ -48,8 +48,16 @@ if pgrep -f "claude --print" >/dev/null 2>&1; then
   exit 0
 fi
 
+# Autoresearch requires Level 3: CPU < 20%, session idle 180 s, AC power.
+# It spawns its own `claude --print`; running it under load hurts the user.
+LEVEL=$("$PYTHON" -m brain.resource_guard 2>/dev/null || echo 0)
+if (( LEVEL < 3 )); then
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) SKIP: level=$LEVEL (need 3 — CPU<20%, idle 180s, AC) ===" >> "$LOG"
+  exit 0
+fi
+
 {
-  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) autoresearch tick ==="
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) autoresearch tick (level=$LEVEL) ==="
   "$PYTHON" -m brain.autoresearch --cycles 1 || echo "autoresearch exited $?"
   echo ""
 } >> "$LOG" 2>&1

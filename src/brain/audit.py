@@ -51,6 +51,12 @@ from pathlib import Path
 
 import brain.config as config
 from brain.config import BRAIN_DIR, ENTITY_TYPES, TIMELINE_DIR  # noqa: F401
+from brain.io import atomic_write_text
+
+try:
+    from brain.db import upsert_entity_from_file as _db_upsert
+except Exception:  # pragma: no cover - db optional at first run
+    _db_upsert = None
 
 
 @dataclass
@@ -153,6 +159,16 @@ def _drop_frontmatter_field(text: str, key: str) -> str:
     return text[m.end():]
 
 
+def _write_and_sync(path: Path, new_text: str) -> None:
+    """Atomic write + immediate SQLite sync so the db reflects the new state."""
+    atomic_write_text(path, new_text)
+    if _db_upsert is not None:
+        try:
+            _db_upsert(path)
+        except Exception:
+            pass  # db sync failure is non-fatal; audit state is on disk
+
+
 def mark_reviewed(path: Path, today: date | None = None) -> bool:
     """Stamp `reviewed: YYYY-MM-DD` on the entity. Returns True if changed.
 
@@ -166,7 +182,7 @@ def mark_reviewed(path: Path, today: date | None = None) -> bool:
     new_text = _set_frontmatter_field(text, "reviewed", new_value)
     if new_text == text:
         return False
-    path.write_text(new_text)
+    _write_and_sync(path, new_text)
     return True
 
 
@@ -177,7 +193,7 @@ def mark_contested(path: Path) -> bool:
     if _has_contested_frontmatter(text):
         return False
     new_text = _set_frontmatter_field(text, "status", "contested")
-    path.write_text(new_text)
+    _write_and_sync(path, new_text)
     return True
 
 
@@ -188,7 +204,7 @@ def resolve_contested(path: Path) -> bool:
     if not _has_contested_frontmatter(text):
         return False
     new_text = _drop_frontmatter_field(text, "status")
-    path.write_text(new_text)
+    _write_and_sync(path, new_text)
     return True
 
 
@@ -386,6 +402,29 @@ def _low_confidence_items(max_items: int = 20) -> list[AuditItem]:
     return [item for _, item in candidates[:max_items]]
 
 
+def _pending_triple_items() -> list[AuditItem]:
+    """Triples waiting for user confirmation before entering the RDF store."""
+    try:
+        from brain.triple_audit import load_pending
+        items = load_pending()
+    except Exception:
+        return []
+    out = []
+    for t in items[:10]:
+        subj = t.get("subject", "?")
+        pred = t.get("predicate", "?")
+        obj = t.get("object", "?")
+        conf = float(t.get("confidence", 0))
+        out.append(AuditItem(
+            kind="pending_triple",
+            label=f"Triple? · ({subj}, {pred}, {obj})",
+            detail=f"confidence {conf:.2f} · basis: {t.get('basis', '')}",
+            priority=55,
+            extra=t,
+        ))
+    return out
+
+
 def top_n(limit: int = 3) -> list[AuditItem]:
     """Return the top `limit` audit items across all signals.
 
@@ -393,7 +432,7 @@ def top_n(limit: int = 3) -> list[AuditItem]:
     Returns [] if the brain is clean — caller should surface nothing.
     """
     pool: list[AuditItem] = []
-    for fn in (_contested_items, _dedupe_items, _low_confidence_items):
+    for fn in (_contested_items, _dedupe_items, _pending_triple_items, _low_confidence_items):
         try:
             pool.extend(fn())
         except Exception:
@@ -512,6 +551,36 @@ def walk(items: list[AuditItem], _input=None,
                 tally["quit"] += 1
                 break
 
+        elif it.kind == "pending_triple":
+            choice = _ask("  y/n/q  (y=add to graph, n=reject) > ", "ynq",
+                          _input=_input)
+            t = it.extra
+            if choice == "y":
+                try:
+                    from brain.graph import add_triple
+                    from brain.triple_rules import record_decision
+                    add_triple(t["subject"], t["predicate"], t["object"])
+                    record_decision(t["predicate"], t.get("basis", ""), "y")
+                    from brain.triple_audit import remove_pending
+                    remove_pending([t["id"]])
+                    print(f"  ✓ added: ({t['subject']}, {t['predicate']}, {t['object']})")
+                except Exception as e:
+                    print(f"  ! error: {e}")
+                tally["yes"] += 1
+            elif choice == "n":
+                try:
+                    from brain.triple_rules import record_decision
+                    from brain.triple_audit import remove_pending
+                    record_decision(t["predicate"], t.get("basis", ""), "n")
+                    remove_pending([t["id"]])
+                    print("  ✗ rejected")
+                except Exception:
+                    pass
+                tally["no"] += 1
+            else:
+                tally["quit"] += 1
+                break
+
         else:
             # Dedupe — two paths; merge is non-trivial, hand off cleanly.
             print("  → run `python -m brain.reconcile --apply` to handle merges")
@@ -543,6 +612,13 @@ def main(argv: list[str] | None = None) -> int:
     the interactive walker so the user can mark items reviewed/contested
     without hand-editing frontmatter.
 
+    Before surfacing items, runs the auto-clean pass (reads
+    ~/.brain/auto_clean.yaml) so items matching known-deletable patterns
+    are removed silently and never reach the user prompt.
+
+    After a --walk session the deleted-item list is fed back into
+    auto_clean.update_rules() so patterns generalise over time.
+
     Exit code is always 0 in non-walk mode — a noisy hook would block
     agent startup, and a failed audit isn't a reason to kill the session.
     """
@@ -552,10 +628,21 @@ def main(argv: list[str] | None = None) -> int:
                    help="How many items to surface (default 3).")
     p.add_argument("--walk", action="store_true",
                    help="Drop into the interactive walker after listing.")
+    p.add_argument("--no-auto-clean", action="store_true",
+                   help="Skip the auto-clean pre-pass (useful for debugging rules).")
     args = p.parse_args(argv)
 
     try:
         config.ensure_dirs()
+
+        # --- auto-clean pre-pass ---
+        if not args.no_auto_clean:
+            try:
+                from brain.auto_clean import apply_rules
+                apply_rules()
+            except Exception:
+                pass  # never let a rules error block the audit
+
         items = top_n(limit=args.limit)
         if not items:
             return 0
@@ -564,6 +651,20 @@ def main(argv: list[str] | None = None) -> int:
             tally = walk(items)
             print()
             print(f"Done — {_summarize_tally(tally)}.")
+
+            # --- rule learning pass ---
+            try:
+                from brain.auto_clean import update_rules
+                deleted_paths = [
+                    it.path for it in items
+                    if it.path is not None and not it.path.exists()
+                ]
+                n = update_rules(deleted_paths)
+                if n:
+                    print(f"auto-clean: learned {n} new pattern(s) → "
+                          f"~/.brain/auto_clean.yaml updated.")
+            except Exception:
+                pass
         else:
             print(format_for_session(items), end="")
     except Exception:

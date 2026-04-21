@@ -1,0 +1,67 @@
+# Brain auto-clean default rules
+# Copied to <vault>/auto_clean.yaml on `brain init` (only if not already present).
+# Edit your vault copy to customize — this file is the factory default.
+#
+# Rules are applied automatically before `brain audit` shows items for review.
+# Items matching a rule are silently deleted — no user prompt needed.
+#
+# Each rule:
+#   name:          short identifier
+#   description:   why this type is safe to auto-delete
+#   match:
+#     types:           list of entity types  (e.g. [insights])
+#     source_count:    exact integer match   (1 = single-source only)
+#     name_patterns:   list of regex — entity name must match ANY one
+#     min_age_days:    (optional) only fire if entity is at least N days old
+#   action: delete
+
+rules:
+  - name: milestone_announcements
+    description: "'X pipeline complete / is operational' — historical milestone with no future recall value"
+    match:
+      types: [insights]
+      source_count: 1
+      name_patterns:
+        - "(?i)\\s+complete$"
+        - "(?i)\\bcompleted\\b"
+        - "(?i)\\bis\\s+operational\\b"
+        - "(?i)\\bnow\\s+operational\\b"
+        - "(?i)pipeline\\s+complete"
+      min_age_days: 3
+    action: delete
+
+  - name: changelog_entries
+    description: "'N issues fixed / retrospective findings' — belongs in git history, not brain"
+    match:
+      types: [insights]
+      source_count: 1
+      name_patterns:
+        - "(?i)\\d+\\s+issues?\\s+(found\\s+and\\s+)?fixed"
+        - "(?i)retrospective.*findings"
+        - "(?i)code\\s+review.*\\d+"
+        - "(?i)\\d+\\s+bugs?\\s+fixed"
+      min_age_days: 3
+    action: delete
+
+  - name: stale_metric_estimates
+    description: "Single-benchmark percentage/token estimates tied to a specific run — stale after one update cycle"
+    match:
+      types: [insights]
+      source_count: 1
+      name_patterns:
+        - "(?i)[~≈]?\\d+\\s*[xX×]\\s*(token|reduction|faster|improvement)"
+        - "(?i)[~≈]?\\d+\\s*%\\s*(token|reduction|faster|improvement)"
+        - "(?i)(token|percent)\\s*(reduction|improvement)"
+      min_age_days: 3
+    action: delete
+
+  - name: vague_goal_statements
+    description: "Thin 'we should do X faster' goal notes without a concrete open action item"
+    match:
+      types: [insights]
+      source_count: 1
+      name_patterns:
+        - "(?i)feedback\\s+loop.*accelerat"
+        - "(?i)accelerat.*feedback\\s+loop"
+      min_age_days: 3
+    action: delete

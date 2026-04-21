@@ -94,6 +94,11 @@ def _build_prompt(note: dict, existing_entities: str) -> str:
     if len(body) > MAX_BODY_CHARS:
         body = body[:MAX_BODY_CHARS] + f"\n\n…[truncated, original {len(body)} chars]"
     date = datetime.fromtimestamp(note.get("mtime") or 0, tz=timezone.utc).strftime("%Y-%m-%d")
+    try:
+        from brain.triple_rules import rules_for_prompt
+        triple_rules = rules_for_prompt()
+    except Exception:
+        triple_rules = ""
     return (
         template
         .replace("{existing_entities}", existing_entities)
@@ -101,6 +106,7 @@ def _build_prompt(note: dict, existing_entities: str) -> str:
         .replace("{title}", note.get("title") or note["path"])
         .replace("{date}", date)
         .replace("{body}", body)
+        .replace("{triple_rules}", triple_rules or "(no learned rules yet)")
     )
 
 

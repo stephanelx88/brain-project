@@ -45,6 +45,12 @@ INDEX_FILE = BRAIN_DIR / "index.md"
 LOG_FILE = BRAIN_DIR / "log.md"
 CONFIG_FILE = BRAIN_DIR / "brain-config.yaml"
 
+# Graph (ODB) layer
+GRAPH_STORE_DIR = BRAIN_DIR / ".brain.rdf"
+PENDING_TRIPLES_PATH = BRAIN_DIR / "pending_triples.jsonl"
+TRIPLE_RULES_PATH = IDENTITY_DIR / "triple_rules.jsonl"
+TRIPLE_RULES_MD_PATH = IDENTITY_DIR / "triple_rules.md"
+
 # Hard-coded fallback when no preset has been picked yet. Kept tiny so a
 # fresh install is still usable without `brain init`.
 _DEFAULT_SEED_TYPES = ["people", "projects", "domains"]

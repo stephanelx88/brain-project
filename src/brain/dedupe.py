@@ -41,14 +41,10 @@ The active-session guard in that script already gates it correctly
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import re
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 
@@ -58,6 +54,7 @@ from brain.entities import append_to_entity_path
 from brain.git_ops import commit
 from brain.io import atomic_write_text
 from brain.log import append_log
+from brain import dedupe_ledger, dedupe_judge
 
 try:
     from brain.db import upsert_entity_from_file, delete_entity_by_path
@@ -97,54 +94,6 @@ DEFAULT_THRESHOLDS = (0.90, 0.96)
 # Bound a single run to keep token cost and write blast radius small.
 DEFAULT_MAX_JUDGMENTS = 20
 DEFAULT_MAX_MERGES = 8
-
-# Cosine value used as a hard floor to skip pairs we've judged before
-# unless one of them was edited since.
-LEDGER_PATH = config.BRAIN_DIR / ".dedupe.ledger.json"
-
-# Truncate entity bodies for the judge prompt — anything past ~1.5KB is
-# almost always boilerplate or fact accumulations rather than the
-# defining text.
-BODY_TRUNCATE_CHARS = 1500
-
-
-# ---------------------------------------------------------------------------
-# ledger — pairs judged before are skipped
-# ---------------------------------------------------------------------------
-
-def _ledger_load() -> dict:
-    if not LEDGER_PATH.exists():
-        return {}
-    try:
-        return json.loads(LEDGER_PATH.read_text())
-    except Exception:
-        return {}
-
-
-def _ledger_save(led: dict) -> None:
-    atomic_write_text(LEDGER_PATH, json.dumps(led, indent=2, sort_keys=True))
-
-
-def _pair_key(slug_a: str, slug_b: str, type_: str) -> str:
-    a, b = sorted([slug_a, slug_b])
-    return f"{type_}|{a}|{b}"
-
-
-def _file_mtime(path: Path) -> int:
-    try:
-        return int(path.stat().st_mtime)
-    except FileNotFoundError:
-        return 0
-
-
-def _ledger_skip(led: dict, key: str, mtime_a: int, mtime_b: int) -> bool:
-    """Skip a pair only if the ledger entry was recorded against the same
-    pair of mtimes. A real edit on either file invalidates the cache so
-    the new wording gets re-judged."""
-    rec = led.get(key)
-    if not rec:
-        return False
-    return rec.get("mtime_a") == mtime_a and rec.get("mtime_b") == mtime_b
 
 
 # ---------------------------------------------------------------------------
@@ -217,68 +166,6 @@ def find_candidates(
             })
     candidates.sort(key=lambda c: -c["cosine"])
     return candidates
-
-
-# ---------------------------------------------------------------------------
-# LLM judge — one Claude Haiku call per candidate
-# ---------------------------------------------------------------------------
-
-def _load_prompt() -> str:
-    return (Path(__file__).parent / "prompts" / "dedupe_judge.md").read_text()
-
-
-def _read_body(path: Path) -> str:
-    """Return the entity body trimmed to BODY_TRUNCATE_CHARS, frontmatter included."""
-    try:
-        text = path.read_text(errors="replace")
-    except FileNotFoundError:
-        return ""
-    return text[:BODY_TRUNCATE_CHARS]
-
-
-def _build_judge_prompt(cand: dict) -> str:
-    template = _load_prompt()
-    return (template
-            .replace("{entity_type}", cand["type"])
-            .replace("{cosine}", f"{cand['cosine']:.3f}")
-            .replace("{slug_a}", cand["slug_a"])
-            .replace("{slug_b}", cand["slug_b"])
-            .replace("{body_a}", _read_body(cand["path_a"]))
-            .replace("{body_b}", _read_body(cand["path_b"])))
-
-
-def _parse_verdict(raw: str) -> dict | None:
-    """Strict JSON expected. Tolerate code fences and surrounding text."""
-    text = raw.strip()
-    if text.startswith("```"):
-        text = "\n".join(l for l in text.split("\n") if not l.startswith("```"))
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        s, e = text.find("{"), text.rfind("}") + 1
-        if s < 0 or e <= s:
-            return None
-        try:
-            obj = json.loads(text[s:e])
-        except json.JSONDecodeError:
-            return None
-    if not isinstance(obj, dict):
-        return None
-    if obj.get("verdict") not in {"merge", "split", "unrelated", "unsure"}:
-        return None
-    return obj
-
-
-def judge_pair(cand: dict) -> dict | None:
-    """One LLM call. Returns parsed verdict dict or None on failure."""
-    # Imported lazily so a fresh checkout that hasn't installed the
-    # extraction deps can still run `find_candidates`.
-    from brain.auto_extract import call_claude
-    prompt = _build_judge_prompt(cand)
-    out = call_claude(prompt, timeout=120)
-    if not out:
-        return None
-    return _parse_verdict(out)
 
 
 # ---------------------------------------------------------------------------
@@ -571,7 +458,7 @@ def run(
 ) -> dict:
     """One dedupe pass. Returns a summary dict."""
     config.ensure_dirs()
-    led = _ledger_load()
+    led = dedupe_ledger.load()
 
     # Drain previously-judged merges that now meet the current auto-apply
     # bar (cheap: no LLM calls). Lets a threshold tweak — or simply a
@@ -588,7 +475,7 @@ def run(
     candidates = find_candidates(type_filter, threshold_override)
     if not candidates and not pending_merged:
         if apply:
-            _ledger_save(led)
+            dedupe_ledger.save(led)
         if not quiet:
             print("No semantic dedupe candidates.")
         return {"candidates": 0, "judged": 0, "merged": 0, "proposed": 0,
@@ -604,14 +491,14 @@ def run(
         if judged >= max_judgments:
             break
 
-        mtime_a = _file_mtime(cand["path_a"])
-        mtime_b = _file_mtime(cand["path_b"])
-        key = _pair_key(cand["slug_a"], cand["slug_b"], cand["type"])
-        if _ledger_skip(led, key, mtime_a, mtime_b):
+        mtime_a = dedupe_ledger.file_mtime(cand["path_a"])
+        mtime_b = dedupe_ledger.file_mtime(cand["path_b"])
+        key = dedupe_ledger.pair_key(cand["slug_a"], cand["slug_b"], cand["type"])
+        if dedupe_ledger.should_skip(led, key, mtime_a, mtime_b):
             skipped_ledger += 1
             continue
 
-        verdict = judge_pair(cand)
+        verdict = dedupe_judge.judge_pair(cand)
         judged += 1
 
         if verdict is None:
@@ -651,7 +538,7 @@ def run(
         proposal_path = _write_proposals(proposals)
 
     if apply:
-        _ledger_save(led)
+        dedupe_ledger.save(led)
         if merged:
             entity_lines = [f"{m['winner']} ← {m['loser']}" for m in merged]
             # Stage only what dedupe actually rewrote (winner + loser
