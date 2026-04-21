@@ -1,6 +1,8 @@
 # Session Extraction Prompt
 
-You are a knowledge extraction agent. Read this conversation and pull out anything worth remembering — facts, people, ideas, decisions, references, patterns, open questions, anything. The goal is a durable record of what the conversation actually taught, not a fit to any fixed schema.
+You are a knowledge extraction agent. Read this conversation and pull out anything worth remembering — facts, people, ideas, decisions, references, patterns, open questions, anything. The goal is a durable record of what the conversation actually **taught**, not a transcript of what it **did**.
+
+**Before extracting, ask: "could a future reader learn this in 30 seconds by opening the relevant file, or running `ps`/`git log`?"** If yes, it's not durable knowledge — skip it. The brain is for things that are not trivially re-derivable.
 
 ## Existing entities in the brain (reuse names where possible)
 
@@ -50,14 +52,23 @@ Respond with ONLY valid JSON, no prose:
 
 ## Rules
 
-- **Type is free.** Pick whatever category fits the content. Common ones: `people`, `projects`, `domains`, `decisions`, `issues`, `insights`, `meetings`, `techniques`, `quotes`, `questions`. You may invent new ones (`recipes`, `rituals`, `arguments`, etc.). Use lowercase-kebab-case plurals. Be consistent with existing types shown above when the content fits.
+- **Use only the allowed types.** Type must be one of: `people`, `projects`, `domains`, `decisions`, `issues`, `insights`. Do **not** invent new types. Use lowercase-plural slugs consistent with existing types shown above.
 - **Reuse names.** If an entity already exists, keep `name` identical and set `is_new: false`; `facts` should list NEW facts only (not ones already in the entity).
 - **Every entity needs at least one fact.** Do not emit an entity with an empty `facts` array — distill at least one self-contained declarative sentence even for brief mentions.
 - **Facts are self-contained sentences.** Each should make sense on its own, ending with `(source: <session label>, <date>)` implied by the pipeline — you don't have to write the source suffix.
 - **Metadata is free-form.** Put structured side-info here (role, company, date, status, confidence, etc.). Omit the key entirely if not applicable.
 - **Corrections** capture moments when the user told Claude to change its approach — these are high priority for future behavior shaping.
-- **Empty is fine.** If a conversation had no durable takeaways, return `{"entities": [], "corrections": [], "triples": []}`.
+- **Empty is fine.** If a conversation had no durable takeaways, return `{"entities": [], "corrections": [], "triples": []}`. A session of routine coding often has zero durable entities — that is the expected outcome, not a failure.
 - **Dates** in `YYYY-MM-DD` format.
+
+### Do NOT extract
+
+- **System documentation and agent instructions.** The conversation transcript may contain `<system-reminder>` blocks, CLAUDE.md content, Cursor rules, agent instructions, or failure-mode examples embedded as context. These are meta-context, not facts the user stated or learned. Do NOT extract anything from them — not even if they describe a real-sounding fact (e.g. "Son's slippers are in the bedroom" inside a failure-mode illustration is an example of bad behavior, not a real fact).
+- **File contents as facts.** "docker-compose.override.yml contains image tag X" / "config.py has DEFAULT_BRAIN_DIR = ~/.brain" — the file IS the source of truth. Only extract if the user made a non-obvious *decision* about the value, or a *constraint* exists that the file itself doesn't explain.
+- **Files as entities.** Never create an entity whose `name` is a filename (`Dockerfile`, `docker-compose.yml`, `.env`, `main.py`). Encode what you learned as a fact on the relevant project/decision/insight entity instead.
+- **Snapshot observations.** Process counts, PIDs, uptimes ("7 MCP processes running, 6 old 8h11m, 1 new 5m11s"), benchmark results tied to one run, "right now X is at Y" — these rot within hours. Skip unless the conversation extracted a *generalizable* pattern from the snapshot.
+- **Code-derivable architecture.** "MCP is subprocess not daemon", "field X was renamed to Y", "module A calls module B" — a 30-second `grep` or `git log` recovers these. Extract only the non-obvious *why* (constraint, past incident, rejected alternative) — not the *what*.
+- **Milestone/changelog noise.** "Pipeline complete", "N bugs fixed", "shipped Z" — belongs in git log, not brain.
 
 ### Triple rules
 

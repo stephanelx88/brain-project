@@ -34,6 +34,16 @@ try:
 except Exception:  # pragma: no cover
     record_fact_provenance = None
 
+try:
+    from brain.supersede import recompute_for_entity as _recompute_supersede
+except Exception:  # pragma: no cover
+    _recompute_supersede = None
+
+try:
+    from brain.ontology_guard import validate_entity as _validate_entity
+except Exception:  # pragma: no cover
+    _validate_entity = None
+
 TRIPLE_CONFIDENCE_THRESHOLD = 0.8
 
 
@@ -113,6 +123,12 @@ def _apply_entity(
     don't pin a source note skip provenance and remain accumulator-only,
     matching pre-existing behaviour.
     """
+    if _validate_entity is not None:
+        is_valid, reason = _validate_entity(item)
+        if not is_valid:
+            print(f"[ontology_guard] rejected {item.get('type')!r}:{item.get('name')!r} — {reason}")
+            return
+
     entity_type = (item.get("type") or "").strip().lower()
     name = (item.get("name") or "").strip()
     if not entity_type or not name:
@@ -249,6 +265,11 @@ def apply_extraction(
                 upsert_entity_from_file(p)
             except Exception as e:  # don't break extraction on db trouble
                 print(f"db write-through failed for {p}: {e}")
+            if _recompute_supersede is not None:
+                try:
+                    _recompute_supersede(p)
+                except Exception as e:
+                    print(f"supersede recompute failed for {p}: {e}")
 
     if do_rebuild_index:
         rebuild_index()
