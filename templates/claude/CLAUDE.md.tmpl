@@ -3,80 +3,15 @@
 {{USERNAME}} has a persistent memory system exposed as MCP tools (prefix
 `mcp__brain__`). **Use them. Do not read brain files manually.**
 
-## Brain-first rule (MANDATORY, AUTONOMOUS)
+{{include: _shared/rules/brain_first.md}}
 
-**Reflex**: your first tool call on every user message is
-`brain_recall(<the user's question, lightly normalised>)`. Always.
-Before any reasoning, before any other tool, before saying "I don't
-know", before being witty.
+{{include: _shared/rules/grounding.md}}
 
-```
-EVERY user message  →  brain_recall(query)  →  then decide what to do
-```
+{{include: _shared/rules/weak_match.md}}
 
-Empty result is fine — proceed normally. Non-empty result must inform
-your answer; never contradict or ignore it without explicit reason.
+{{include: _shared/rules/tools_table.md}}
 
-You may **skip** the reflex ONLY when **all** three hold simultaneously:
-1. The message is pure external knowledge with zero possessive pronouns
-   or proper nouns belonging to {{USERNAME}}'s world (e.g. *"what year
-   was Python 3 released"*, *"explain TCP handshake"*).
-2. You already called `brain_recall` this turn for the same topic.
-3. You're answering a meta-question about the current conversation
-   itself (e.g. *"what did you just say?"*).
-
-Anything else — including offhand, whimsical, single-word, or seemingly
-nonsensical questions — gets `brain_recall` first. Cost of a redundant
-call is ~200 ms; cost of a missed one is hallucination.
-
-> Failure mode this rule prevents (incident 2026-04-21): Claude Code
-> received *"đôi dép tôi đâu?"*, classified it as "object question
-> outside brain's scope", answered *"look under your bed 👟"*. Brain
-> actually had the answer indexed from a user note. The agent never
-> called the tool.
-
-If `brain_recall` returns nothing useful, escalate:
-1. `brain_notes(query)` — user-authored notes only
-2. `brain_entities(type=...)` — list extracted entities
-3. `brain_get(slug)` / `brain_note_get(path)` — fetch full file
-4. Only after all of the above return empty: say "the brain has no record of this."
-
-**Never** answer from training data or guesses when brain could plausibly
-have it. The brain is the source of truth for {{USERNAME}}.
-
-## Tools available
-
-| Tool | Use for |
-|---|---|
-| `brain_recall` | **Default** — hybrid BM25+semantic across everything |
-| `brain_semantic` | Paraphrase / concept queries |
-| `brain_notes` | User-authored markdown notes only |
-| `brain_note_get` | Fetch full note body by path |
-| `brain_entities` | List entities by type |
-| `brain_get` | Fetch one entity file by slug |
-| `brain_recent` | Last N entities/facts |
-| `brain_identity` | Who-I-am snapshot |
-| `brain_stats` | Counts |
-| `brain_audit` | Top-N items needing a human decision (contested / dedupe / low-conf) |
-| `brain_live_sessions` | List Claude/Cursor sessions alive *right now* (bypasses extraction lag) |
-| `brain_live_tail` | Last N turns of a peer session (no LLM, no harvest) |
-
-## Cross-session awareness
-
-The harvest+extract pipeline is gated by 60-180 s idle thresholds, so the
-SQLite-backed tools above lag live activity. When you need to know what
-*other Claude/Cursor windows are doing right now*, use the live tools.
-
-- On the **first user message of a fresh session**, call
-  `brain_live_sessions(300)` (your own session is auto-excluded from
-  results). If it returns any peers, mention them in one line: e.g.
-  *"FYI — 2 other sessions active: Cursor in `brain-project`, Claude
-  in `~/Documents/foo`."*
-- If the user asks "what am I working on elsewhere?" / "what's the other
-  window doing?" / similar, call `brain_live_tail(session_id, 20)` on
-  the relevant peer and summarise.
-- Do **not** call `brain_live_tail` on every turn — it reads the full
-  jsonl. Use it on demand or when peers look relevant to the task.
+{{include: _shared/rules/cross_session.md}}
 
 ## Session-start audit (surface, don't dump)
 
@@ -86,28 +21,13 @@ in a single line: e.g. *"FYI — your brain has 3 items pending review
 (1 contested, 2 merge candidates). Say `audit` if you want to walk
 through them."* Then proceed with the actual user request.
 
-Do not list every item, do not derail the user's task, do not nag on
-subsequent turns. If they ignore it, drop it. If they say "audit" /
-"show", call `brain_audit(limit=10)` and walk through them one at a time.
+{{include: _shared/rules/session_audit.md}}
 
 Both Claude Code and Cursor get the same hook now (`brain install`
 wires Cursor's `sessionStart` event to the same harvest+audit pair),
-so no manual fallback call is needed in either tool. If `brain doctor`
-flags either hook as unwired, fall back to calling `brain_audit(limit=3)`
-yourself on the first message and apply the same surface-once rule.
+so no manual fallback call is needed in either tool.
 
-## NEVER
-
-- Never read `{{BRAIN_DIR}}/*.md` with file tools when an MCP tool can answer.
-- Never spawn `claude --print` from a hook (causes dual-instance Mac freeze).
+{{include: _shared/rules/never.md}}
 - Never run `brain.auto_extract` from SessionStart hook — it calls Claude internally.
 
-## Architecture (FYI only)
-
-- **Harvest** (auto, launchd, ~1 s throttle): captures Claude/Cursor sessions → `{{BRAIN_DIR}}/raw/`
-- **Ingest notes** (auto): picks up user-authored markdown anywhere in `{{BRAIN_DIR}}/`
-- **Extract** (auto): LLM extracts entities → `{{BRAIN_DIR}}/entities/`
-- **Reconcile + clean** (auto): dedup, tidy
-- **MCP server** (`brain.mcp_server`): how you query all of the above
-
-Source: `{{PROJECT_DIR}}` · run `{{BRAIN_DIR}}/bin/doctor.sh` if anything seems off.
+{{include: _shared/rules/architecture.md}}
