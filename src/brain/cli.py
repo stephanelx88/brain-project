@@ -1,10 +1,13 @@
 """Top-level `brain` CLI dispatcher.
 
-    brain init             interactive setup wizard
-    brain status           show vault stats
-    brain doctor           run diagnostics (delegates to bin/doctor.sh)
-    brain config           print resolved brain-config.yaml
-    brain --version        print version
+    brain init                 interactive setup wizard
+    brain status               show vault stats
+    brain doctor               run diagnostics (delegates to bin/doctor.sh)
+    brain config               print resolved brain-config.yaml
+    brain failure record ...   append a row to the failure ledger
+    brain failure list [...]   list recorded failures (newest first)
+    brain failure resolve ...  mark a failure as resolved
+    brain --version            print version
 
 This is intentionally thin — each subcommand lives in its own module.
 """
@@ -12,6 +15,7 @@ This is intentionally thin — each subcommand lives in its own module.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -54,6 +58,71 @@ def _cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_failure_record(args: argparse.Namespace) -> int:
+    """`brain failure record` — append one row to the ledger, print id.
+
+    Thin wrapper: the argparse namespace carries whatever the caller
+    supplied; `None` is the right default for every optional field so
+    `record_failure` stores an explicit null rather than the empty string.
+    """
+    from brain import failures
+    fid = failures.record_failure(
+        source=args.source,
+        tool=args.tool,
+        query=args.query,
+        result_digest=args.result_digest,
+        user_correction=args.correction,
+        tags=args.tag or [],
+        session_id=args.session_id,
+    )
+    print(fid)
+    return 0
+
+
+def _cmd_failure_list(args: argparse.Namespace) -> int:
+    """`brain failure list` — pretty-print (or JSON) the ledger.
+
+    --json is the primary interface for tests and scripting; the text
+    form is a best-effort single-line summary per row to keep humans
+    oriented without reimplementing a full formatter."""
+    from brain import failures
+    rows = failures.list_failures(
+        source=args.source,
+        tag=args.tag,
+        unresolved_only=args.unresolved,
+        limit=args.limit,
+    )
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no failures recorded)")
+        return 0
+    for r in rows:
+        status = "RESOLVED" if r.get("resolution") else "open"
+        tags = ",".join(r.get("tags") or []) or "-"
+        q = (r.get("query") or "")[:60]
+        print(f"{r.get('id','?')}  {r.get('ts','?')}  [{status}]  "
+              f"{r.get('source','?')}/{r.get('tool') or '-'}  "
+              f"tags={tags}  q={q!r}")
+    return 0
+
+
+def _cmd_failure_resolve(args: argparse.Namespace) -> int:
+    """`brain failure resolve <id>` — rewrite the matching row's resolution."""
+    from brain import failures
+    ok = failures.resolve_failure(
+        args.id,
+        patch_ref=args.patch,
+        outcome=args.outcome,
+    )
+    if not ok:
+        print(f"No failure with id {args.id!r}", file=sys.stderr)
+        return 1
+    print(f"resolved {args.id}")
+    return 0
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     """Translate parsed args back into argv form so init.main() can stay
     a self-contained, separately runnable module (`python3 -m brain.init`)."""
@@ -92,6 +161,49 @@ def main(argv: list[str] | None = None) -> int:
     p_status.set_defaults(func=_cmd_status)
     sub.add_parser("doctor", help="Diagnostics (bin/doctor.sh)").set_defaults(func=_cmd_doctor)
     sub.add_parser("config", help="Print brain-config.yaml").set_defaults(func=_cmd_config)
+
+    # `brain failure {record,list,resolve}` — structured failure ledger.
+    # Substrate only; consumers (extraction DLQ, drift detector, ...) ship
+    # in later waves.
+    p_fail = sub.add_parser("failure", help="Structured failure ledger")
+    fail_sub = p_fail.add_subparsers(dest="failure_cmd")
+    # If the user types just `brain failure`, print the subcommand help
+    # rather than silently no-op'ing.
+    p_fail.set_defaults(func=lambda _a: (p_fail.print_help() or 0))
+
+    p_fr = fail_sub.add_parser("record", help="Append a failure row")
+    p_fr.add_argument("--source", required=True,
+                      help="Failure source (e.g. recall, extraction, template_drift, manual)")
+    p_fr.add_argument("--tool", default=None, help="MCP/CLI tool involved")
+    p_fr.add_argument("--query", default=None, help="The user query that triggered the failure")
+    p_fr.add_argument("--result-digest", dest="result_digest", default=None,
+                      help="Short hash or summary of what brain returned")
+    p_fr.add_argument("--correction", dest="correction", default=None,
+                      help="User-supplied correction / ground truth")
+    p_fr.add_argument("--tag", action="append", default=[],
+                      help="Tag (repeatable)")
+    p_fr.add_argument("--session-id", dest="session_id", default=None,
+                      help="Originating session id, if known")
+    p_fr.set_defaults(func=_cmd_failure_record)
+
+    p_fl = fail_sub.add_parser("list", help="List recorded failures (newest first)")
+    p_fl.add_argument("--source", default=None, help="Filter by source")
+    p_fl.add_argument("--tag", default=None, help="Filter by tag")
+    p_fl.add_argument("--unresolved", action="store_true",
+                      help="Only list rows without a resolution")
+    p_fl.add_argument("-n", "--limit", type=int, default=50,
+                      help="Max rows to return (default 50)")
+    p_fl.add_argument("--json", action="store_true",
+                      help="Emit JSON instead of text")
+    p_fl.set_defaults(func=_cmd_failure_list)
+
+    p_fx = fail_sub.add_parser("resolve", help="Mark a failure as resolved")
+    p_fx.add_argument("id", help="Failure id (12-hex short uuid)")
+    p_fx.add_argument("--patch", required=True,
+                      help="Patch reference (commit sha, PR url, file path)")
+    p_fx.add_argument("--outcome", required=True,
+                      help="Outcome label (e.g. fixed, wontfix, duplicate)")
+    p_fx.set_defaults(func=_cmd_failure_resolve)
 
     args = p.parse_args(argv)
     if args.version:

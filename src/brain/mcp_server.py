@@ -17,6 +17,8 @@ on-demand retrieval. Tools:
                                        → live Claude/Cursor sessions
   brain_live_tail(session_id, n)       → last N turns of one live session
   brain_audit(limit)                   → top-N items needing a human decision
+  brain_failure_record(...)            → append a row to the failure ledger
+  brain_failure_list(...)              → list recorded failures (newest first)
   brain_status()                       → operational dashboard
   brain_stats()                        → high-level counts
 
@@ -568,6 +570,67 @@ def brain_audit(limit: int = 3) -> str:
     limit = max(0, min(int(limit), 10))
     items = audit_mod.top_n(limit=limit)
     return audit_mod.format_for_session(items)
+
+
+@mcp.tool()
+def brain_failure_record(
+    source: str,
+    tool: str | None = None,
+    query: str | None = None,
+    result_digest: str | None = None,
+    user_correction: str | None = None,
+    tags: list[str] | None = None,
+    session_id: str | None = None,
+    extra: dict | None = None,
+) -> str:
+    """Append one row to the brain's failure ledger. Returns `{"id": ...}`.
+
+    Substrate for the self-correction loop: record a structured failure
+    event (wrong recall, bad extraction, template drift, etc.) so a
+    later wave can drive patches or verify fixes. Consumers do not yet
+    read the ledger automatically — use this when you want to make an
+    incident queryable.
+
+    `source` is required ("recall" | "extraction" | "template_drift" |
+    "manual" | ...); every other field is optional. `tags` accepts a
+    list of strings; `extra` is an open-ended dict for per-source metadata.
+    """
+    from brain import failures
+    fid = failures.record_failure(
+        source=source,
+        tool=tool,
+        query=query,
+        result_digest=result_digest,
+        user_correction=user_correction,
+        tags=list(tags) if tags else [],
+        session_id=session_id,
+        extra=dict(extra) if extra else None,
+    )
+    return json.dumps({"id": fid})
+
+
+@mcp.tool()
+def brain_failure_list(
+    source: str | None = None,
+    tag: str | None = None,
+    unresolved_only: bool = False,
+    limit: int = 50,
+) -> str:
+    """List recorded failures, newest first. Filters compose (AND).
+
+    Use to surface recent unresolved failures at session start or when
+    investigating a class of bugs ("what recall misses have I logged
+    this week?"). Returns a JSON list of ledger rows — see
+    `brain.failures` for the schema.
+    """
+    from brain import failures
+    rows = failures.list_failures(
+        source=source,
+        tag=tag,
+        unresolved_only=bool(unresolved_only),
+        limit=int(limit),
+    )
+    return json.dumps(rows, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
