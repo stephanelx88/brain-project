@@ -75,6 +75,16 @@ EXCLUDED_PATHS: tuple[str, ...] = (
     "research-log.md",
     "recall-ledger.jsonl",
     "README.md",
+    # System-managed files rendered by bin/install.sh into the vault root.
+    # These are documentation/config, NOT user-typed facts. Sending them
+    # to the LLM produces hallucinated facts: e.g. cursor-user-rules.md
+    # contains the example "đôi dép tôi đâu?" → the LLM extracted that as
+    # a real fact "Son's slippers are in the bedroom" (incident 2026-04-21).
+    # If install.sh starts rendering more files into the vault root, add
+    # them here — the rule is "if a script writes it, exclude it".
+    "cursor-user-rules.md",
+    "program.md",
+    "eval-queries.md",
 )
 
 
