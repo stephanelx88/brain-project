@@ -65,3 +65,15 @@ rules:
         - "(?i)accelerat.*feedback\\s+loop"
       min_age_days: 3
     action: delete
+
+  - name: architecture_clarifications
+    description: "'X is Y, not Z' / 'renamed field' / 'clarification' — code-derivable facts, no future recall value"
+    match:
+      types: [insights]
+      source_count: 1
+      name_patterns:
+        - "(?i)\\bclarification\\b"
+        - "(?i)\\barchitecture\\s+is\\b"
+        - "(?i)\\brenamed?\\b"
+      min_age_days: 3
+    action: delete

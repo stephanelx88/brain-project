@@ -3,8 +3,10 @@ import pytest
 from brain.resource_guard import clearance_level
 
 
-def _level(cpu, idle, ac=True, screen=0):
-    return clearance_level(cpu=cpu, session_idle=idle, on_ac=ac, screen_idle=screen)
+def _level(cpu, idle, ac=True, screen=0, mem=0):
+    return clearance_level(
+        cpu=cpu, mem=mem, session_idle=idle, on_ac=ac, screen_idle=screen
+    )
 
 
 class TestClearanceLevel:
@@ -58,3 +60,29 @@ class TestClearanceLevel:
     def test_full_idle_machine(self):
         # typical screensaver + idle laptop on charger
         assert _level(cpu=2, idle=600, ac=True, screen=600) == 4
+
+
+class TestMemoryGate:
+    def test_level_0_when_memory_saturated(self):
+        # RAM > 90% blocks even the lowest level despite idle CPU
+        assert _level(cpu=5, idle=600, ac=True, screen=600, mem=95) == 0
+
+    def test_level_1_mem_at_boundary(self):
+        # exactly at L1 threshold is NOT below it
+        assert _level(cpu=5, idle=0, mem=90) == 0
+
+    def test_level_1_mem_just_below(self):
+        assert _level(cpu=5, idle=0, mem=89.9) == 1
+
+    def test_level_2_blocked_by_mem(self):
+        # CPU + idle would allow L2 but mem pressure caps at L1
+        assert _level(cpu=5, idle=120, ac=True, mem=85) == 1
+
+    def test_level_3_blocked_by_mem(self):
+        assert _level(cpu=5, idle=300, ac=True, mem=75) == 2
+
+    def test_level_4_blocked_by_mem(self):
+        assert _level(cpu=5, idle=600, ac=True, screen=600, mem=65) == 3
+
+    def test_level_4_mem_headroom(self):
+        assert _level(cpu=5, idle=600, ac=True, screen=600, mem=50) == 4

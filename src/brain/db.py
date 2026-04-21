@@ -143,6 +143,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "extracted_sha" not in cols("notes"):
         conn.execute("ALTER TABLE notes ADD COLUMN extracted_sha TEXT")
 
+    # 2026-04-22 — fact supersession: when the LLM re-extracts a
+    # contradictory fact (e.g. note says "Cần Thơ", session said
+    # "Long Xuyên"), the older fact is not deleted — it is marked
+    # `superseded` and rendered with `~~strikethrough~~` in the
+    # entity markdown so the user still sees history at a glance
+    # while the MCP read path only surfaces current facts.
+    fact_cols = cols("facts")
+    if "status" not in fact_cols:
+        conn.execute("ALTER TABLE facts ADD COLUMN status TEXT")
+    if "superseded_by" not in fact_cols:
+        conn.execute("ALTER TABLE facts ADD COLUMN superseded_by INTEGER")
+    if "superseded_at" not in fact_cols:
+        conn.execute("ALTER TABLE facts ADD COLUMN superseded_at TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS facts_status_idx ON facts(status)")
+
 
 @contextmanager
 def connect():
@@ -188,13 +203,17 @@ def _summary(body: str, limit: int = 200) -> str:
     return ""
 
 
-def _facts_from_body(body: str) -> Iterable[tuple[str, str | None, str | None]]:
-    """Yield (text, source, date) for each LIVE fact bullet.
+_STRIKE_RE = re.compile(r"^~~(.+?)~~\s*(.*)$")
 
-    Strikethrough bullets (`- ~~…~~`) are treated as invalidated and
-    skipped — they remain in the markdown for human auditability and
-    git history, but the search index pretends they don't exist so
-    deleted-source facts stop showing up in recall.
+
+def _facts_from_body(body: str) -> Iterable[tuple[str, str | None, str | None, str | None]]:
+    """Yield (text, source, date, status) for each fact bullet.
+
+    Strikethrough bullets (`- ~~…~~`) survive with status='superseded'
+    so they remain inspectable via the audit surface but are filtered
+    out of the FTS index (see upsert_entity_from_file) and the
+    semantic vector store (see semantic.build). Live bullets yield
+    status=None ("current").
     """
     for raw in body.split("\n"):
         line = raw.strip()
@@ -203,14 +222,21 @@ def _facts_from_body(body: str) -> Iterable[tuple[str, str | None, str | None]]:
         body_text = line[2:].strip()
         if not body_text:
             continue
+        status: str | None = None
         if body_text.startswith("~~"):
-            continue  # invalidated — see ingest_notes.invalidate_facts_for_note
+            m_strike = _STRIKE_RE.match(body_text)
+            if not m_strike:
+                continue
+            inner = m_strike.group(1).strip()
+            trailing = m_strike.group(2).strip()
+            body_text = f"{inner} {trailing}".strip() if trailing else inner
+            status = "superseded"
         m = _SOURCE_RE.search(body_text)
         source = m.group(1).strip() if m else None
         date = m.group(2).strip() if m and m.group(2) else None
         cleaned = _SOURCE_RE.sub("", body_text).strip()
         if cleaned:
-            yield cleaned, source, date
+            yield cleaned, source, date, status
 
 
 def _entity_type_from_path(path: Path) -> str | None:
@@ -314,16 +340,21 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
             (entity_id,),
         )
         cur.execute("DELETE FROM facts WHERE entity_id=?", (entity_id,))
-        for fact_text, source, fact_date in _facts_from_body(body):
+        for fact_text, source, fact_date, status in _facts_from_body(body):
             cur.execute(
-                "INSERT INTO facts(entity_id, text, source, fact_date) VALUES (?,?,?,?)",
-                (entity_id, fact_text, source, fact_date),
+                "INSERT INTO facts(entity_id, text, source, fact_date, status) "
+                "VALUES (?,?,?,?,?)",
+                (entity_id, fact_text, source, fact_date, status),
             )
             fid = cur.lastrowid
-            cur.execute(
-                "INSERT INTO fts_facts(rowid, text, source) VALUES (?,?,?)",
-                (fid, fact_text, source or ""),
-            )
+            # Superseded facts stay in the `facts` table (audit trail)
+            # but do NOT enter the FTS index — keeps `brain_recall` /
+            # `db.search` returning only current facts.
+            if status != "superseded":
+                cur.execute(
+                    "INSERT INTO fts_facts(rowid, text, source) VALUES (?,?,?)",
+                    (fid, fact_text, source or ""),
+                )
 
         # fts_entity is contentless (content=''), so a bare
         # `DELETE FROM ... WHERE rowid=?` raises "cannot DELETE from
@@ -420,6 +451,17 @@ def rebuild() -> dict:
                     continue
                 upsert_entity_from_file(f)
                 counts["entities"] += 1
+        # Backfill supersession: after all entity files have been
+        # upserted, collapse contradictions (note > session, newer
+        # wins) so a fresh rebuild brings stale vaults into the new
+        # model in one pass. Import lazily to avoid a circular import
+        # during package load.
+        try:
+            from brain.supersede import recompute_all as _recompute_all
+            sup = _recompute_all()
+            counts["superseded"] = sup.get("facts_superseded", 0)
+        except Exception as _e:
+            counts["superseded"] = 0
         with connect() as conn:
             counts["facts"] = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
     except BaseException:

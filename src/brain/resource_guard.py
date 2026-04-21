@@ -1,11 +1,11 @@
 """resource_guard — adaptive clearance level for background brain jobs.
 
-Clearance levels:
-  0  always              harvest, WatchPaths
-  1  CPU < 60%           note_extract, index rebuild (pure Python, no LLM)
-  2  CPU < 40% + idle 60s    LLM extract, reconcile
-  3  CPU < 20% + idle 180s + AC  autoresearch, dedupe
-  4  CPU < 15% + idle 300s + AC + screen idle  backfill, revalidate
+Clearance levels (all listed conditions must hold):
+  0  always                                              harvest, WatchPaths
+  1  CPU < 60% + MEM < 90%                               note_extract, index rebuild
+  2  CPU < 40% + MEM < 80% + idle 60s                    LLM extract, reconcile
+  3  CPU < 20% + MEM < 70% + idle 180s + AC              dedupe
+  4  CPU < 15% + MEM < 60% + idle 300s + AC + screen idle  backfill, revalidate
 
 CLI usage:
   python -m brain.resource_guard            # prints level (0-4)
@@ -32,6 +32,11 @@ _CPU_L2 = float(os.environ.get("BRAIN_RG_CPU_L2", "40"))
 _CPU_L3 = float(os.environ.get("BRAIN_RG_CPU_L3", "20"))
 _CPU_L4 = float(os.environ.get("BRAIN_RG_CPU_L4", "15"))
 
+_MEM_L1 = float(os.environ.get("BRAIN_RG_MEM_L1", "90"))   # % used
+_MEM_L2 = float(os.environ.get("BRAIN_RG_MEM_L2", "80"))
+_MEM_L3 = float(os.environ.get("BRAIN_RG_MEM_L3", "70"))
+_MEM_L4 = float(os.environ.get("BRAIN_RG_MEM_L4", "60"))
+
 _IDLE_L2 = float(os.environ.get("BRAIN_RG_IDLE_L2", "60"))    # seconds
 _IDLE_L3 = float(os.environ.get("BRAIN_RG_IDLE_L3", "180"))
 _IDLE_L4 = float(os.environ.get("BRAIN_RG_IDLE_L4", "300"))
@@ -46,6 +51,11 @@ _SCREEN_L4 = float(os.environ.get("BRAIN_RG_SCREEN_L4", "120"))  # seconds
 def _cpu_percent() -> float:
     """1-second CPU sample across all cores."""
     return psutil.cpu_percent(interval=1)
+
+
+def _memory_percent() -> float:
+    """Current system memory usage as a percentage (0-100)."""
+    return psutil.virtual_memory().percent
 
 
 def _on_ac_power() -> bool:
@@ -107,6 +117,7 @@ def _session_idle_seconds() -> float:
 def clearance_level(
     *,
     cpu: float | None = None,
+    mem: float | None = None,
     session_idle: float | None = None,
     on_ac: bool | None = None,
     screen_idle: float | None = None,
@@ -117,6 +128,8 @@ def clearance_level(
     """
     if cpu is None:
         cpu = _cpu_percent()
+    if mem is None:
+        mem = _memory_percent()
     if session_idle is None:
         session_idle = _session_idle_seconds()
     if on_ac is None:
@@ -125,13 +138,16 @@ def clearance_level(
         screen_idle = _screen_idle_seconds()
 
     # Levels are additive — each level requires all lower conditions plus more.
-    if cpu < _CPU_L4 and session_idle >= _IDLE_L4 and on_ac and screen_idle >= _SCREEN_L4:
+    if (
+        cpu < _CPU_L4 and mem < _MEM_L4
+        and session_idle >= _IDLE_L4 and on_ac and screen_idle >= _SCREEN_L4
+    ):
         return 4
-    if cpu < _CPU_L3 and session_idle >= _IDLE_L3 and on_ac:
+    if cpu < _CPU_L3 and mem < _MEM_L3 and session_idle >= _IDLE_L3 and on_ac:
         return 3
-    if cpu < _CPU_L2 and session_idle >= _IDLE_L2:
+    if cpu < _CPU_L2 and mem < _MEM_L2 and session_idle >= _IDLE_L2:
         return 2
-    if cpu < _CPU_L1:
+    if cpu < _CPU_L1 and mem < _MEM_L1:
         return 1
     return 0
 
@@ -158,16 +174,17 @@ def main() -> None:
     args = parser.parse_args()
 
     cpu = _cpu_percent()
+    mem = _memory_percent()
     session_idle = _session_idle_seconds()
     on_ac = _on_ac_power()
     screen_idle = _screen_idle_seconds()
     level = clearance_level(
-        cpu=cpu, session_idle=session_idle, on_ac=on_ac, screen_idle=screen_idle
+        cpu=cpu, mem=mem, session_idle=session_idle, on_ac=on_ac, screen_idle=screen_idle
     )
 
     if args.verbose:
         print(
-            f"level={level}  cpu={cpu:.1f}%  session_idle={session_idle:.0f}s"
+            f"level={level}  cpu={cpu:.1f}%  mem={mem:.1f}%  session_idle={session_idle:.0f}s"
             f"  ac={on_ac}  screen_idle={screen_idle:.0f}s"
         )
     else:

@@ -120,6 +120,7 @@ def build() -> dict:
                    e.type, e.name, e.slug
             FROM facts f
             JOIN entities e ON e.id = f.entity_id
+            WHERE f.status IS NULL OR f.status != 'superseded'
             """
         ).fetchall()
 
@@ -581,6 +582,12 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
             return 1.1
         return 1.0
 
+    # Extracted entities ARE the canonical record of a topic (multi-source
+    # dedup'd summary); user notes are raw input. On a concept query both
+    # branches hit, but the entity should outrank the tangential note.
+    def _primary_entity_boost(hit: dict) -> float:
+        return 1.5 if hit.get("kind") == "fact" else 1.0
+
     # Recency weighting — addresses Karpathy's "memory distraction" complaint
     # (https://x.com/karpathy/status/2036836816654147718): irrelevant ancient
     # context keeps surfacing as if it's a current interest. We give recent
@@ -627,7 +634,7 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
     for k_ in pool:
         hit = pool[k_]
         path = hit.get("path", "")
-        adj = scores[k_] * _path_penalty(path) * _density_boost(hit) * _recency_factor(hit)
+        adj = scores[k_] * _path_penalty(path) * _density_boost(hit) * _recency_factor(hit) * _primary_entity_boost(hit)
         fused.append({**hit, "rrf": adj})
     fused.sort(key=lambda x: -x["rrf"])
     return fused[:k]

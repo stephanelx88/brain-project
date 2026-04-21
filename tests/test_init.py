@@ -215,6 +215,63 @@ class TestEntityDirs:
             assert (isolated_brain / "entities" / t["name"]).is_dir()
 
 
+class TestPurgeOldVault:
+    def test_purge_removes_cache_files_only(self, tmp_path):
+        old = tmp_path / "old-vault"
+        old.mkdir()
+        # Brain-managed artifacts — should be deleted.
+        (old / ".brain.db").write_text("cache")
+        (old / ".dedupe.ledger.json").write_text("{}")
+        (old / ".vec").mkdir()
+        (old / ".vec" / "facts.json").write_text("[]")
+        (old / ".brain.rdf").mkdir()
+        (old / ".brain.rdf" / "store.db").write_text("rdf")
+        # User content — must survive.
+        (old / "entities").mkdir()
+        (old / "entities" / "note.md").write_text("- fact")
+        (old / "identity").mkdir()
+        (old / "identity" / "who-i-am.md").write_text("me")
+        (old / "my-note.md").write_text("# personal")
+        (old / ".git").mkdir()
+        (old / ".git" / "HEAD").write_text("ref")
+
+        removed = init_mod._purge_old_vault_artifacts(old)
+
+        assert set(removed) >= {".brain.db", ".dedupe.ledger.json", ".vec/", ".brain.rdf/"}
+        # User content intact
+        assert (old / "entities" / "note.md").exists()
+        assert (old / "identity" / "who-i-am.md").exists()
+        assert (old / "my-note.md").exists()
+        assert (old / ".git" / "HEAD").exists()
+        # Caches gone
+        assert not (old / ".brain.db").exists()
+        assert not (old / ".vec").exists()
+        assert not (old / ".brain.rdf").exists()
+
+    def test_maybe_purge_skips_when_old_equals_new(self, tmp_path, monkeypatch):
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        (vault / ".brain.db").write_text("cache")
+        monkeypatch.setenv("BRAIN_DIR", str(vault))
+
+        # Same vault — should NOT purge.
+        init_mod._maybe_purge_old_vault(vault, q=None, assume_yes=True)
+        assert (vault / ".brain.db").exists()
+
+    def test_maybe_purge_silent_when_old_vault_has_no_artifacts(self, tmp_path, monkeypatch):
+        old = tmp_path / "old"
+        new = tmp_path / "new"
+        old.mkdir()
+        new.mkdir()
+        # Old vault has only user content, no cache files.
+        (old / "note.md").write_text("# note")
+        monkeypatch.setenv("BRAIN_DIR", str(old))
+
+        init_mod._maybe_purge_old_vault(new, q=None, assume_yes=True)
+        # User content untouched
+        assert (old / "note.md").exists()
+
+
 class TestPersistBrainDir:
     def test_appends_export_to_shell_rc(self, isolated_brain):
         rc = init_mod._persist_brain_dir_to_shell_rc(isolated_brain)

@@ -209,9 +209,11 @@ def test_note_delete_strikethroughs_provenance_linked_facts(tmp_vault):
     assert "~~Son likes bun rieu~~" not in body
 
 
-def test_strikethrough_excludes_fact_from_db_facts_view(tmp_vault):
-    """Once strikethroughed, the fact must drop out of `_facts_from_body`
-    (so FTS recall stops returning it)."""
+def test_strikethrough_marks_fact_as_superseded(tmp_vault):
+    """Strikethrough bullets are preserved in `_facts_from_body` with
+    status='superseded' so the audit trail stays intact. The FTS
+    write path in `upsert_entity_from_file` is what drops them from
+    BM25 recall — verified separately."""
     from brain import db
 
     body = (
@@ -220,8 +222,13 @@ def test_strikethrough_excludes_fact_from_db_facts_view(tmp_vault):
         "- Son likes bun rieu (source: s, 2026-04-19)"
     )
     facts = list(db._facts_from_body(body))
-    assert len(facts) == 1
-    assert facts[0][0] == "Son likes bun rieu"
+    assert len(facts) == 2
+    superseded = [f for f in facts if f[3] == "superseded"]
+    live = [f for f in facts if f[3] is None]
+    assert len(superseded) == 1
+    assert len(live) == 1
+    assert "Long Xuyen" in superseded[0][0]
+    assert live[0][0] == "Son likes bun rieu"
 
 
 def test_invalidation_is_idempotent(tmp_vault):

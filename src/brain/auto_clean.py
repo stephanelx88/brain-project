@@ -34,6 +34,24 @@ _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _NAME_FM_RE = re.compile(r"^name:\s*(.+)", re.MULTILINE)
 
 
+def _frontmatter_field(text: str, field: str) -> str | None:
+    """Extract a single scalar field value from YAML frontmatter. Returns
+    the raw string (trimmed, unquoted) or None if not present."""
+    m = _FRONTMATTER_RE.match(text)
+    if not m:
+        return None
+    fm = m.group(1)
+    pat = re.compile(rf"^{re.escape(field)}\s*:\s*(.+?)\s*$", re.MULTILINE)
+    fm_match = pat.search(fm)
+    if not fm_match:
+        return None
+    value = fm_match.group(1).strip()
+    if (value.startswith('"') and value.endswith('"')) or \
+       (value.startswith("'") and value.endswith("'")):
+        value = value[1:-1]
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Rule loading
 # ---------------------------------------------------------------------------
@@ -119,6 +137,15 @@ def _matches_rule(path: Path, text: str, rule: dict,
         name = _entity_name(text)
         if not any(re.search(p, name) for p in patterns):
             return False
+
+    frontmatter = match.get("frontmatter")
+    if isinstance(frontmatter, dict):
+        for field, expected in frontmatter.items():
+            actual = _frontmatter_field(text, field)
+            if actual is None:
+                return False
+            if not re.search(str(expected), actual):
+                return False
 
     return True
 
