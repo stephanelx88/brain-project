@@ -44,6 +44,16 @@ LEDGER = config.BRAIN_DIR / "recall-ledger.jsonl"
 import os as _os
 MISS_THRESHOLD = float(_os.environ.get("BRAIN_MISS_THRESHOLD", "0.45"))
 
+#  Live-mode (real `brain_recall` calls) measures hybrid RRF, NOT raw
+#  cosine, because that's the path real users hit. RRF scores live on a
+#  different scale (~0.07 = strong hit, ~0.04 = weak). The default
+#  matches `BRAIN_RECALL_WEAK_RRF` in mcp_server (0.035) but raised
+#  slightly so a "miss" means "even weaker than the weak-match guard
+#  itself flagged as low-confidence". Without this split, every
+#  ledger-driven miss-rate report inflates by ~50% because the cosine
+#  threshold (0.45) was being applied to RRF-driven retrieval.
+MISS_RRF_THRESHOLD = float(_os.environ.get("BRAIN_MISS_RRF_THRESHOLD", "0.05"))
+
 
 DEFAULT_EVAL_QUERIES = [
     # brain self-knowledge
@@ -148,7 +158,14 @@ class CoverageReport:
 
 
 def _top_score_for(query: str, k: int = 3) -> tuple[float, str]:
-    """Return (max_score, source_label). max over top-k facts ∪ top-k notes."""
+    """Return (max_cosine_score, source_label). Used by the **eval-set**
+    coverage path: each eval query is independent and scored the same way
+    (raw semantic cosine over facts ∪ notes) so trajectory deltas across
+    runs stay comparable.
+
+    Live-mode scoring uses `_hybrid_top_score` instead, because that's
+    the path real `brain_recall` calls take.
+    """
     fact_hits = semantic.search_facts(query, k=k) or []
     note_hits = semantic.search_notes(query, k=k) or []
     best = -1.0
@@ -164,6 +181,37 @@ def _top_score_for(query: str, k: int = 3) -> tuple[float, str]:
             best = s
             label = f"note:{h.get('path')}"
     return best, label
+
+
+def _hybrid_top_score(query: str, k: int = 3) -> tuple[float, float, str]:
+    """Return (top_rrf, top_cosine, label) — live-mode scorer.
+
+    Mirrors the `hybrid_search` path that `brain_recall` actually serves
+    so the live ledger reflects retrieval quality as the user experiences
+    it. Returns BOTH metrics so old consumers reading `top_score`
+    (cosine) keep working, while new consumers can switch to `top_rrf`
+    for a faithful miss-detection signal.
+
+    `top_cosine` is sourced independently from `_top_score_for` (raw
+    semantic) rather than from the hybrid hit's `score` field — that
+    field can be BM25 (often negative) or absent depending on which
+    branch won the fusion, which would corrupt the cosine column in
+    the ledger. The two embeddings calls share the same model, so the
+    cost is one extra ~5 ms cosine pass; the win is a ledger where
+    `top_score` always means "best raw semantic similarity".
+    """
+    hits = semantic.hybrid_search(query, k=k) or []
+    if not hits:
+        return -1.0, -1.0, "(no hit)"
+    top = hits[0]
+    rrf = float(top.get("rrf", 0.0))
+    cos_best, _ = _top_score_for(query, k=k)
+    cosine = max(0.0, cos_best)
+    if top.get("kind") == "note":
+        label = f"note:{top.get('path') or top.get('title','')}"
+    else:
+        label = f"fact:{top.get('type')}/{top.get('name')}"
+    return rrf, cosine, label
 
 
 def score_coverage(
@@ -229,7 +277,12 @@ def score_coverage(
     return report
 
 
-def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
+def log_live_recall(
+    query: str,
+    *,
+    threshold: float = MISS_THRESHOLD,  # back-compat: cosine threshold
+    rrf_threshold: float = MISS_RRF_THRESHOLD,
+) -> None:
     """Append one `kind: "live"` row to the recall ledger.
 
     Called from the MCP `brain_recall` handler on every real query Son
@@ -237,11 +290,19 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
     `live_coverage()`, which gives rolling-window coverage computed
     from actual usage (as opposed to the synthetic eval set).
 
-    When the query misses (score < threshold), also mirror the event
-    into `failures.jsonl` with source=`recall_miss`, so the failure
-    ledger can aggregate repeated-miss topics (see `learning_gaps`).
-    This closes the loop between what son asks and what the brain
-    surfaces as "you keep missing X — want to note something?".
+    Miss decision is made on **hybrid RRF** (the same retrieval path
+    `brain_recall` serves), not raw cosine — otherwise good hybrid hits
+    get flagged as misses just because their constituent semantic
+    cosine landed near the cosine threshold. Both `top_rrf` (new) and
+    `top_score` (cosine, kept for back-compat) are written to every row
+    so historical comparisons keep parsing.
+
+    When the query misses (top_rrf < rrf_threshold), also mirror the
+    event into `failures.jsonl` with source=`recall_miss`, so the
+    failure ledger can aggregate repeated-miss topics (see
+    `learning_gaps`). This closes the loop between what son asks and
+    what the brain surfaces as "you keep missing X — want to note
+    something?".
 
     Failures are silenced — a logging hiccup must never break the
     user-facing recall path.
@@ -250,10 +311,10 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
     if len(q) < 2:
         return  # don't pollute the ledger with empty / single-char pings
     try:
-        score, label = _top_score_for(q)
+        top_rrf, cosine, label = _hybrid_top_score(q)
     except Exception:
         return
-    is_miss = score < threshold
+    is_miss = top_rrf < rrf_threshold
     try:
         LEDGER.parent.mkdir(parents=True, exist_ok=True)
         with LEDGER.open("a") as f:
@@ -261,10 +322,12 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
                 "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "kind": "live",
                 "query": query[:200],
-                "top_score": round(score, 4),
+                "top_score": round(cosine, 4),       # back-compat (cosine)
+                "top_rrf": round(top_rrf, 4),        # new: drives miss flag
                 "top_hit": label,
                 "miss": is_miss,
-                "threshold": threshold,
+                "threshold": threshold,              # cosine, historical
+                "rrf_threshold": rrf_threshold,
             }) + "\n")
     except Exception:
         pass
@@ -275,8 +338,16 @@ def log_live_recall(query: str, *, threshold: float = MISS_THRESHOLD) -> None:
                 source="recall_miss",
                 tool="brain_recall",
                 query=query[:200],
-                result_digest=f"top_score={round(score, 4)} top_hit={label}",
-                extra={"top_score": round(score, 4), "threshold": threshold},
+                result_digest=(
+                    f"top_rrf={round(top_rrf, 4)} "
+                    f"top_score={round(cosine, 4)} top_hit={label}"
+                ),
+                extra={
+                    "top_rrf": round(top_rrf, 4),
+                    "rrf_threshold": rrf_threshold,
+                    "top_score": round(cosine, 4),
+                    "threshold": threshold,
+                },
             )
         except Exception:
             pass
@@ -294,12 +365,14 @@ def live_coverage(days: int = 7) -> dict:
     hits = 0
     misses = 0
     score_sum = 0.0
+    rrf_sum = 0.0
+    rrf_rows = 0  # count rows that carry the new top_rrf field
     queries: set[str] = set()
     if not LEDGER.exists():
         return {
             "available": False, "days": days, "queries": 0,
             "total_calls": 0, "misses": 0, "hits": 0,
-            "miss_rate": 0.0, "avg_top": 0.0,
+            "miss_rate": 0.0, "avg_top": 0.0, "avg_rrf": 0.0,
         }
     for raw in LEDGER.read_text(errors="replace").splitlines():
         raw = raw.strip()
@@ -321,6 +394,9 @@ def live_coverage(days: int = 7) -> dict:
         if t < cutoff:
             continue
         score_sum += float(row.get("top_score", 0.0))
+        if "top_rrf" in row:
+            rrf_sum += float(row.get("top_rrf", 0.0))
+            rrf_rows += 1
         if row.get("miss"):
             misses += 1
         else:
@@ -335,7 +411,12 @@ def live_coverage(days: int = 7) -> dict:
         "misses": misses,
         "hits": hits,
         "miss_rate": (misses / total) if total else 0.0,
+        # `avg_top` stays cosine for back-compat with old dashboards.
+        # `avg_rrf` is the live-mode trajectory signal — the average
+        # hybrid RRF score of real queries this week.
         "avg_top": (score_sum / total) if total else 0.0,
+        "avg_rrf": (rrf_sum / rrf_rows) if rrf_rows else 0.0,
+        "rrf_rows": rrf_rows,
     }
 
 
