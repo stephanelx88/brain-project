@@ -5,7 +5,7 @@
 # Two guards against the dual-instance Mac freeze (incident 2026-04-11):
 #   1. flock singleton — never overlap two launchd runs
 #   2. process-level check — skip LLM stages only when another `claude --print`
-#      is *actually* running. Files in ~/.brain/raw/ are already proof of an
+#      is *actually* running. Files in <vault>/raw/ are already proof of an
 #      idle session (harvest gates on 60s idle), so we don't need an mtime
 #      guard — the only real risk is two `claude --print` racing for the GPU.
 
@@ -13,12 +13,15 @@ set -euo pipefail
 
 export PATH="{{HOME}}/.local/bin:{{HOME}}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export PYTHONPATH="{{PROJECT_DIR}}/src${PYTHONPATH:+:$PYTHONPATH}"
+# Tell brain.config which vault to operate on (launchd doesn't read the
+# user's shell rc, so without this it would default to ~/.brain).
+export BRAIN_DIR="{{BRAIN_DIR}}"
 PYTHON="{{PYTHON}}"
 
-LOG_DIR="{{HOME}}/.brain/logs"
+LOG_DIR="{{BRAIN_DIR}}/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/auto-extract.log"
-LOCKDIR="{{HOME}}/.brain/.extract.lock.d"
+LOCKDIR="{{BRAIN_DIR}}/.extract.lock.d"
 
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   if [[ -f "$LOCKDIR/pid" ]] && kill -0 "$(cat "$LOCKDIR/pid" 2>/dev/null)" 2>/dev/null; then
@@ -35,7 +38,7 @@ trap 'rm -rf "$LOCKDIR"' EXIT
 # is already running (the actual dual-instance freeze risk). The old mtime
 # heuristic — skip while *any* Claude/Cursor transcript was written in the
 # last 180s — was too coarse: with Cursor open all day the gate never opens
-# and `~/.brain/raw/` accumulates indefinitely. Files in raw/ are already
+# and `<vault>/raw/` accumulates indefinitely. Files in raw/ are already
 # proof of an idle session (harvest gates on 60s idle per source), so we
 # don't need to re-check session activity here. Pure-Python stages always
 # run — they don't spawn `claude --print` so they can't trigger the freeze.
@@ -54,6 +57,12 @@ fi
   # LLM-calling stages — skip while a Claude session is actively writing.
   if (( ACTIVE_SESSION == 0 )); then
     "$PYTHON" -m brain.auto_extract           || echo "auto_extract exited $?"
+    # Note extraction: turn user-typed vault notes into entity facts with
+    # provenance, so deleting a note auto-retracts the fact (see
+    # brain/note_extract.py + brain/ingest_notes.invalidate_facts_for_note).
+    # Capped at MAX_NOTES_PER_RUN=30 inside the module so this never
+    # dominates the launchd window.
+    "$PYTHON" -m brain.note_extract           || echo "note_extract exited $?"
     "$PYTHON" -m brain.reconcile              || echo "reconcile exited $?"
     # Semantic dedupe — bounded LLM calls per run, ledger-skipped after.
     # Catches the same-idea-different-wording dupes that brain.reconcile
@@ -61,7 +70,7 @@ fi
     # below the auto bar become proposal files in timeline/ for review.
     "$PYTHON" -m brain.dedupe --apply --quiet || echo "dedupe exited $?"
   else
-    echo "skip auto_extract+reconcile+dedupe: another claude --print is running"
+    echo "skip auto_extract+note_extract+reconcile+dedupe: another claude --print is running"
   fi
   echo ""
 } >> "$LOG" 2>&1

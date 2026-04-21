@@ -126,11 +126,30 @@ _SOURCE_RE = re.compile(r"\(source:\s*([^,)]+?)(?:,\s*([\d-]+))?\s*\)")
 _FRONTMATTER_RE = re.compile(r"^---\n(.*?)\n---\n", re.DOTALL)
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Idempotent column adds for vaults created before a column existed.
+
+    SQLite's `ADD COLUMN IF NOT EXISTS` only landed in 3.35; we read
+    `PRAGMA table_info` and ALTER manually to support older systems.
+    Add new migrations here — one block per new column. Cheap enough
+    to run on every connect.
+    """
+    def cols(table: str) -> set[str]:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return {r[1] for r in rows}
+
+    # 2026-04-21 — note→fact provenance: track which note sha we last
+    # extracted so re-runs only LLM-call on changed notes.
+    if "extracted_sha" not in cols("notes"):
+        conn.execute("ALTER TABLE notes ADD COLUMN extracted_sha TEXT")
+
+
 @contextmanager
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     try:
         yield conn
         conn.commit()
@@ -431,6 +450,60 @@ def list_note_ledger() -> dict[str, tuple[float, str]]:
     with connect() as conn:
         rows = conn.execute("SELECT path, mtime, sha FROM notes").fetchall()
     return {p: (m, s) for p, m, s in rows}
+
+
+def pending_note_extractions(
+    limit: int = 50,
+    min_body_chars: int = 0,
+    exclude_prefixes: tuple[str, ...] = (),
+    exclude_paths: tuple[str, ...] = (),
+) -> list[dict]:
+    """Notes whose current sha hasn't been processed by note_extract yet.
+
+    Returned dicts carry everything the extractor needs (path, title,
+    body, sha) so the caller doesn't re-read the file. Ordered by
+    mtime DESC so newly-typed notes get priority over years-old ones
+    when the queue is long.
+
+    `exclude_prefixes` / `exclude_paths` filter out machine-managed
+    notes that happen to live in the FTS index but shouldn't be sent
+    to the extractor (playground/, timeline/, log.md, etc.). Filtered
+    in SQL so we never read those bodies into Python.
+    """
+    where = ["(extracted_sha IS NULL OR extracted_sha != sha)"]
+    params: list = []
+    for prefix in exclude_prefixes:
+        where.append("path NOT LIKE ?")
+        params.append(prefix.rstrip("/") + "/%")
+    for p in exclude_paths:
+        where.append("path != ?")
+        params.append(p)
+    sql = (
+        "SELECT path, title, body, sha, mtime, extracted_sha FROM notes "
+        f"WHERE {' AND '.join(where)} "
+        "ORDER BY mtime DESC LIMIT ?"
+    )
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    out: list[dict] = []
+    for path, title, body, sha, mtime, prev_sha in rows:
+        if min_body_chars and len(body or "") < min_body_chars:
+            continue
+        out.append({
+            "path": path, "title": title, "body": body or "",
+            "sha": sha, "mtime": mtime,
+            "extracted_sha": prev_sha,  # None = first extraction; non-None = edit
+        })
+    return out
+
+
+def mark_note_extracted(rel_path: str, sha: str) -> None:
+    """Record that we've processed `rel_path` at this `sha`."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE notes SET extracted_sha=? WHERE path=?", (sha, rel_path)
+        )
 
 
 def search_notes(query: str, k: int = 10) -> list[dict]:

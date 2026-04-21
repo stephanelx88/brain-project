@@ -84,6 +84,7 @@ def _strikethrough_fact_in_entity(
     target_hashes: set[str],
     note_rel: str,
     today: str,
+    reason: str = "deleted",
 ) -> int:
     """Wrap matching fact lines in `~~…~~` and append an invalidation tag.
 
@@ -93,6 +94,11 @@ def _strikethrough_fact_in_entity(
 
     Lines already strikethroughed are left alone (idempotent — repeated
     note-delete events on the same provenance won't double-mark).
+
+    `reason` flavours the audit tag — "deleted" when the note vanished
+    from disk, "edited" when the note still exists but the user
+    rewrote it (note_extract treats the previous version's facts as
+    retracted before applying the new extraction).
     """
     try:
         text = entity_path.read_text(errors="replace")
@@ -126,12 +132,12 @@ def _strikethrough_fact_in_entity(
             tail = body_text[m.start():]
             new_body = (
                 f"~~{head}~~ {tail} "
-                f"[invalidated {today}: source note `{note_rel}` deleted]"
+                f"[invalidated {today}: source note `{note_rel}` {reason}]"
             )
         else:
             new_body = (
                 f"~~{body_text.rstrip()}~~ "
-                f"[invalidated {today}: source note `{note_rel}` deleted]"
+                f"[invalidated {today}: source note `{note_rel}` {reason}]"
             )
         new_lines.append(f"{indent}- {new_body}")
         changed += 1
@@ -141,21 +147,23 @@ def _strikethrough_fact_in_entity(
     return changed
 
 
-def invalidate_facts_for_note(note_rel: str, verbose: bool = False) -> dict:
+def invalidate_facts_for_note(
+    note_rel: str, verbose: bool = False, reason: str = "deleted"
+) -> dict:
     """Strikethrough every fact whose provenance points at `note_rel`.
 
-    Called after a note is detected as gone from disk. Walks the
-    `fact_provenance` table, edits the affected entity files, then
-    drops the provenance rows so a subsequent deletion of a different
-    note doesn't re-process them. Re-upserts each touched entity to
-    refresh the FTS index (struck-through facts are excluded by
-    `db._facts_from_body`).
+    Called after a note is detected as gone from disk (`reason="deleted"`)
+    or before re-extracting an edited note (`reason="edited"`). Walks
+    the `fact_provenance` table, edits the affected entity files, then
+    drops the provenance rows so subsequent invalidations won't re-mark
+    the same lines. Re-upserts each touched entity to refresh FTS
+    (strikethroughed facts are excluded by `db._facts_from_body`).
     """
     from datetime import datetime, timezone
 
     rows = db.facts_invalidated_by_note(note_rel)
     if not rows:
-        return {"facts_invalidated": 0, "entities_touched": 0}
+        return {"facts_invalidated": 0, "entities_touched": 0, "entity_paths": []}
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     by_entity: dict[str, set[str]] = {}
@@ -164,14 +172,16 @@ def invalidate_facts_for_note(note_rel: str, verbose: bool = False) -> dict:
 
     facts_changed = 0
     entities_touched = 0
+    touched_entity_paths: list[str] = []
     for entity_rel, hashes in by_entity.items():
         epath = config.BRAIN_DIR / entity_rel
         if not epath.exists():
             continue
-        n = _strikethrough_fact_in_entity(epath, hashes, note_rel, today)
+        n = _strikethrough_fact_in_entity(epath, hashes, note_rel, today, reason=reason)
         if n > 0:
             facts_changed += n
             entities_touched += 1
+            touched_entity_paths.append(entity_rel)
             try:
                 db.upsert_entity_from_file(epath)  # refresh FTS index
             except Exception as exc:
@@ -184,6 +194,7 @@ def invalidate_facts_for_note(note_rel: str, verbose: bool = False) -> dict:
     return {
         "facts_invalidated": facts_changed,
         "entities_touched": entities_touched,
+        "entity_paths": touched_entity_paths,
     }
 
 
