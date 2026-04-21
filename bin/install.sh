@@ -37,7 +37,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 HOME_DIR="$HOME"
 USERNAME="${USER:-$(whoami)}"
-BRAIN_DIR="$HOME_DIR/.brain"
+# BRAIN_DIR is the user's vault. `brain init` exports it before invoking
+# this script; falls back to ~/.brain for direct/legacy invocations.
+# Exported so every Python subprocess we spawn (db rebuild, semantic
+# ensure, brain.mcp_server when test-launched) reads the right vault
+# via brain.config._resolve_brain_dir().
+export BRAIN_DIR="${BRAIN_DIR:-$HOME_DIR/.brain}"
 TODAY="$(date +%Y-%m-%d)"
 
 # ──────────────────────────────────────────────────────────────────────
@@ -138,22 +143,36 @@ echo "      ✓ vault ready"
 
 # ──────────────────────────────────────────────────────────────────────
 # 3. Render templates with sed substitution
+#
+# Two-pass render (see bin/_render.sh for the impl — sourced so tests
+# can exercise the same functions install does):
+#   Pass 1: expand {{include: <path-relative-to-templates/>}} directives
+#           (single pass, no nesting — partials are pure prose today).
+#           See templates/_shared/rules/README.md for the "why".
+#   Pass 2: the original token substitution.
 # ──────────────────────────────────────────────────────────────────────
+TEMPLATES_DIR="$PROJECT_DIR/templates"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/_render.sh"
+
 render() {
   local src="$1" dst="$2"
-  sed -e "s|{{HOME}}|$HOME_DIR|g" \
-      -e "s|{{USERNAME}}|$USERNAME|g" \
-      -e "s|{{PROJECT_DIR}}|$PROJECT_DIR|g" \
-      -e "s|{{PYTHON}}|$PYTHON|g" \
-      -e "s|{{TODAY}}|$TODAY|g" \
-      "$src" > "$dst"
+  render_template "$TEMPLATES_DIR" "$src" "$dst" \
+    "$HOME_DIR" "$USERNAME" "$PROJECT_DIR" "$PYTHON" "$BRAIN_DIR" "$TODAY"
 }
 
-echo "[3/8] render scripts + plist + CLAUDE.md"
+echo "[3/8] render scripts + plist + CLAUDE.md + session-start hooks"
 render "$PROJECT_DIR/templates/scripts/auto-extract.sh.tmpl" "$BRAIN_DIR/bin/auto-extract.sh"
 chmod +x "$BRAIN_DIR/bin/auto-extract.sh"
 render "$PROJECT_DIR/templates/scripts/autoresearch-tick.sh.tmpl" "$BRAIN_DIR/bin/autoresearch-tick.sh"
 chmod +x "$BRAIN_DIR/bin/autoresearch-tick.sh"
+
+# Cursor sessionStart hook script — invoked by ~/.cursor/hooks.json on
+# every new composer session. Mirrors what Claude's SessionStart hook
+# does (harvest + audit), so onboarding doesn't require any manual
+# settings.json / hooks.json editing on either side.
+render "$PROJECT_DIR/templates/cursor/hooks/session-start.sh.tmpl" "$BRAIN_DIR/bin/cursor-session-start.sh"
+chmod +x "$BRAIN_DIR/bin/cursor-session-start.sh"
 
 # Persist resolved paths so doctor.sh + future re-installs find them.
 cat > "$BRAIN_DIR/.brain.conf" <<EOF
@@ -221,24 +240,25 @@ PY
 # ──────────────────────────────────────────────────────────────────────
 # 5. Register MCP server with Claude Code + Cursor (both idempotent)
 # ──────────────────────────────────────────────────────────────────────
-echo "[5/8] register MCP server with Claude Code + Cursor"
+echo "[5/8] register MCP server + SessionStart hooks (Claude Code + Cursor)"
 if command -v claude >/dev/null 2>&1; then
   # `claude mcp add` errors if name exists — remove first to be idempotent.
   claude mcp remove brain -s user >/dev/null 2>&1 || true
   claude mcp add brain -s user \
     -e "PYTHONPATH=$PROJECT_DIR/src" \
+    -e "BRAIN_DIR=$BRAIN_DIR" \
     -- "$PYTHON" -m brain.mcp_server >/dev/null
-  echo "      ✓ Claude Code registered"
+  echo "      ✓ Claude Code registered (BRAIN_DIR=$BRAIN_DIR)"
 else
   echo "      - 'claude' CLI not found — Claude Code skipped."
 fi
 
 # Cursor has no MCP CLI; merge into ~/.cursor/mcp.json by hand using Python
 # (already a hard dep). Preserves any sibling servers, backs up first.
-"$PYTHON" - "$PYTHON" "$PROJECT_DIR" <<'PY'
+"$PYTHON" - "$PYTHON" "$PROJECT_DIR" "$BRAIN_DIR" <<'PY'
 import json, os, shutil, sys, time
 
-py, proj = sys.argv[1], sys.argv[2]
+py, proj, brain_dir = sys.argv[1], sys.argv[2], sys.argv[3]
 home = os.path.expanduser("~")
 cursor_dir = os.path.join(home, ".cursor")
 cfg = os.path.join(cursor_dir, "mcp.json")
@@ -263,14 +283,26 @@ servers["brain"] = {
     "transport": "stdio",
     "command": py,
     "args": ["-m", "brain.mcp_server"],
-    "env": {"PYTHONPATH": os.path.join(proj, "src")},
+    "env": {
+        "PYTHONPATH": os.path.join(proj, "src"),
+        "BRAIN_DIR": brain_dir,
+    },
 }
 
 with open(cfg, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
-print("      ✓ Cursor registered (~/.cursor/mcp.json)")
+print(f"      ✓ Cursor registered (~/.cursor/mcp.json, BRAIN_DIR={brain_dir})")
 PY
+
+# Render per-machine hook config files, then delegate the JSON merge
+# to brain.install_hooks (testable, used by uninstall.sh too). Quietly
+# skips Claude or Cursor if the corresponding app dir is missing.
+SETTINGS_RENDERED="$BRAIN_DIR/.claude-settings.brain.json"
+HOOKS_RENDERED="$BRAIN_DIR/.cursor-hooks.brain.json"
+render "$PROJECT_DIR/templates/claude/settings.json.tmpl" "$SETTINGS_RENDERED"
+render "$PROJECT_DIR/templates/cursor/hooks.json.tmpl"   "$HOOKS_RENDERED"
+"$PYTHON" -m brain.install_hooks install "$SETTINGS_RENDERED" "$HOOKS_RENDERED"
 
 # ──────────────────────────────────────────────────────────────────────
 # 6. Build the search index (so first query is instant)
@@ -328,10 +360,12 @@ if "$BRAIN_DIR/bin/doctor.sh"; then
   echo
   echo "── install complete ──────────────────────────────────"
   echo "  Restart Claude Code / Cursor to pick up the brain MCP tools."
+  echo "  SessionStart hooks are auto-wired in both — no manual config needed."
   echo
-  echo "  Cursor extra step (one-time): paste"
+  echo "  Cursor extra step (one-time, optional): paste"
   echo "    $BRAIN_DIR/cursor-user-rules.md"
-  echo "  into Cursor → Settings → Rules → User Rules."
+  echo "  into Cursor → Settings → Rules → User Rules so the agent prefers"
+  echo "  brain_recall over guessing. (Cursor still has no global rules file.)"
   echo
   echo "  Run anytime: $BRAIN_DIR/bin/doctor.sh"
   exit 0
