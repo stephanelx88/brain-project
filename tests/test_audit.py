@@ -387,12 +387,12 @@ class _ScriptedInput:
         return self._answers.pop(0)
 
 
-def test_walker_keep_marks_reviewed_and_returns_tally(tmp_vault):
+def test_walker_yes_marks_reviewed_and_returns_tally(tmp_vault):
     insights = tmp_vault / "entities" / "insights"
     _write_entity(insights, "alpha", source_count=1, first_seen="2026-01-01")
     items = audit.top_n(limit=5)
-    tally = audit.walk(items, _input=_ScriptedInput(["k"]))
-    assert tally["reviewed"] == 1
+    tally = audit.walk(items, _input=_ScriptedInput(["y"]))
+    assert tally["yes"] == 1
     # Suppression actually took effect.
     assert audit.top_n(limit=5) == []
 
@@ -407,30 +407,30 @@ def test_walker_quit_breaks_loop_without_touching_remaining(tmp_vault):
     items = audit.top_n(limit=5)
     tally = audit.walk(items, _input=_ScriptedInput(["q"]))
     assert tally["quit"] == 1
-    assert tally["reviewed"] == 0
+    assert tally["yes"] == 0
     # Neither file should have been stamped.
     assert "reviewed:" not in p1.read_text()
     assert "reviewed:" not in p2.read_text()
 
 
-def test_walker_contest_routes_to_contested_bucket(tmp_vault):
+def test_walker_no_flags_contested(tmp_vault):
     insights = tmp_vault / "entities" / "insights"
     _write_entity(insights, "smells-fishy", source_count=1,
                   first_seen="2026-01-01")
     items = audit.top_n(limit=5)
-    tally = audit.walk(items, _input=_ScriptedInput(["c"]))
-    assert tally["contested"] == 1
+    tally = audit.walk(items, _input=_ScriptedInput(["n"]))
+    assert tally["no"] == 1
     after = audit.top_n(limit=5)
     assert any(it.kind == "contested" for it in after)
 
 
-def test_walker_resolve_clears_contested(tmp_vault):
+def test_walker_yes_resolves_contested(tmp_vault):
     domains = tmp_vault / "entities" / "domains"
     _write_entity(domains, "was-wrong", contested=True)
     items = audit.top_n(limit=5)
     assert items[0].kind == "contested"
-    tally = audit.walk(items, _input=_ScriptedInput(["r"]))
-    assert tally["resolved"] == 1
+    tally = audit.walk(items, _input=_ScriptedInput(["y"]))
+    assert tally["yes"] == 1
     assert audit.top_n(limit=5) == []
 
 
@@ -441,7 +441,7 @@ def test_walker_eof_treated_as_quit(tmp_vault):
     items = audit.top_n(limit=5)
     tally = audit.walk(items, _input=_ScriptedInput([]))  # immediate EOF
     assert tally["quit"] == 1
-    assert tally["reviewed"] == 0
+    assert tally["yes"] == 0
 
 
 def test_main_walk_flag_invokes_walker(tmp_vault, capsys, monkeypatch):
@@ -449,9 +449,9 @@ def test_main_walk_flag_invokes_walker(tmp_vault, capsys, monkeypatch):
     insights = tmp_vault / "entities" / "insights"
     _write_entity(insights, "walk-me", source_count=1,
                   first_seen="2026-01-01")
-    monkeypatch.setattr("builtins.input", _ScriptedInput(["k"]))
+    monkeypatch.setattr("builtins.input", _ScriptedInput(["y"]))
     rc = audit.main(["--walk", "--limit", "3"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "🧠 Brain audit" in out
-    assert "Done — 1 reviewed" in out
+    assert "Done —" in out

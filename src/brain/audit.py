@@ -473,91 +473,60 @@ def walk(items: list[AuditItem], _input=None,
 
     `_input` is injectable so tests can drive the walker without TTY.
     """
-    tally = {"reviewed": 0, "contested": 0, "resolved": 0,
-             "skipped": 0, "quit": 0}
+    tally = {"yes": 0, "no": 0, "skipped": 0, "quit": 0}
     for i, it in enumerate(items, 1):
         print()
         print(f"[{i}/{len(items)}] {it.label}")
         if it.detail:
             print(f"        {it.detail}")
+        if it.path:
+            _print_head(it.path)
 
         if it.kind == "low_confidence" and it.path is not None:
-            choice = _ask(
-                "  (k)eep — mark reviewed  (c)ontest  (o)pen  (s)kip  (q)uit > ",
-                "kcosq", _input=_input,
-            )
-            if choice == "k":
+            # y = correct, keep it   n = wrong, flag contested
+            choice = _ask("  y/n/q  (y=correct, n=flag contested) > ", "ynq",
+                          _input=_input)
+            if choice == "y":
                 if mark_reviewed(it.path, today=_today):
-                    print(f"  ✓ stamped reviewed: {(_today or date.today()).isoformat()}")
-                    tally["reviewed"] += 1
-                else:
-                    print("  · already reviewed today (no change)")
-            elif choice == "c":
+                    print(f"  ✓ reviewed: {(_today or date.today()).isoformat()}")
+                tally["yes"] += 1
+            elif choice == "n":
                 if mark_contested(it.path):
-                    print("  ⚑ flagged status: contested")
-                    tally["contested"] += 1
-                else:
-                    print("  · already contested (no change)")
-            elif choice == "o":
-                _print_head(it.path)
-                # Re-ask the same item so `open` is a peek, not a decision.
-                # We do this by re-running the prompt loop on this index.
-                tally["skipped"] += 1  # provisional; will be corrected if
-                # the user then picks k/c on the re-ask. Cheap to over-count
-                # by one in the rare double-`o` case.
-                # Single-level re-ask (no recursion) — simpler than building
-                # a state machine for what is a peek-then-decide flow.
-                second = _ask(
-                    "  (k)eep  (c)ontest  (s)kip  (q)uit > ",
-                    "kcsq", _input=_input,
-                )
-                if second == "k" and mark_reviewed(it.path, today=_today):
-                    tally["reviewed"] += 1
-                    tally["skipped"] -= 1
-                    print("  ✓ stamped reviewed")
-                elif second == "c" and mark_contested(it.path):
-                    tally["contested"] += 1
-                    tally["skipped"] -= 1
-                    print("  ⚑ flagged contested")
-                elif second == "q":
-                    tally["skipped"] -= 1
-                    tally["quit"] += 1
-                    break
-            elif choice == "s":
-                tally["skipped"] += 1
-            elif choice == "q":
+                    print("  ⚑ flagged: contested")
+                tally["no"] += 1
+            else:
                 tally["quit"] += 1
                 break
 
         elif it.kind == "contested" and it.path is not None:
-            choice = _ask(
-                "  (r)esolve — clear flag  (o)pen  (s)kip  (q)uit > ",
-                "rosq", _input=_input,
-            )
-            if choice == "r":
+            # y = looks fine, clear the flag   n = skip
+            choice = _ask("  y/n/q  (y=resolve, n=skip) > ", "ynq",
+                          _input=_input)
+            if choice == "y":
                 if resolve_contested(it.path):
-                    print("  ✓ cleared status: contested")
-                    tally["resolved"] += 1
-                else:
-                    print("  · was not contested (no change)")
-            elif choice == "o":
-                _print_head(it.path)
-                tally["skipped"] += 1
-            elif choice == "s":
-                tally["skipped"] += 1
-            elif choice == "q":
+                    print("  ✓ cleared: contested")
+                tally["yes"] += 1
+            elif choice == "n":
+                tally["no"] += 1
+            else:
                 tally["quit"] += 1
                 break
 
         else:
-            # Dedupe items hold *two* paths and the apply path is non-trivial;
-            # rather than half-implement merge-from-walker, hand off cleanly.
+            # Dedupe — two paths; merge is non-trivial, hand off cleanly.
             print("  → run `python -m brain.reconcile --apply` to handle merges")
-            choice = _ask("  (s)kip  (q)uit > ", "sq", _input=_input)
-            if choice == "q":
+            choice = _ask("  y/n/q  (y=open reconcile, n=skip) > ", "ynq",
+                          _input=_input)
+            if choice == "y":
+                import subprocess
+                subprocess.run(["python", "-m", "brain.reconcile", "--apply"],
+                               check=False)
+                tally["yes"] += 1
+            elif choice == "n":
+                tally["skipped"] += 1
+            else:
                 tally["quit"] += 1
                 break
-            tally["skipped"] += 1
     return tally
 
 
