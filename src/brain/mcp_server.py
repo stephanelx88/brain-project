@@ -559,6 +559,70 @@ def brain_learning_gaps(
 
 
 @mcp.tool()
+def brain_retract_fact(
+    entity_type: str,
+    entity_name: str,
+    fact_text: str,
+) -> str:
+    """Retract (supersede) a specific fact from an entity.
+
+    Finds the first fact bullet in `entity_type/entity_name` whose text
+    contains `fact_text` (case-insensitive substring match), wraps it in
+    ~~strikethrough~~ so it stays visible as history, and removes it from
+    the FTS + semantic indexes so it stops surfacing in recall.
+
+    Use when the user says a brain fact is wrong and should be forgotten.
+    Returns JSON: {"retracted": "<exact fact text>"} on success, or
+    {"error": "..."} if the entity/fact is not found.
+
+    Example:
+        brain_retract_fact("people", "Son", "slippers are in the bedroom")
+    """
+    try:
+        from brain import retract as retract_mod
+        text = retract_mod.retract_fact(
+            entity_type, entity_name, fact_text, retracted_by="user-correction"
+        )
+        return json.dumps({"retracted": text}, ensure_ascii=False)
+    except (ValueError, RuntimeError) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def brain_correct_fact(
+    entity_type: str,
+    entity_name: str,
+    wrong_fact: str,
+    correct_fact: str,
+) -> str:
+    """Retract a wrong fact and immediately append the corrected one.
+
+    Combines brain_retract_fact + appending a new fact bullet in one
+    atomic step so the entity stays consistent. The new fact is sourced
+    as "user-correction" with today's date.
+
+    Returns JSON: {"retracted": "...", "appended": "..."} on success, or
+    {"error": "..."} if the entity/fact is not found.
+
+    Example:
+        brain_correct_fact(
+            "people", "Son",
+            wrong_fact="currently in Long Xuyên",
+            correct_fact="currently in Cần Thơ",
+        )
+    """
+    try:
+        from brain import retract as retract_mod
+        result = retract_mod.correct_fact(
+            entity_type, entity_name, wrong_fact, correct_fact,
+            source="user-correction",
+        )
+        return json.dumps(result, ensure_ascii=False)
+    except (ValueError, RuntimeError) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
 def brain_status() -> str:
     """Operational dashboard — is anything running in the background?
 
