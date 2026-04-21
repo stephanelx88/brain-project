@@ -27,6 +27,8 @@ Both Claude Code and Cursor get the same hook now (`brain install`
 wires Cursor's `sessionStart` event to the same harvest+audit pair),
 so no manual fallback call is needed in either tool.
 
+{{include: _shared/rules/learning_gaps.md}}
+
 {{include: _shared/rules/never.md}}
 - Never run `brain.auto_extract` from SessionStart hook — it calls Claude internally.
 

@@ -12,5 +12,6 @@
 | `brain_identity` | Who-I-am snapshot |
 | `brain_stats` | Counts |
 | `brain_audit` | Top-N items needing a human decision (contested / dedupe / low-conf) |
+| `brain_learning_gaps` | Queries the user repeatedly asks that keep missing — call at session-start to surface (never to auto-answer) |
 | `brain_live_sessions` | List Claude/Cursor sessions alive *right now* (bypasses extraction lag) |
 | `brain_live_tail` | Last N turns of a peer session (no LLM, no harvest) |
