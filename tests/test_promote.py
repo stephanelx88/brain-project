@@ -28,12 +28,22 @@ def vault(tmp_path, monkeypatch):
     brain = tmp_path / "brain"
     (brain / "playground" / "insights").mkdir(parents=True)
     (brain / "playground" / "hypotheses").mkdir(parents=True)
+    (brain / "playground" / "contradictions").mkdir(parents=True)
     (brain / "playground" / "articles").mkdir(parents=True)
     (brain / "entities" / "insights").mkdir(parents=True)
+    (brain / "entities" / "hypotheses").mkdir(parents=True)
+    (brain / "entities" / "contradictions").mkdir(parents=True)
     (brain / "timeline").mkdir()
     monkeypatch.setattr(config, "BRAIN_DIR", brain)
     monkeypatch.setattr(config, "ENTITIES_DIR", brain / "entities")
     monkeypatch.setattr(config, "TIMELINE_DIR", brain / "timeline")
+    # ENTITY_TYPES was discovered at import-time against ~/.brain;
+    # rebuild against the temp vault so get_or_create_type_dir() lands
+    # under tmp_path, not the real home directory.
+    monkeypatch.setattr(
+        config, "ENTITY_TYPES",
+        {p.name: p for p in (brain / "entities").iterdir() if p.is_dir()},
+    )
     # ensure_dirs is called inside main(); stub it out so it doesn't try
     # to mkdir the hard-coded ~/.brain subtree.
     monkeypatch.setattr(config, "ensure_dirs", lambda: None)
@@ -139,15 +149,56 @@ def test_already_promoted_skipped(vault):
     assert "already promoted" in report.skipped[0]["reason"]
 
 
-def test_hypothesis_promotes_as_insight(vault):
-    """A confirmed hypothesis is an insight — target folder is entities/insights/"""
+def test_hypothesis_promotes_to_hypotheses_folder(vault):
+    """Per program.md: hypotheses → entities/hypotheses/ with status: unverified.
+
+    Lower confidence bar (medium allowed) intentional: an unverified
+    queryable claim is more useful than one stuck in playground/."""
     _write_playground_item(vault, "hypotheses", "0001-h.md",
-                           title="Testable Claim")
+                           title="Testable Claim", confidence="medium")
     report = promote.run(apply=True)
     assert len(report.promoted) == 1
-    out_file = vault / "entities" / "insights" / "testable-claim.md"
+    out_file = vault / "entities" / "hypotheses" / "testable-claim.md"
     assert out_file.exists()
-    assert "type: insight" in out_file.read_text()
+    text = out_file.read_text()
+    assert "type: hypothesis" in text
+    assert "status: unverified" in text
+    # Insight folder should NOT receive it
+    assert not (vault / "entities" / "insights" / "testable-claim.md").exists()
+
+
+def test_contradiction_promotes_to_contradictions_folder(vault):
+    """Per program.md: contradictions auto-promoted so they're queryable.
+
+    High-confidence only — wrongly flagged conflicts waste more
+    attention than missed ones."""
+    _write_playground_item(vault, "contradictions", "0001-c.md",
+                           title="Two Truths Diverged",
+                           body="- a: entity-x.md\n- b: entity-y.md\n- conflict: ...")
+    report = promote.run(apply=True)
+    assert len(report.promoted) == 1
+    out_file = vault / "entities" / "contradictions" / "two-truths-diverged.md"
+    assert out_file.exists()
+    text = out_file.read_text()
+    assert "type: contradiction" in text
+    assert "status: open" in text
+
+
+def test_contradiction_medium_confidence_skipped(vault):
+    """Contradictions are gated to confidence=high. Medium → skip."""
+    _write_playground_item(vault, "contradictions", "0001-c.md",
+                           confidence="medium")
+    report = promote.run(apply=False)
+    assert report.promoted == []
+    assert any("confidence=medium" in s["reason"] for s in report.skipped)
+
+
+def test_hypothesis_low_confidence_still_skipped(vault):
+    """Hypothesis bar is medium+, not anything-goes. Low → skip."""
+    _write_playground_item(vault, "hypotheses", "0001-h.md", confidence="low")
+    report = promote.run(apply=False)
+    assert report.promoted == []
+    assert any("confidence=low" in s["reason"] for s in report.skipped)
 
 
 def test_articles_not_promoted(vault):
@@ -159,7 +210,7 @@ def test_articles_not_promoted(vault):
         '\ncycle: 1\nconfidence: high\nrefs: ["a", "b", "c"]\n---\n\n# Essay\n\nbody\n'
     )
     report = promote.run(apply=False)
-    # Articles aren't in PROMOTE_MAP, so they're never scanned as candidates
+    # Articles aren't in PROMOTE_RULES, so they're never scanned as candidates
     assert all("articles" not in c.path.parts for c in report.candidates)
 
 
@@ -349,7 +400,7 @@ def test_key_facts_skips_testable_via_metadata(vault):
         ),
     )
     promote.run(apply=True)
-    text = (vault / "entities" / "insights" / "interesting-claim.md").read_text()
+    text = (vault / "entities" / "hypotheses" / "interesting-claim.md").read_text()
     assert "testable_via" not in text.split("## Key Facts")[1].split("\n\n")[0]
 
 

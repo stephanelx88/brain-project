@@ -35,7 +35,6 @@ The source playground file is left intact but annotated with
 
 - Promote `articles/` — those are narrative; their atomic facts should
   be extracted by auto_extract.py from sessions, not lifted wholesale.
-- Promote `contradictions/` — those need a human judgment call.
 - Dedupe against existing entities — that's the dedupe module's job,
   and it'll catch near-duplicates on the next auto-extract tick. Trying
   to dedupe here would duplicate that logic and tempt feature creep.
@@ -71,17 +70,58 @@ from brain.slugify import slugify
 
 MIN_REFS = 2
 MAX_AGE_DAYS = 14
-HIGH_CONFIDENCE = {"high"}
 
 # Max bullets synthesized in `## Key Facts` during render. Kept tight —
 # fact-parsing weights equally across bullets, so flooding dilutes signal.
 MAX_KEY_FACTS = 4
 
-# Playground subdirs → target entity folder. Only the two that make
-# sense at MVP; extending this dict is the way to promote new kinds.
-PROMOTE_MAP = {
-    "insights": "insights",
-    "hypotheses": "insights",  # a confirmed hypothesis *is* an insight
+
+@dataclass(frozen=True)
+class PromoteRule:
+    """How to promote one playground subdir.
+
+    Encapsulates everything that varies between insight / hypothesis /
+    contradiction promotion: where the entity lands, what frontmatter
+    it gets stamped with, and how strict the gate is.
+
+    Driven by `program.md`'s promotion rules section — keep them in
+    sync if either changes.
+    """
+    target_folder: str          # entities/<this>/
+    entity_type: str            # frontmatter `type: ...`
+    status: str                 # frontmatter `status: ...`
+    min_refs: int = 2
+    allowed_confidence: tuple[str, ...] = ("high",)
+
+
+# Per-kind rules. To enable a new playground subdir, add an entry.
+PROMOTE_RULES: dict[str, PromoteRule] = {
+    "insights": PromoteRule(
+        target_folder="insights", entity_type="insight",
+        status="current", min_refs=MIN_REFS,
+        allowed_confidence=("high",),
+    ),
+    "hypotheses": PromoteRule(
+        # program.md: "hypotheses auto-promoted to entities/hypotheses/
+        # with status: unverified so they're queryable". Lower bar
+        # intentional — the *whole point* is to surface medium-conf
+        # claims for future evidence to verify or refute. A queryable
+        # unverified hypothesis is more useful than one rotting in
+        # playground/.
+        target_folder="hypotheses", entity_type="hypothesis",
+        status="unverified", min_refs=MIN_REFS,
+        allowed_confidence=("high", "medium"),
+    ),
+    "contradictions": PromoteRule(
+        # program.md: "contradictions auto-promoted to
+        # entities/contradictions/ (so they're queryable in MCP)".
+        # Keep `high` only — a wrongly-flagged contradiction wastes
+        # more attention than a missed one, and the autoresearch
+        # prompt already labels uncertain conflicts as `medium`.
+        target_folder="contradictions", entity_type="contradiction",
+        status="open", min_refs=MIN_REFS,
+        allowed_confidence=("high",),
+    ),
 }
 
 PROMOTED_STATUS = "promoted"
@@ -195,7 +235,7 @@ def scan_candidates() -> list[Candidate]:
     out: list[Candidate] = []
     root = _playground_root()
     now = datetime.now(timezone.utc)
-    for sub, _ in PROMOTE_MAP.items():
+    for sub in PROMOTE_RULES:
         src = root / sub
         if not src.is_dir():
             continue
@@ -233,13 +273,17 @@ def scan_candidates() -> list[Candidate]:
 
 
 def _why_skip(c: Candidate, now: datetime) -> str | None:
+    rule = PROMOTE_RULES.get(c.kind)
+    if rule is None:
+        return f"unknown kind: {c.kind}"
     if c.raw_frontmatter.get("status") in (PROMOTED_STATUS, "archived",
                                            "superseded"):
         return f"already {c.raw_frontmatter.get('status')}"
-    if c.confidence not in HIGH_CONFIDENCE:
-        return f"confidence={c.confidence or 'missing'} (need: high)"
-    if len(c.refs) < MIN_REFS:
-        return f"only {len(c.refs)} ref(s) (need ≥ {MIN_REFS})"
+    if c.confidence not in rule.allowed_confidence:
+        allowed = "/".join(rule.allowed_confidence)
+        return f"confidence={c.confidence or 'missing'} (need: {allowed})"
+    if len(c.refs) < rule.min_refs:
+        return f"only {len(c.refs)} ref(s) (need ≥ {rule.min_refs})"
     if c.created_at is None:
         return "missing/unparseable created_at"
     age_days = (now - c.created_at).total_seconds() / 86400
@@ -257,9 +301,10 @@ def _target_path(c: Candidate) -> Path:
     """Destination entity file. If a file already exists with the same
     slug, append `-promoted` so we never silently overwrite manually
     written entities."""
-    target_type = PROMOTE_MAP[c.kind]
-    dst_dir = _entities_root() / target_type
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    rule = PROMOTE_RULES[c.kind]
+    # Register the type folder so config.ENTITY_TYPES picks it up —
+    # contradictions/ and hypotheses/ are typically new on first use.
+    dst_dir = config.get_or_create_type_dir(rule.target_folder)
     slug = slugify(c.title) or c.path.stem.lstrip("0123456789-")
     candidate = dst_dir / f"{slug}.md"
     if candidate.exists():
@@ -351,7 +396,12 @@ def _synthesize_key_facts(c: Candidate) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _render_entity(c: Candidate, src_rel: str) -> str:
+def _render_entity(
+    c: Candidate,
+    src_rel: str,
+    *,
+    rule_override: PromoteRule | None = None,
+) -> str:
     """Wrap the playground body in canonical entity frontmatter.
 
     `first_seen` inherits the playground `created_at` rather than "now"
@@ -362,14 +412,20 @@ def _render_entity(c: Candidate, src_rel: str) -> str:
     downstream `db.upsert_entity_from_file()` has bullets to extract.
     Without this, promoted entities stay invisible to fact-search even
     after re-indexing.
+
+    `rule_override` exists for `rerender()` — when refreshing an entity
+    that lives in `entities/insights/` because of a legacy
+    hypothesis-as-insight promotion, the caller passes the insight rule
+    so we don't accidentally restamp it as `type: hypothesis` and
+    leave it dangling in the wrong folder.
     """
+    rule = rule_override or PROMOTE_RULES[c.kind]
     created_date = (c.created_at or datetime.now(timezone.utc)).date().isoformat()
-    entity_type = PROMOTE_MAP[c.kind].rstrip("s")  # insights → insight
     front = [
         "---",
-        f"type: {entity_type}",
+        f"type: {rule.entity_type}",
         f"name: {c.title}",
-        "status: current",
+        f"status: {rule.status}",
         f"first_seen: {created_date}",
         f"last_updated: {created_date}",
         f"source_count: {max(1, len(c.refs))}",
@@ -537,9 +593,14 @@ def rerender(apply: bool = False) -> PromoteReport:
                 refs = []
         else:
             refs = list(refs_raw)
+        pg_kind = pg_path.parent.name
+        # `kind` may not be a known rule key (legacy/manual playground
+        # subdirs, or someone moved a file). Default to `insights` so
+        # we never crash on render.
+        cand_kind = pg_kind if pg_kind in PROMOTE_RULES else "insights"
         cand = Candidate(
             path=pg_path,
-            kind="insights" if pg_path.parent.name == "insights" else pg_path.parent.name,
+            kind=cand_kind,
             title=_first_heading(pg_body) or pg_path.stem,
             body=pg_body,
             confidence=str(pg_fm.get("confidence", "")).lower(),
@@ -547,6 +608,16 @@ def rerender(apply: bool = False) -> PromoteReport:
             created_at=_parse_iso(pg_fm.get("created_at")),
             raw_frontmatter=pg_fm,
         )
+        # Stay loyal to where the entity already lives — if a legacy
+        # hypothesis was promoted into entities/insights/ before the
+        # per-kind split, rerender it AS an insight (not a hypothesis)
+        # so the file's frontmatter matches its folder.
+        ent_folder = ent_path.parent.name
+        rule_override: PromoteRule | None = None
+        for rule in PROMOTE_RULES.values():
+            if rule.target_folder == ent_folder:
+                rule_override = rule
+                break
         rel_ent = str(ent_path.relative_to(brain_dir))
         record = {
             "src": src_rel,
@@ -558,7 +629,9 @@ def rerender(apply: bool = False) -> PromoteReport:
             report.promoted.append(record)
             continue
         try:
-            ent_path.write_text(_render_entity(cand, src_rel))
+            ent_path.write_text(
+                _render_entity(cand, src_rel, rule_override=rule_override)
+            )
             _db_upsert_safely(ent_path)
             report.promoted.append(record)
         except OSError as exc:
