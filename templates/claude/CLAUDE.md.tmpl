@@ -5,14 +5,27 @@
 
 ## Brain-first rule (MANDATORY, AUTONOMOUS)
 
-For **any** question about {{USERNAME}}, work, people, clients, projects,
-locations, preferences, decisions, issues, history, or "what do you know
-about X" — your **first action** is `brain_recall`. No asking, no warm-up,
-no file reads.
+Default to `brain_recall`. The trigger is **not** a list of topics — it
+is "anything specific to {{USERNAME}}'s life, world, work, things,
+plans, or context". This explicitly includes offhand or whimsical
+questions about objects, items, places, people, animals, time-of-day
+plans, "đôi dép tôi đâu" / "where are my X" / "did I say anything
+about Y" — query brain *first*, answer second.
 
 ```
-User asks anything personal/factual  →  call brain_recall(query)  →  then answer
+User asks anything specific to their world  →  brain_recall(query)  →  answer
 ```
+
+You may skip brain ONLY when **all** of these hold:
+- the question is pure programming / pure general knowledge (no
+  {{USERNAME}}-specific context),
+- OR you already called brain this turn for the same topic,
+- OR the question is meta about the current conversation itself.
+
+If unsure → call brain. A redundant `brain_recall` costs ~200 ms; a
+missed one costs a wrong answer (incident 2026-04-21: Claude Code
+dismissed *"đôi dép tôi đâu?"* as out-of-scope without querying brain,
+which actually had a matching note).
 
 If `brain_recall` returns nothing useful, escalate:
 1. `brain_notes(query)` — user-authored notes only
@@ -20,8 +33,8 @@ If `brain_recall` returns nothing useful, escalate:
 3. `brain_get(slug)` / `brain_note_get(path)` — fetch full file
 4. Only after all of the above return empty: say "the brain has no record of this."
 
-**Never** answer from training data or guesses for personal/factual questions
-about {{USERNAME}}. The brain is the source of truth.
+**Never** answer from training data or guesses for anything specific
+to {{USERNAME}}'s world. The brain is the source of truth.
 
 ## Tools available
 
@@ -69,22 +82,24 @@ Do not list every item, do not derail the user's task, do not nag on
 subsequent turns. If they ignore it, drop it. If they say "audit" /
 "show", call `brain_audit(limit=10)` and walk through them one at a time.
 
-In Cursor (no SessionStart hook), call `brain_audit(limit=3)` *only* on
-the first user message of a fresh session and apply the same surface-
-once rule.
+Both Claude Code and Cursor get the same hook now (`brain install`
+wires Cursor's `sessionStart` event to the same harvest+audit pair),
+so no manual fallback call is needed in either tool. If `brain doctor`
+flags either hook as unwired, fall back to calling `brain_audit(limit=3)`
+yourself on the first message and apply the same surface-once rule.
 
 ## NEVER
 
-- Never read `{{HOME}}/.brain/*.md` with file tools when an MCP tool can answer.
+- Never read `{{BRAIN_DIR}}/*.md` with file tools when an MCP tool can answer.
 - Never spawn `claude --print` from a hook (causes dual-instance Mac freeze).
 - Never run `brain.auto_extract` from SessionStart hook — it calls Claude internally.
 
 ## Architecture (FYI only)
 
-- **Harvest** (auto, launchd, ~1 s throttle): captures Claude/Cursor sessions → `{{HOME}}/.brain/raw/`
-- **Ingest notes** (auto): picks up user-authored markdown anywhere in `{{HOME}}/.brain/`
-- **Extract** (auto): LLM extracts entities → `{{HOME}}/.brain/entities/`
+- **Harvest** (auto, launchd, ~1 s throttle): captures Claude/Cursor sessions → `{{BRAIN_DIR}}/raw/`
+- **Ingest notes** (auto): picks up user-authored markdown anywhere in `{{BRAIN_DIR}}/`
+- **Extract** (auto): LLM extracts entities → `{{BRAIN_DIR}}/entities/`
 - **Reconcile + clean** (auto): dedup, tidy
 - **MCP server** (`brain.mcp_server`): how you query all of the above
 
-Source: `{{PROJECT_DIR}}` · run `{{HOME}}/.brain/bin/doctor.sh` if anything seems off.
+Source: `{{PROJECT_DIR}}` · run `{{BRAIN_DIR}}/bin/doctor.sh` if anything seems off.

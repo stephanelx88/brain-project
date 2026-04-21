@@ -8,16 +8,58 @@ the `brain` MCP server (registered in `~/.cursor/mcp.json`).
 > Cursor → Settings → Rules → **User Rules** so every chat session
 > picks it up.
 
+## Rule 0 — Surface the session-start audit (MANDATORY, FIRST REPLY)
+
+Cursor's `sessionStart` hook (`~/.cursor/hooks.json` →
+`{{BRAIN_DIR}}/bin/cursor-session-start.sh`) injects a `🧠 Brain audit —`
+block into your initial system context whenever the brain has items
+needing review. Cursor does **not** show this block to the user — only
+to you. So **before** you do anything else on the very first user
+message of a session:
+
+1. Scan your initial system context for a line starting with
+   `🧠 Brain audit — top items needing a 5-second decision:`.
+2. If present, **prepend a single-line nudge** to your first reply,
+   stating the count and (optionally) the first item's label. Then
+   proceed with the user's actual request.
+3. If absent, do nothing — the brain is clean.
+
+Example acknowledgement (matches the real block format):
+
+> _FYI — brain has 3 items pending review (top: "Confirm? · Graphify
+> Semantic Extraction Docs Only"). Say `audit` to walk through them._
+
+Do not list every item, do not derail the user's task, do not nag on
+subsequent turns. If they say `audit` / `show`, call
+`brain_audit(limit=10)` and walk through them one at a time.
+
+If the hook block is missing entirely (older install, or `brain doctor`
+flags the hook as not wired), fall back to calling `brain_audit(limit=3)`
+yourself on the first user message and surface the same one-liner.
+
 ## Brain-first rule (MANDATORY, AUTONOMOUS)
 
-For **any** question about {{USERNAME}}, work, people, clients, projects,
-locations, preferences, decisions, issues, history, or "what do you know
-about X" — your **first action** is `brain_recall`. No asking, no warm-up,
-no file reads.
+Default to `brain_recall`. The trigger is **not** a list of topics — it
+is "anything specific to {{USERNAME}}'s life, world, work, things,
+plans, or context". This explicitly includes offhand or whimsical
+questions about objects, items, places, people, animals, time-of-day
+plans, "đôi dép tôi đâu" / "where are my X" / "did I say anything
+about Y" — query brain *first*, answer second.
 
 ```
-User asks anything personal/factual  →  call brain_recall(query)  →  then answer
+User asks anything specific to their world  →  brain_recall(query)  →  answer
 ```
+
+You may skip brain ONLY when **all** of these hold:
+- the question is pure programming / pure general knowledge (no
+  {{USERNAME}}-specific context),
+- OR you already called brain this turn for the same topic,
+- OR the question is meta about the current conversation itself.
+
+If unsure → call brain. A redundant `brain_recall` costs ~200 ms; a
+missed one costs a wrong answer (incident 2026-04-21: Claude Code
+dismissed *"đôi dép tôi đâu?"* as out-of-scope without querying brain,
+which actually had a matching note).
 
 If `brain_recall` returns nothing useful, escalate:
 1. `brain_notes(query)` — user-authored notes only
@@ -25,8 +67,8 @@ If `brain_recall` returns nothing useful, escalate:
 3. `brain_get(slug)` / `brain_note_get(path)` — fetch full file
 4. Only after all of the above return empty: say "the brain has no record of this."
 
-**Never** answer from training data or guesses for personal/factual questions
-about {{USERNAME}}. The brain is the source of truth.
+**Never** answer from training data or guesses for anything specific
+to {{USERNAME}}'s world. The brain is the source of truth.
 
 ## Tools available
 
@@ -64,30 +106,17 @@ tools.
 - Do **not** call `brain_live_tail` on every turn — it reads the full
   jsonl. Use it on demand or when peers look relevant to the task.
 
-## Session-start audit (surface, don't dump)
-
-Cursor has no SessionStart hook. On the **first user message of a fresh
-session**, call `brain_audit(limit=3)` once. If it returns items,
-acknowledge them in a single line at the top of your reply: e.g.
-*"FYI — your brain has 3 items pending review (1 contested, 2 merge
-candidates). Say `audit` if you want to walk through them."* Then
-proceed with the actual user request.
-
-Do not list every item, do not derail the user's task, do not nag on
-subsequent turns. If they ignore it, drop it. If they say "audit" /
-"show", call `brain_audit(limit=10)` and walk through them one at a time.
-
 ## NEVER
 
-- Never read `{{HOME}}/.brain/*.md` with file tools when an MCP tool can answer.
+- Never read `{{BRAIN_DIR}}/*.md` with file tools when an MCP tool can answer.
 - Never run `brain.auto_extract` from a Cursor command — it calls Claude internally.
 
 ## Architecture (FYI only)
 
-- **Harvest** (auto, launchd, ~1 s throttle): captures Claude/Cursor sessions → `{{HOME}}/.brain/raw/`
-- **Ingest notes** (auto): picks up user-authored markdown anywhere in `{{HOME}}/.brain/`
-- **Extract** (auto): LLM extracts entities → `{{HOME}}/.brain/entities/`
+- **Harvest** (auto, launchd, ~1 s throttle): captures Claude/Cursor sessions → `{{BRAIN_DIR}}/raw/`
+- **Ingest notes** (auto): picks up user-authored markdown anywhere in `{{BRAIN_DIR}}/`
+- **Extract** (auto): LLM extracts entities → `{{BRAIN_DIR}}/entities/`
 - **Reconcile + clean** (auto): dedup, tidy
 - **MCP server** (`brain.mcp_server`): how you query all of the above
 
-Source: `{{PROJECT_DIR}}` · run `{{HOME}}/.brain/bin/doctor.sh` if anything seems off.
+Source: `{{PROJECT_DIR}}` · run `{{BRAIN_DIR}}/bin/doctor.sh` if anything seems off.
