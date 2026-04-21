@@ -25,6 +25,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 import brain.config as config
+from brain.io import atomic_write_text
 
 BRAIN_RAW = config.RAW_DIR
 HARVESTED_FILE = config.BRAIN_DIR / ".harvested"
@@ -107,7 +108,7 @@ def load_harvested() -> list[str]:
 def save_harvested(harvested: list[str]) -> None:
     """Persist harvested session IDs preserving insertion order."""
     HARVESTED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    HARVESTED_FILE.write_text("\n".join(harvested) + "\n")
+    atomic_write_text(HARVESTED_FILE, "\n".join(harvested) + "\n")
 
 
 def rotate_harvested(max_entries: int = 2000) -> int:
@@ -118,7 +119,7 @@ def rotate_harvested(max_entries: int = 2000) -> int:
     if len(lines) <= max_entries:
         return 0
     trimmed = lines[-max_entries:]
-    HARVESTED_FILE.write_text("\n".join(trimmed) + "\n")
+    atomic_write_text(HARVESTED_FILE, "\n".join(trimmed) + "\n")
     return len(lines) - len(trimmed)
 
 
@@ -481,7 +482,7 @@ def harvest_all() -> int:
         source_tag = "cursor" if _is_cursor_path(jsonl_path) else "claude"
         filename = f"session-{now.strftime('%Y-%m-%d-%H%M%S')}-{source_tag}-{slug}.md"
         output_path = BRAIN_RAW / filename
-        output_path.write_text(summary)
+        atomic_write_text(output_path, summary)
 
         mark(session_id)
         count += 1

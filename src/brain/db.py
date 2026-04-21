@@ -334,21 +334,70 @@ def delete_entity_by_path(path: Path | str) -> None:
 
 
 def rebuild() -> dict:
-    """Wipe DB and rebuild from every entity markdown file on disk."""
-    if DB_PATH.exists():
-        DB_PATH.unlink()
+    """Wipe DB and rebuild from every entity markdown file on disk.
+
+    Atomic: the rebuild is performed against a sibling `<name>.new` file.
+    Only after every entity has been upserted do we `os.replace` the
+    `.new` file over `DB_PATH`. A crash mid-rebuild leaves the stale-but-
+    consistent original in place plus an abandoned `.new` sibling — the
+    next successful rebuild will overwrite that temp, so no manual
+    cleanup is required. Previously the non-atomic `unlink(); upsert`
+    sequence could leave a partial index that looked "built" to callers
+    (meta file present, rows missing), which is exactly the silent-data-
+    loss surface Storage clause 3 prohibits.
+    """
+    import os as _os
+
+    global DB_PATH
+    orig_path = DB_PATH
+    new_path = orig_path.parent / (orig_path.name + ".new")
+    # Remove any stale `.new` left by a previous crashed rebuild so
+    # `connect()` starts from a clean slate.
+    if new_path.exists():
+        new_path.unlink()
+
     counts = {"entities": 0, "facts": 0}
-    config.ENTITY_TYPES.update(config._discover_entity_types())
-    for type_dir in config.ENTITY_TYPES.values():
-        if not type_dir.exists():
-            continue
-        for f in type_dir.glob("*.md"):
-            if f.name.startswith("_"):
+    # Redirect every `connect()` call below at the scratch path for the
+    # duration of the rebuild. `DB_PATH` is the only module-level handle
+    # connect() reads, so swapping it is sufficient and preserves all
+    # existing call sites (`upsert_entity_from_file`, the final count
+    # query) with zero changes.
+    DB_PATH = new_path
+    try:
+        config.ENTITY_TYPES.update(config._discover_entity_types())
+        for type_dir in config.ENTITY_TYPES.values():
+            if not type_dir.exists():
                 continue
-            upsert_entity_from_file(f)
-            counts["entities"] += 1
-    with connect() as conn:
-        counts["facts"] = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+            for f in type_dir.glob("*.md"):
+                if f.name.startswith("_"):
+                    continue
+                upsert_entity_from_file(f)
+                counts["entities"] += 1
+        with connect() as conn:
+            counts["facts"] = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    except BaseException:
+        # Best-effort scratch cleanup — don't mask the underlying error.
+        try:
+            new_path.unlink()
+        except FileNotFoundError:
+            pass
+        DB_PATH = orig_path
+        raise
+
+    # Swap the freshly-built DB over the original in one atomic call.
+    # SQLite's WAL sidecars (-wal, -shm) are ephemeral; connect() will
+    # recreate them lazily against the new file.
+    _os.replace(new_path, orig_path)
+    for sidecar in (
+        orig_path.with_name(orig_path.name + "-wal"),
+        orig_path.with_name(orig_path.name + "-shm"),
+    ):
+        if sidecar.exists():
+            try:
+                sidecar.unlink()
+            except OSError:
+                pass
+    DB_PATH = orig_path
     return counts
 
 

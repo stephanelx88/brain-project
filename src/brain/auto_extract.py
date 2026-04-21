@@ -28,6 +28,7 @@ if os.environ.get("BRAIN_EXTRACTING"):
 import brain.config as config
 from brain.apply_extraction import apply_extraction
 from brain.git_ops import commit
+from brain.io import atomic_write_text
 from brain.index import rebuild_index
 from brain.log import append_log
 from brain.prefilter import filter_session_text
@@ -86,7 +87,7 @@ def get_existing_index() -> str:
     except FileNotFoundError:
         pass
     text = _build_entity_name_cache()
-    CACHE_FILE.write_text(text)
+    atomic_write_text(CACHE_FILE, text)
     return text
 
 
@@ -113,7 +114,7 @@ def get_retry_count(raw_file: Path) -> int:
 
 def increment_retry(raw_file: Path) -> None:
     rm = raw_file.with_suffix(".retries")
-    rm.write_text(str(get_retry_count(raw_file) + 1))
+    atomic_write_text(rm, str(get_retry_count(raw_file) + 1))
 
 
 def cleanup_file(raw_file: Path) -> None:

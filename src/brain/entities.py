@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 
+from brain.io import atomic_write_text
 from brain.slugify import slugify, validate_slug
 import brain.config as config
 
@@ -78,7 +79,7 @@ def create_entity(
     fm_lines.append("---")
 
     content = "\n".join(fm_lines) + f"\n\n# {name}\n\n{body}\n"
-    path.write_text(content)
+    atomic_write_text(path, content)
     return path
 
 
@@ -163,7 +164,7 @@ def append_to_entity(entity_type: str, name: str, section: str, content: str) ->
     else:
         text = text.rstrip() + f"\n\n{section_header}\n{new_content}\n"
 
-    path.write_text(text)
+    atomic_write_text(path, text)
     return path
 
 

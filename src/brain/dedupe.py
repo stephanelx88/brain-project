@@ -56,6 +56,7 @@ import brain.config as config
 from brain import semantic
 from brain.entities import append_to_entity
 from brain.git_ops import commit
+from brain.io import atomic_write_text
 from brain.log import append_log
 
 try:
@@ -121,7 +122,7 @@ def _ledger_load() -> dict:
 
 
 def _ledger_save(led: dict) -> None:
-    LEDGER_PATH.write_text(json.dumps(led, indent=2, sort_keys=True))
+    atomic_write_text(LEDGER_PATH, json.dumps(led, indent=2, sort_keys=True))
 
 
 def _pair_key(slug_a: str, slug_b: str, type_: str) -> str:
@@ -410,14 +411,14 @@ def apply_merge(cand: dict, verdict: dict) -> dict:
         "source_count": str(new_count),
         "last_updated": now,
     })
-    winner.write_text(winner_text)
+    atomic_write_text(winner, winner_text)
 
     new_loser = _set_frontmatter_keys(loser_text, {
         "status": "superseded",
         "superseded_by": winner.stem,
         "last_updated": now,
     })
-    loser.write_text(new_loser)
+    atomic_write_text(loser, new_loser)
 
     if upsert_entity_from_file is not None:
         # Surface db sync failures in the cron log — they used to be
@@ -555,7 +556,7 @@ def _write_proposals(proposals: list[dict]) -> Path | None:
             f"- files: `{cand['path_a'].relative_to(config.BRAIN_DIR)}` ⇄ `{cand['path_b'].relative_to(config.BRAIN_DIR)}`",
             "",
         ])
-    path.write_text("\n".join(lines))
+    atomic_write_text(path, "\n".join(lines))
     return path
 
 

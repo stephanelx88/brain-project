@@ -22,6 +22,7 @@ from pathlib import Path
 
 import brain.config as config
 from brain.config import ENTITY_TYPES
+from brain.io import atomic_write_text
 
 # Optional write-through to the SQLite mirror. Imported lazily so the
 # clean script still works on a fresh install before db.py has been touched.
@@ -138,7 +139,7 @@ def clean_stale_harvested(execute: bool) -> int:
     kept = [sid for sid in lines if sid in existing_ids]
     removed = len(lines) - len(kept)
     if execute and removed > 0:
-        harvested_file.write_text("\n".join(kept) + "\n")
+        atomic_write_text(harvested_file, "\n".join(kept) + "\n")
     return removed
 
 
@@ -189,7 +190,7 @@ def collapse_double_sources(execute: bool) -> int:
                 file_changed = True
                 edited += 1
             if file_changed and execute:
-                f.write_text("\n".join(new_lines))
+                atomic_write_text(f, "\n".join(new_lines))
     return edited
 
 
@@ -251,7 +252,7 @@ def generate_mocs(execute: bool) -> int:
                     break
             lines.append(f"- [[{f.stem}|{name}]]")
         if execute:
-            (type_dir / "_MOC.md").write_text("\n".join(lines) + "\n")
+            atomic_write_text(type_dir / "_MOC.md", "\n".join(lines) + "\n")
         written += 1
     return written
 
