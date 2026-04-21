@@ -72,7 +72,7 @@ Then it auto-configures everything else:
 - exports `BRAIN_DIR` into your shell rc (`~/.zshrc` etc.)
 - registers the MCP server with Claude Code **and** Cursor
 - wires SessionStart hooks into both `~/.claude/settings.json` and `~/.cursor/hooks.json`
-- loads three launchd agents: `brain-auto-extract`, `brain-semantic-worker`, `brain-autoresearch`
+- loads two launchd agents: `brain-auto-extract`, `brain-semantic-worker`
 - downloads the embedding model (`paraphrase-multilingual-MiniLM-L12-v2`, ~120 MB, one-time)
 - runs `bin/doctor.sh` to verify everything is green
 
@@ -93,7 +93,7 @@ The vault you point at can be a brand-new folder **or an existing Obsidian vault
   identity/                  # who-i-am, preferences, corrections
   entities/<type>/           # one .md per entity, folders match your preset
   raw/                       # transient session summaries waiting for extraction
-  playground/                # autoresearch sandbox — articles/hypotheses/
+  playground/                # research sandbox — articles/hypotheses/
                              # contradictions/insights/questions before promotion
   .brain.rdf/                # Oxigraph RDF triple store (typed relationships)
   index.md                   # auto-generated entity catalog
@@ -103,7 +103,7 @@ The vault you point at can be a brand-new folder **or an existing Obsidian vault
   .dedupe.ledger.json        # canonical dedupe verdicts (audit reads this)
   .extract.lock.d/           # flock dir — singleton guard for the watcher
   bin/                       # rendered watcher + doctor scripts
-  logs/                      # auto-extract + autoresearch logs
+  logs/                      # auto-extract + semantic-worker logs
   (your existing notes…)     # untouched — brain reads but never deletes them
 ```
 
@@ -133,19 +133,19 @@ Claude / Cursor session  ──► SessionStart hook  ──► brain audit (3 i
                               ▼
                         dedupe.py            (semantic dedupe, LLM-judged)
 
-                              ╭── parallel ──╮
-                              ▼              ▼
-                  semantic worker       autoresearch (every 30 min)
-                  (embeddings, RRF)        │
-                                           ▼
-                                    playground/articles|hypotheses|
-                                    contradictions|insights|questions
-                                           │
-                                           ▼
-                                    promote.py (≥2 refs, ≤14d, conf=high)
-                                           │
-                                           ▼
-                                    entities/insights|hypotheses|contradictions
+                              ▼
+                        semantic worker
+                        (embeddings, RRF)
+
+                  [optional, manual]
+                        playground/articles|hypotheses|
+                        contradictions|insights|questions
+                              │
+                              ▼
+                        promote.py (≥2 refs, ≤14d, conf=high)
+                              │
+                              ▼
+                        entities/insights|hypotheses|contradictions
 
                 Anywhere in your conversation, the LLM calls brain_*
                 tools via the MCP server, which reads the same vault
@@ -242,7 +242,6 @@ python3 -m brain.harvest_session    # one-shot harvest of pending Claude/Cursor 
 python3 -m brain.auto_extract       # one-shot LLM extraction from raw/
 python3 -m brain.note_extract       # one-shot LLM extraction from user notes
 python3 -m brain.ingest_notes       # one-shot pickup of user-authored markdown
-python3 -m brain.autoresearch       # one cycle of the autonomous research loop
 python3 -m brain.promote            # promote high-confidence playground items
 python3 -m brain.reconcile          # lexical duplicate / conflict sweep
 python3 -m brain.dedupe              # semantic dedupe (LLM-judged)
@@ -321,9 +320,7 @@ src/brain/
   ingest_notes.py     auto-pickup of user-authored markdown
   apply_extraction.py single source of truth for brain mutations
 
-  # Autoresearch loop
-  autoresearch.py     30-min autonomous loop — reads brain, writes playground/
-  round_robin.py      picker-driven concrete subjects for autoresearch slots
+  # Promotion (manual)
   promote.py          playground/ → entities/ promotion (per-kind rules)
 
   # Audit + cleanup

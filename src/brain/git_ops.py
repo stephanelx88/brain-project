@@ -1,6 +1,6 @@
 """Git operations for the brain repository.
 
-Important: automated jobs (extract, dedupe, autoresearch) MUST commit
+Important: automated jobs (extract, dedupe) MUST commit
 with an explicit `paths=` allowlist. The legacy `git add -A` behaviour
 silently swept user-deleted root notes (e.g. `where-is-son.md`) into
 unrelated automated commits, masking when/who deleted what — see the

@@ -161,7 +161,7 @@ def test_to_json_roundtrip(fake_vault, monkeypatch):
 
 
 def test_coverage_absent_when_no_ledger(fake_vault, monkeypatch):
-    """Fresh install with no autoresearch runs — coverage surfaces as
+    """Fresh install with no eval runs — coverage surfaces as
     `available: False` rather than synthesising a bogus score."""
     _stub_launchctl_not_loaded(monkeypatch)
     rep = status.gather()

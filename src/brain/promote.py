@@ -1,21 +1,16 @@
 """Promote high-confidence playground items into canonical entities.
 
-Closes the autoresearch feedback loop described in program.md:
-
-    cycle writes playground/  →  promote moves selected items to entities/
-      ↑                                                        |
-      └─────── next cycle's recall sees the new entity ────────┘
-
-Until this shipped, playground items were never searchable by downstream
-cycles, so the brain couldn't build on its own reasoning — the whole
-"autoresearch" loop had an open wire. This module closes it.
+Playground items are free-form research artefacts (historically written
+by an autoresearch loop, now manual only). Promotion moves selected
+items from `playground/` → `entities/` so they become searchable by
+future recalls.
 
 ## Selection criteria (MVP — intentionally conservative)
 
 A playground item is promoted iff *all* of:
 
-  1. `confidence: high` in its frontmatter (autoresearch already tags
-     items it's sure about; medium/low stay in playground for review).
+  1. `confidence: high` in its frontmatter (author tags items they're
+     sure about; medium/low stay in playground for review).
   2. `len(refs) >= MIN_REFS` (default 2) — the item cites at least two
      existing entities, so we have provenance rather than free-floating
      speculation.
@@ -113,11 +108,9 @@ PROMOTE_RULES: dict[str, PromoteRule] = {
         allowed_confidence=("high", "medium"),
     ),
     "contradictions": PromoteRule(
-        # program.md: "contradictions auto-promoted to
-        # entities/contradictions/ (so they're queryable in MCP)".
-        # Keep `high` only — a wrongly-flagged contradiction wastes
-        # more attention than a missed one, and the autoresearch
-        # prompt already labels uncertain conflicts as `medium`.
+        # Contradictions surface as entities/contradictions/ so they're
+        # queryable in MCP. Keep `high` only — a wrongly-flagged
+        # contradiction wastes more attention than a missed one.
         target_folder="contradictions", entity_type="contradiction",
         status="open", min_refs=MIN_REFS,
         allowed_confidence=("high",),
@@ -160,8 +153,7 @@ class PromoteReport:
 
 # ---------------------------------------------------------------------------
 # frontmatter parsing — kept narrow (no yaml dep) so this module runs
-# even on install.sh's minimal Python path. Parsers mirror what
-# autoresearch._write_playground_item writes.
+# even on install.sh's minimal Python path.
 # ---------------------------------------------------------------------------
 
 _FRONT_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
@@ -430,7 +422,7 @@ def _render_entity(
         f"last_updated: {created_date}",
         f"source_count: {max(1, len(c.refs))}",
         f"promoted_from: {src_rel}",
-        "tags: [autoresearch]",
+        "tags: [promoted]",
         "---",
         "",
     ]
@@ -490,9 +482,9 @@ def _annotate_source(c: Candidate, target_rel: str) -> str:
 def run(apply: bool = False, limit: int | None = None) -> PromoteReport:
     """Scan playground, decide, (optionally) write.
 
-    `limit` is a safety knob — useful when wiring this into autoresearch
-    so a single tick can't flood entities/ with a hundred promotions if
-    something goes wrong upstream. Default None = no cap.
+    `limit` is a safety knob that caps promotions per invocation so a
+    single run can't flood entities/ if something goes wrong upstream.
+    Default None = no cap.
     """
     cands = scan_candidates()
     report = PromoteReport(candidates=cands)

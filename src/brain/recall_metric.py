@@ -1,37 +1,24 @@
-"""Question Coverage Score — autoresearch's `val_bpb` analog.
+"""Question Coverage Score — recall-quality metric.
 
-Per `~/.brain/program.md`:
-
-  > A miss is a recall whose top-3 results have semantic score < 0.35.
-  > Question Coverage Score = unanswered_recall_misses / total_recalls
-  > (single scalar, monotone, lower-is-better)
-
-The spec metric (binary miss-rate) is preserved as `miss_rate` and still
-reported, but it floor-saturates at 0 the moment every eval query clears
-the threshold — at which point the brain looks "done" even though
-semantic recall quality keeps drifting up or down. To keep `val_bpb`
-behaviour (smooth, monotone, never-saturated), the **primary** scalar
-`score` is now `1.0 - avg_top_score`: it tracks the gap-from-perfect on
-the same lower-is-better axis as the binary metric, but moves on every
-cycle that nudges semantic similarity even slightly. The two agree at
-the extremes (perfect avg_top → score 0; everything misses → score
-close to 1) and never contradict each other the way the old binary-only
-ledger entries did (`score=0.0` next to `avg_top=0.712`).
+A miss is a recall whose top result has semantic score < threshold.
+The **primary** scalar `score = 1.0 - avg_top_score` is monotone with
+semantic recall quality and never floor-saturates, unlike the binary
+`miss_rate` which hits 0 once every eval query clears the threshold.
+Both are reported; `score` is the trajectory signal.
 
 Two ways to drive it:
 
-  1. **Eval set mode** (used by autoresearch run/cycle): a fixed list of
-     queries representing typical Son recall patterns is scored before
-     and after each cycle. The delta tells you whether the playground
-     items the agent wrote actually moved the needle.
+  1. **Eval set mode**: a fixed list of queries representing typical
+     Son recall patterns is scored; the delta across runs tells you
+     whether changes to the brain actually moved the needle.
 
-  2. **Live mode** (future): every real `brain_recall` call gets logged
-     to `~/.brain/recall-ledger.jsonl` with its top score; this module
+  2. **Live mode**: every real `brain_recall` call gets logged to
+     `~/.brain/recall-ledger.jsonl` with its top score; this module
      reads the ledger and reports rolling 7-day coverage.
 
-The eval set lives at `~/.brain/eval-queries.md` (one query per non-blank,
-non-`#` line). When that file is missing we ship a sensible default seed
-so the metric works out of the box.
+The eval set lives at `~/.brain/eval-queries.md` (one `- query` item
+per line). When the file is missing we seed defaults so the metric
+works out of the box.
 """
 
 from __future__ import annotations
@@ -58,9 +45,7 @@ MISS_THRESHOLD = float(_os.environ.get("BRAIN_MISS_THRESHOLD", "0.60"))
 
 
 DEFAULT_EVAL_QUERIES = [
-    # autoresearch / brain self-knowledge
-    "what is brain autoresearch and how does a cycle work",
-    "Karpathy autoresearch pattern program.md",
+    # brain self-knowledge
     "playground promotion to entities",
     "Question Coverage Score metric",
     # X crawl project
@@ -106,10 +91,9 @@ def load_eval_queries() -> list[str]:
     # First run: seed the file from defaults so the human can iterate.
     EVAL_FILE.write_text(
         "# Brain Recall Eval Set\n\n"
-        "One query per line. Lines starting with `#` are ignored. The\n"
-        "autoresearch loop scores each query before and after every cycle\n"
-        "and reports the delta. Edit this file as your recall patterns\n"
-        "evolve — it's the brain's `val` set.\n\n"
+        "One `- query` item per line. Lines starting with `#` are ignored.\n"
+        "Edit this file as your recall patterns evolve — it's the brain's\n"
+        "`val` set for measuring recall quality deltas across changes.\n\n"
         + "\n".join(f"- {q}" for q in DEFAULT_EVAL_QUERIES)
         + "\n"
     )
@@ -128,8 +112,7 @@ class CoverageReport:
     misses: int
     #  Continuous primary metric: 1 - avg_top_score, clamped to [0, 1].
     #  Lower-is-better, monotone with semantic recall quality, and never
-    #  floor-saturates while the brain has any room to improve. This is
-    #  the val_bpb analog the autoresearch loop optimises against.
+    #  floor-saturates while the brain has any room to improve.
     score: float
     #  Binary spec metric (program.md): misses / total. Preserved for
     #  back-compat and as a "did any query cross the threshold?" signal.

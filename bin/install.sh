@@ -164,8 +164,6 @@ render() {
 echo "[3/8] render scripts + plist + CLAUDE.md + session-start hooks"
 render "$PROJECT_DIR/templates/scripts/auto-extract.sh.tmpl" "$BRAIN_DIR/bin/auto-extract.sh"
 chmod +x "$BRAIN_DIR/bin/auto-extract.sh"
-render "$PROJECT_DIR/templates/scripts/autoresearch-tick.sh.tmpl" "$BRAIN_DIR/bin/autoresearch-tick.sh"
-chmod +x "$BRAIN_DIR/bin/autoresearch-tick.sh"
 
 # Cursor sessionStart hook script — invoked by ~/.cursor/hooks.json on
 # every new composer session. Mirrors what Claude's SessionStart hook
@@ -195,12 +193,6 @@ render "$PROJECT_DIR/templates/launchd/brain-auto-extract.plist.tmpl" "$PLIST"
 # the only way to hit the ≤10 s sync goal.
 SEM_PLIST="$HOME_DIR/Library/LaunchAgents/com.${USERNAME}.brain-semantic-worker.plist"
 render "$PROJECT_DIR/templates/launchd/brain-semantic-worker.plist.tmpl" "$SEM_PLIST"
-
-# Autonomous autoresearch — fires one cycle every 30 min, but only
-# when no `claude --print` is running and program.md exists. The tick
-# script guards itself; the plist just schedules it.
-AR_PLIST="$HOME_DIR/Library/LaunchAgents/com.${USERNAME}.brain-autoresearch.plist"
-render "$PROJECT_DIR/templates/launchd/brain-autoresearch.plist.tmpl" "$AR_PLIST"
 
 CLAUDE_MD="$HOME_DIR/.claude/CLAUDE.md"
 mkdir -p "$(dirname "$CLAUDE_MD")"
@@ -315,22 +307,18 @@ echo "      ✓ index ready"
 # ──────────────────────────────────────────────────────────────────────
 # 7. Load launchd job (unload first so re-runs pick up plist changes)
 # ──────────────────────────────────────────────────────────────────────
-echo "[7/8] load launchd watcher + semantic worker + autoresearch"
+echo "[7/8] load launchd watcher + semantic worker"
 launchctl unload "$PLIST" 2>/dev/null || true
 launchctl load "$PLIST"
 launchctl unload "$SEM_PLIST" 2>/dev/null || true
 launchctl load "$SEM_PLIST"
-launchctl unload "$AR_PLIST" 2>/dev/null || true
-launchctl load "$AR_PLIST"
 # launchctl load is asynchronous — the job may take a beat to appear in
 # `launchctl list`. Poll briefly so the success message is honest.
 LAUNCHD_LABEL="com.${USERNAME}.brain-auto-extract"
 SEM_LABEL="com.${USERNAME}.brain-semantic-worker"
-AR_LABEL="com.${USERNAME}.brain-autoresearch"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if launchctl list | grep -q "$LAUNCHD_LABEL" \
-     && launchctl list | grep -q "$SEM_LABEL" \
-     && launchctl list | grep -q "$AR_LABEL"; then break; fi
+     && launchctl list | grep -q "$SEM_LABEL"; then break; fi
   sleep 0.3
 done
 if launchctl list | grep -q "$LAUNCHD_LABEL"; then
@@ -344,11 +332,6 @@ if launchctl list | grep -q "$SEM_LABEL"; then
   echo "      ✓ semantic worker live (cold-start once, warm forever)"
 else
   echo "      ! semantic worker not visible — ingest will fall back to in-process embedding"
-fi
-if launchctl list | grep -q "$AR_LABEL"; then
-  echo "      ✓ autoresearch live (one cycle every 30 min, idle-guarded)"
-else
-  echo "      ! autoresearch not visible — autoresearch will need manual runs"
 fi
 
 # ──────────────────────────────────────────────────────────────────────

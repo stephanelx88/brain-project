@@ -55,7 +55,6 @@ LLM_PROC_PATTERNS = [
     "brain.auto_extract",
     "brain.reconcile",
     "brain.dedupe",
-    "brain.autoresearch",
     "claude --print",
 ]
 
@@ -363,19 +362,17 @@ def _pending_audit() -> dict:
 def _coverage() -> dict:
     """Tail the recall-ledger to surface Question Coverage Score.
 
-    Each autoresearch cycle appends a JSON line with `score` (miss rate,
-    lower is better) and `avg_top` (mean top-k similarity, higher is
-    better). We only need the latest two rows to show "current vs.
-    previous" — everything further back lives in the ledger for offline
-    analysis.
+    Each eval run appends a JSON line with `score` (miss rate, lower is
+    better) and `avg_top` (mean top-k similarity, higher is better). We
+    only need the latest two rows to show "current vs. previous" —
+    everything further back lives in the ledger for offline analysis.
 
     Tolerant of the ledger not existing (fresh install before the first
-    autoresearch run) and of malformed lines (hand-editing, partial
-    writes during a crash)."""
+    eval run) and of malformed lines (hand-editing, partial writes
+    during a crash)."""
     out: dict = {
         "available": False,
-        #  Continuous score (1 - avg_top), the val_bpb analog the
-        #  autoresearch loop optimises against. Lower is better.
+        #  Continuous score (1 - avg_top). Lower is better.
         "latest_score": None,
         "prev_score": None,
         "delta_score": None,
@@ -597,7 +594,7 @@ def format_text(report: StatusReport) -> str:
                 f"[{C['runs_logged']} eval runs logged, legacy schema]"
             )
     else:
-        coverage_line = "no autoresearch cycles logged yet"
+        coverage_line = "no eval runs logged yet"
 
     L = report.live_coverage or {}
     if L.get("available"):

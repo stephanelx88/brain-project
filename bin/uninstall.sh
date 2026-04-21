@@ -45,13 +45,14 @@ echo
 
 PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-auto-extract.plist"
 SEM_PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-semantic-worker.plist"
-AR_PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-autoresearch.plist"
 
 echo "[1/5] launchd"
+# Also sweep legacy autoresearch plist if a pre-removal install left it behind.
+LEGACY_AR_PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-autoresearch.plist"
 for label_plist in \
     "com.${USERNAME}.brain-auto-extract:$PLIST" \
     "com.${USERNAME}.brain-semantic-worker:$SEM_PLIST" \
-    "com.${USERNAME}.brain-autoresearch:$AR_PLIST"; do
+    "com.${USERNAME}.brain-autoresearch:$LEGACY_AR_PLIST"; do
   label="${label_plist%%:*}"
   plist="${label_plist#*:}"
   if launchctl list 2>/dev/null | grep -q "$label"; then

@@ -80,11 +80,6 @@ if echo "$LAUNCHCTL_LIST" | grep -q "com\.${USERNAME}\.brain-semantic-worker"; t
 else
   warn "semantic-worker not loaded — ingest will cold-start the model each run"
 fi
-if echo "$LAUNCHCTL_LIST" | grep -q "com\.${USERNAME}\.brain-autoresearch"; then
-  ok "autoresearch launchd job loaded (one cycle / 30 min)"
-else
-  warn "autoresearch not loaded — cycles will need manual runs"
-fi
 
 if [[ -f "$LOG" ]]; then
   LAST_RUN=$(grep "auto-extract run" "$LOG" | tail -1 | awk '{print $2}')

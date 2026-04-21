@@ -2,7 +2,7 @@
 
 These exercise the pure-Python parts: ledger logging, live_coverage
 parsing, and diff_reports. Scoring itself requires the semantic
-stack and is covered end-to-end in the autoresearch smoke tests.
+stack and is covered end-to-end in higher-level smoke tests.
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ def _stub_top_score(monkeypatch, score: float, label: str = "fact:insights/x"):
 
 def test_log_live_recall_writes_one_row(fake_ledger, monkeypatch):
     _stub_top_score(monkeypatch, 0.82)
-    recall_metric.log_live_recall("what is brain autoresearch")
+    recall_metric.log_live_recall("what is the brain vault")
     lines = fake_ledger.read_text().splitlines()
     assert len(lines) == 1
     row = json.loads(lines[0])
     assert row["kind"] == "live"
-    assert row["query"] == "what is brain autoresearch"
+    assert row["query"] == "what is the brain vault"
     assert row["top_score"] == 0.82
     assert row["miss"] is False  # 0.82 > default 0.60
     assert row["threshold"] == recall_metric.MISS_THRESHOLD
