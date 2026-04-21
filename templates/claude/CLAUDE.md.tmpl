@@ -5,27 +5,35 @@
 
 ## Brain-first rule (MANDATORY, AUTONOMOUS)
 
-Default to `brain_recall`. The trigger is **not** a list of topics — it
-is "anything specific to {{USERNAME}}'s life, world, work, things,
-plans, or context". This explicitly includes offhand or whimsical
-questions about objects, items, places, people, animals, time-of-day
-plans, "đôi dép tôi đâu" / "where are my X" / "did I say anything
-about Y" — query brain *first*, answer second.
+**Reflex**: your first tool call on every user message is
+`brain_recall(<the user's question, lightly normalised>)`. Always.
+Before any reasoning, before any other tool, before saying "I don't
+know", before being witty.
 
 ```
-User asks anything specific to their world  →  brain_recall(query)  →  answer
+EVERY user message  →  brain_recall(query)  →  then decide what to do
 ```
 
-You may skip brain ONLY when **all** of these hold:
-- the question is pure programming / pure general knowledge (no
-  {{USERNAME}}-specific context),
-- OR you already called brain this turn for the same topic,
-- OR the question is meta about the current conversation itself.
+Empty result is fine — proceed normally. Non-empty result must inform
+your answer; never contradict or ignore it without explicit reason.
 
-If unsure → call brain. A redundant `brain_recall` costs ~200 ms; a
-missed one costs a wrong answer (incident 2026-04-21: Claude Code
-dismissed *"đôi dép tôi đâu?"* as out-of-scope without querying brain,
-which actually had a matching note).
+You may **skip** the reflex ONLY when **all** three hold simultaneously:
+1. The message is pure external knowledge with zero possessive pronouns
+   or proper nouns belonging to {{USERNAME}}'s world (e.g. *"what year
+   was Python 3 released"*, *"explain TCP handshake"*).
+2. You already called `brain_recall` this turn for the same topic.
+3. You're answering a meta-question about the current conversation
+   itself (e.g. *"what did you just say?"*).
+
+Anything else — including offhand, whimsical, single-word, or seemingly
+nonsensical questions — gets `brain_recall` first. Cost of a redundant
+call is ~200 ms; cost of a missed one is hallucination.
+
+> Failure mode this rule prevents (incident 2026-04-21): Claude Code
+> received *"đôi dép tôi đâu?"*, classified it as "object question
+> outside brain's scope", answered *"look under your bed 👟"*. Brain
+> actually had the answer indexed from a user note. The agent never
+> called the tool.
 
 If `brain_recall` returns nothing useful, escalate:
 1. `brain_notes(query)` — user-authored notes only
@@ -33,8 +41,8 @@ If `brain_recall` returns nothing useful, escalate:
 3. `brain_get(slug)` / `brain_note_get(path)` — fetch full file
 4. Only after all of the above return empty: say "the brain has no record of this."
 
-**Never** answer from training data or guesses for anything specific
-to {{USERNAME}}'s world. The brain is the source of truth.
+**Never** answer from training data or guesses when brain could plausibly
+have it. The brain is the source of truth for {{USERNAME}}.
 
 ## Tools available
 
