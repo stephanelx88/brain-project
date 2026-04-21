@@ -35,6 +35,48 @@ These predate the requirements log; captured here for context only.
 
 ## Decision Log
 
+### 2026-04-21 — Phase 1 (third push): per-kind promote rules — hypotheses + contradictions go live
+
+**Decision:** Replace `promote.py`'s flat `PROMOTE_MAP` (which silently routed
+hypotheses into `entities/insights/` and ignored contradictions entirely) with
+a `PROMOTE_RULES` dataclass dict that gives each playground subdir its own
+target folder, frontmatter `type` + `status`, and gating thresholds. This
+matches what `program.md` always promised — that hypotheses surface in
+`entities/hypotheses/` with `status: unverified`, and contradictions auto-
+promote to `entities/contradictions/` so they're queryable in MCP.
+
+**Rationale:** A 24-hour audit of `~/.brain/playground/` found 6 contradictions
+and 8 hypotheses backed up since the loop went live, none of them queryable.
+The promote spec section in `program.md` had been written but never
+implemented — a real "ghost code" gap. Closing it makes the autoresearch
+agent's two highest-leverage output kinds (gap detection + falsifiable
+claims) immediately useful in MCP recall instead of rotting in a sandbox
+folder no one reads.
+
+**Per-kind config:**
+- `insights/` → `entities/insights/`, `status: current`, confidence=high (unchanged)
+- `hypotheses/` → `entities/hypotheses/`, `status: unverified`, confidence=high|medium
+- `contradictions/` → `entities/contradictions/`, `status: open`, confidence=high
+
+The hypothesis bar drops to medium because the *whole point* of an unverified
+hypothesis is to surface medium-conf claims for future evidence to verify or
+refute — gating to `high` would defeat the spec. Contradictions stay strict
+because a wrong contradiction wastes more attention than a missed one.
+
+**Backward compat:** `_render_entity` accepts a `rule_override` so `rerender()`
+can preserve legacy hypothesis-as-insight files in `entities/insights/`
+without restamping them as `type: hypothesis` (which would leave them in the
+wrong folder). New promotions land in the correct folders going forward.
+
+**Status:** shipped — `feat(promote): per-kind rules` (`c1977e5`).
+- 184/184 tests pass (added 3 new tests: hypotheses → hypotheses folder,
+  contradictions → contradictions folder, contradiction medium-conf gate).
+- Backfilled real `~/.brain`: 5 hypotheses + 5 contradictions promoted, both
+  queryable via `brain_search` (verified end-to-end with two real queries).
+- Coverage held at 0/15 miss = 0.0%.
+
+---
+
 ### 2026-04-20 — Phase 1 (second push): autoresearch auto-promotes + live recall-ledger
 
 Two follow-ups the moment Phase 1 first win flipped the miss rate to 0.0%.
