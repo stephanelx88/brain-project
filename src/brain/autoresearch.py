@@ -154,14 +154,14 @@ class Program:
 # question queue + auto-generation
 # ---------------------------------------------------------------------------
 
-ROUND_ROBIN_QUESTIONS = [
-    "stale-entity-sweep: find entities with last_updated > 60 days that are still referenced by ≥2 newer entities. Re-read both — are the older entity's facts still consistent?",
-    "cross-project-synthesis: pick a person mentioned in ≥3 projects. Write a narrative article describing their role across all of them.",
-    "decision-audit: pick a decision with status=open from 30+ days ago. Search recent sessions for evidence it was actually made, reversed, or remains open. File a contradiction or update.",
-    "correction-synthesis: read all corrections from the last 30 days. Cluster by theme. File a meta-correction summarizing the pattern.",
-    "issue-follow-through: pick an issue with status=open 14+ days. Search for evidence of resolution or escalation. Update or escalate.",
-    "domain-coverage-gap: pick a domain with <3 linked entities. Find recent sessions touching the domain that didn't extract. Propose new entities.",
-]
+#  Slot 0 of the legacy wheel — kept here only so older imports
+#  (`from brain.autoresearch import ROUND_ROBIN_QUESTIONS`) still work.
+#  Live picker logic lives in `brain.round_robin`; this list mirrors its
+#  FALLBACK_QUESTIONS so behaviour matches when the SQL pickers can't
+#  find an eligible subject.
+from brain import round_robin as _round_robin
+
+ROUND_ROBIN_QUESTIONS = _round_robin.FALLBACK_QUESTIONS
 
 
 def _load_queue() -> list[str]:
@@ -195,7 +195,62 @@ def _mark_queue_done(question: str) -> None:
 
 
 def _next_round_robin(cycle_n: int) -> str:
-    return ROUND_ROBIN_QUESTIONS[cycle_n % len(ROUND_ROBIN_QUESTIONS)]
+    """Defer to `brain.round_robin.next_question` so the autoresearch
+    wheel benefits from picker-driven concrete subjects (instead of the
+    static prompts that kept hitting "saturated" loops). The picker
+    falls back to the legacy generic question on its own when the vault
+    has nothing eligible for that slot."""
+    return _round_robin.next_question(cycle_n)
+
+
+# ---------------------------------------------------------------------------
+# (c3) Live-miss question picker — prefer real recall pain over synthetic
+# round-robin prompts. The synthetic wheel keeps autoresearch busy but
+# never targets queries the human actually fired and missed; this picker
+# closes that loop by reading the live recall ledger.
+# ---------------------------------------------------------------------------
+
+LIVE_MISS_LOOKBACK_DAYS = 14
+LIVE_MISS_RECENT_CYCLES = 3  # don't repeat a query within last N cycles
+
+
+def _recent_cycle_questions(n: int = LIVE_MISS_RECENT_CYCLES) -> set[str]:
+    """Read the front matter / first **Question:** line of the last N
+    cycle files so we can avoid re-running the same live miss query
+    twice in a row (which would burn LLM tokens without adding signal)."""
+    out: set[str] = set()
+    if not PLAYGROUND.exists():
+        return out
+    for f in sorted(PLAYGROUND.glob("cycle-*.md"), reverse=True)[:n]:
+        try:
+            text = f.read_text(errors="replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            if line.startswith("**Question:**"):
+                out.add(line.split("**Question:**", 1)[1].strip())
+                break
+    return out
+
+
+def _pick_live_miss_question() -> str | None:
+    """Return the highest-priority live miss query that hasn't been
+    targeted in the last few cycles, or None if the live ledger is
+    empty / saturated."""
+    try:
+        misses = recall_metric.top_miss_queries(
+            days=LIVE_MISS_LOOKBACK_DAYS, n=10
+        )
+    except Exception:
+        return None
+    if not misses:
+        return None
+    recent = _recent_cycle_questions()
+    for m in misses:
+        q = (m.get("query") or "").strip()
+        if q and q not in recent:
+            return q
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -467,15 +522,25 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
     program = Program.load()
 
     queue = _load_queue()
+    live_q = None if force_question else _pick_live_miss_question()
     if force_question:
         question = force_question
         from_queue = False
+        source = "forced"
+    elif live_q:
+        question = live_q
+        from_queue = False
+        source = "live_miss"
     elif queue:
         question = queue[0]
         from_queue = True
+        source = "queue"
     else:
         question = _next_round_robin(cycle_n)
         from_queue = False
+        source = "round_robin"
+    print(f"[autoresearch] cycle {cycle_n} question source={source}: "
+          f"{question[:80]}", file=sys.stderr)
 
     cycle_log = PLAYGROUND / f"cycle-{cycle_n:04d}.md"
     PLAYGROUND.mkdir(parents=True, exist_ok=True)
@@ -486,6 +551,7 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
         f"started_at: {_now()}",
         f"program_version: {program.version}",
         f"from_queue: {from_queue}",
+        f"question_source: {source}",
         "---",
         "",
         f"# Cycle {cycle_n}",
@@ -607,7 +673,8 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
 
     # research-log.md one-line summary
     metric_str = (
-        f"score: {pre.score:.3f}->{post.score:.3f} (Δ{delta['score_delta']:+.3f})"
+        f"score: {pre.score:.3f}->{post.score:.3f} (Δ{delta['score_delta']:+.3f}) "
+        f"miss: {pre.miss_rate:.3f}->{post.miss_rate:.3f}"
         if pre is not None and post is not None else "score: n/a"
     )
     line = (
@@ -635,6 +702,8 @@ def run_cycle(cycle_n: int, *, dry_run: bool = False, force_question: str | None
         "score_before": pre.score if pre is not None else None,
         "score_after": post.score if post is not None else None,
         "score_delta": delta["score_delta"] if delta is not None else None,
+        "miss_rate_before": pre.miss_rate if pre is not None else None,
+        "miss_rate_after": post.miss_rate if post is not None else None,
         "avg_top_before": pre.avg_top_score if pre is not None else None,
         "avg_top_after": post.avg_top_score if post is not None else None,
         "newly_answered": delta["flipped_to_hit"] if delta is not None else [],
@@ -668,10 +737,13 @@ def run(cycles: int = 1, *, dry_run: bool = False, force_question: str | None = 
                 "↑" if (r["score_delta"] or 0) > 0 else "·")
             avg_d = (r.get("avg_top_after") or 0) - (r.get("avg_top_before") or 0)
             avg_arrow = "↑" if avg_d > 0 else ("↓" if avg_d < 0 else "·")
+            #  `score` = continuous (1 - avg_top) since 2026-04-21, so
+            #  it always moves with avg_top. Lower-is-better; arrow ↓
+            #  is improvement.
             print(
                 f"[autoresearch] cycle {r['cycle']:>4}  "
                 f"items={r['items_written']}  "
-                f"miss-rate {r['score_before']:.3f}→{r['score_after']:.3f} "
+                f"score {r['score_before']:.3f}→{r['score_after']:.3f} "
                 f"({arrow}{abs(r['score_delta']):.3f})  "
                 f"avg-top {r.get('avg_top_before',0):.3f}→{r.get('avg_top_after',0):.3f} "
                 f"({avg_arrow}{abs(avg_d):.3f})  "

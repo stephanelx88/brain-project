@@ -22,6 +22,9 @@
         <string>{{PROJECT_DIR}}/src</string>
         <key>PATH</key>
         <string>/Users/{{USERNAME}}/.local/bin:/Users/{{USERNAME}}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <!-- The semantic worker writes to <vault>/.semantic/ via brain.semantic. -->
+        <key>BRAIN_DIR</key>
+        <string>{{BRAIN_DIR}}</string>
     </dict>
 
     <key>RunAtLoad</key>
@@ -40,12 +43,12 @@
     <integer>10</integer>
 
     <key>WorkingDirectory</key>
-    <string>{{HOME}}/.brain</string>
+    <string>{{BRAIN_DIR}}</string>
 
     <key>StandardOutPath</key>
-    <string>{{HOME}}/.brain/logs/semantic-worker.log</string>
+    <string>{{BRAIN_DIR}}/logs/semantic-worker.log</string>
 
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/.brain/logs/semantic-worker.log</string>
+    <string>{{BRAIN_DIR}}/logs/semantic-worker.log</string>
 </dict>
 </plist>

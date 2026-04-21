@@ -19,12 +19,13 @@ set -euo pipefail
 
 export PATH="{{HOME}}/.local/bin:{{HOME}}/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 export PYTHONPATH="{{PROJECT_DIR}}/src${PYTHONPATH:+:$PYTHONPATH}"
+export BRAIN_DIR="{{BRAIN_DIR}}"
 PYTHON="{{PYTHON}}"
 
-LOG_DIR="{{HOME}}/.brain/logs"
+LOG_DIR="{{BRAIN_DIR}}/logs"
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/autoresearch.log"
-LOCKDIR="{{HOME}}/.brain/.autoresearch.lock.d"
+LOCKDIR="{{BRAIN_DIR}}/.autoresearch.lock.d"
 
 if ! mkdir "$LOCKDIR" 2>/dev/null; then
   if [[ -f "$LOCKDIR/pid" ]] && kill -0 "$(cat "$LOCKDIR/pid" 2>/dev/null)" 2>/dev/null; then
@@ -37,8 +38,8 @@ fi
 echo $$ > "$LOCKDIR/pid"
 trap 'rm -rf "$LOCKDIR"' EXIT
 
-if [[ ! -f "{{HOME}}/.brain/program.md" ]]; then
-  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) SKIP: ~/.brain/program.md missing ===" >> "$LOG"
+if [[ ! -f "{{BRAIN_DIR}}/program.md" ]]; then
+  echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) SKIP: {{BRAIN_DIR}}/program.md missing ===" >> "$LOG"
   exit 0
 fi
 

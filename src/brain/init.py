@@ -1,28 +1,35 @@
 """Interactive `brain init` wizard.
 
-Collects persona (preset, name, role, optional LLM config), writes the
-result into `~/.brain/brain-config.yaml`, then delegates the mechanical
-setup (vault skeleton, MCP registration, launchd, model download) to
-`bin/install.sh`. Persona-specific entity folders and a rendered
-`identity/who-i-am.md` are applied on top.
+Two prompts only — profile + vault path. Everything else (name, role, LLM
+provider, MCP registration, launchd watcher, embedding model download)
+is auto-configured.
+
+The vault path is what the user supplies — typically an Obsidian vault.
+Brain creates `entities/`, `raw/`, `identity/`, `logs/` etc. inside it
+(side-by-side with the user's existing notes; they coexist).
+
+The chosen path is persisted three ways:
+  1. `BRAIN_DIR` export appended to the user's shell rc (~/.zshrc etc.)
+  2. Recorded in `<vault>/.brain.conf` by `bin/install.sh`
+  3. Used as the `BRAIN_DIR` env var when spawning the MCP server (so
+     Claude Code / Cursor read the right vault).
 
 Usage
 -----
-    brain init                       # interactive
-    brain init --preset doctor       # skip preset prompt
+    brain init                       # 2 prompts (profile + vault)
+    brain init --preset doctor       # skip profile prompt
     brain init --no-install          # write config + identity, skip install.sh
-    brain init --yes                 # accept all defaults (uses developer preset)
+    brain init --yes                 # CI mode — needs BRAIN_DIR env var
 
-The wizard is idempotent: re-running it preserves existing identity files
-unless `--force-identity` is passed and merges into existing
-brain-config.yaml without clobbering unrelated keys.
+Re-running is safe: existing identity files are preserved unless
+`--force-identity` is passed; brain-config.yaml is merged, not clobbered.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import shutil
+import re
 import subprocess
 import sys
 from datetime import date
@@ -34,9 +41,7 @@ import yaml
 from brain.io import atomic_write_text
 from brain.presets import list_presets, load_preset
 
-BRAIN_DIR = Path.home() / ".brain"
 PROJECT_DIR = Path(__file__).resolve().parent.parent.parent  # repo root
-CONFIG_PATH = BRAIN_DIR / "brain-config.yaml"
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -63,7 +68,7 @@ def _header(msg: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Wizard steps
+# Prompts
 # ─────────────────────────────────────────────────────────────────────────
 def _ensure_questionary():
     """Import questionary lazily so the module loads even when the dep is
@@ -100,13 +105,13 @@ def _pick_preset(q, forced_slug: str | None) -> dict[str, Any]:
     presets = list_presets()
     choices = [
         q.Choice(
-            title=f"{p['display_name']:<32} — {p['description']}",
+            title=f"{p['display_name']:<24} — {p['description']}",
             value=p["_slug"],
         )
         for p in presets
     ]
     slug = q.select(
-        "What's your field?",
+        "Pick your profile:",
         choices=choices,
         instruction="(↑↓ to move, ⏎ to select)",
     ).unsafe_ask()
@@ -126,32 +131,41 @@ def _collect_custom_types(q) -> list[dict[str, str]]:
     ]
 
 
-def _collect_identity(q, preset: dict[str, Any]) -> dict[str, str]:
-    name = q.text("Your name:", default=_detect_default_name()).unsafe_ask()
-    role = q.text(
-        "Your role:",
-        default=preset["identity"].get("role_hint", ""),
-    ).unsafe_ask()
-    return {"name": name.strip(), "role": role.strip(), "field": preset["identity"].get("field", "")}
+def _ask_vault_path(q) -> Path:
+    """Prompt for vault path. Required, no default — user must supply.
 
+    Accepts ~ and $VARS. Creates the folder if missing. Returns the
+    resolved absolute Path.
+    """
+    def _validate(v: str) -> bool | str:
+        v = v.strip()
+        if not v:
+            return "Vault path is required."
+        # Don't fail-fast on non-existence — we'll create it. Just sanity-check
+        # that the parent is reachable.
+        try:
+            p = Path(os.path.expandvars(os.path.expanduser(v)))
+            if not p.parent.exists():
+                return f"Parent folder doesn't exist: {p.parent}"
+        except Exception as e:
+            return f"Invalid path: {e}"
+        return True
 
-def _collect_llm(q) -> dict[str, str]:
-    provider = q.select(
-        "LLM provider for extraction (you can change later):",
-        choices=[
-            q.Choice("Claude (Anthropic) — recommended", value="claude"),
-            q.Choice("OpenAI", value="openai"),
-            q.Choice("Local (Ollama)", value="ollama"),
-            q.Choice("Skip — set up later", value="skip"),
-        ],
+    raw = q.text(
+        "Vault path (your Obsidian vault, or any folder):",
+        instruction="(absolute path, e.g. ~/Documents/MyVault)",
+        validate=_validate,
     ).unsafe_ask()
-    return {"provider": provider}
+    p = Path(os.path.expandvars(os.path.expanduser(raw.strip())))
+    p.mkdir(parents=True, exist_ok=True)
+    return p.resolve()
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Apply collected data to disk
+# Persistence: brain-config.yaml, shell rc, identity
 # ─────────────────────────────────────────────────────────────────────────
 def _merge_config(
+    vault: Path,
     preset: dict[str, Any],
     entity_types: list[dict[str, str]],
     identity: dict[str, str],
@@ -159,27 +173,25 @@ def _merge_config(
 ) -> dict[str, Any]:
     """Read existing brain-config.yaml (if any) and overlay persona keys.
     Never drops unrelated keys."""
-    BRAIN_DIR.mkdir(parents=True, exist_ok=True)
+    vault.mkdir(parents=True, exist_ok=True)
+    config_path = vault / "brain-config.yaml"
     existing: dict[str, Any] = {}
-    if CONFIG_PATH.exists():
+    if config_path.exists():
         try:
-            loaded = yaml.safe_load(CONFIG_PATH.read_text())
+            loaded = yaml.safe_load(config_path.read_text())
         except yaml.YAMLError:
             loaded = None
         if isinstance(loaded, dict):
             existing = loaded
         else:
-            # Unparseable OR parsed to a non-dict (e.g. accidental list/string).
-            # Either way it's unusable; back it up and start fresh.
-            _warn(f"existing {CONFIG_PATH} unusable — backing up to .bak")
-            CONFIG_PATH.rename(CONFIG_PATH.with_suffix(".yaml.bak"))
+            _warn(f"existing {config_path} unusable — backing up to .bak")
+            config_path.rename(config_path.with_suffix(".yaml.bak"))
             existing = {}
 
     existing.setdefault("version", "0.1.0")
     existing.setdefault("reconciliation_interval_hours", 2)
     existing.setdefault("auto_commit", True)
-    if llm["provider"] != "skip":
-        existing["llm_provider"] = llm["provider"]
+    existing.setdefault("llm_provider", llm["provider"])
     existing.setdefault("models", {
         "extraction": "sonnet",
         "reconciliation": "sonnet",
@@ -196,31 +208,33 @@ def _merge_config(
     return existing
 
 
-def _write_config(cfg: dict[str, Any]) -> None:
+def _write_config(vault: Path, cfg: dict[str, Any]) -> None:
+    config_path = vault / "brain-config.yaml"
     atomic_write_text(
-        CONFIG_PATH,
+        config_path,
         "# Generated and updated by `brain init`. Hand-edits preserved on re-run.\n"
         + yaml.safe_dump(cfg, sort_keys=False, default_flow_style=False),
     )
-    _ok(f"wrote {CONFIG_PATH}")
+    _ok(f"wrote {config_path}")
 
 
-def _create_entity_dirs(types: list[dict[str, str]]) -> None:
-    ent = BRAIN_DIR / "entities"
+def _create_entity_dirs(vault: Path, types: list[dict[str, str]]) -> None:
+    ent = vault / "entities"
     ent.mkdir(parents=True, exist_ok=True)
     for t in types:
         (ent / t["name"]).mkdir(exist_ok=True)
-    _ok(f"created {len(types)} entity folders under entities/")
+    _ok(f"created {len(types)} entity folders under {ent}/")
 
 
 def _render_who_i_am(
+    vault: Path,
     preset: dict[str, Any],
     identity: dict[str, str],
     force: bool,
 ) -> None:
     """Write identity/who-i-am.md from the preset. Skip if file already
     exists and `--force-identity` was not passed."""
-    dst = BRAIN_DIR / "identity" / "who-i-am.md"
+    dst = vault / "identity" / "who-i-am.md"
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and not force:
         _info(f"skipped {dst} (exists; pass --force-identity to overwrite)")
@@ -256,14 +270,80 @@ def _render_who_i_am(
     _ok(f"wrote {dst}")
 
 
-def _run_install_sh() -> int:
+# ─────────────────────────────────────────────────────────────────────────
+# Shell rc: persist `export BRAIN_DIR=…` so future shells see it
+# ─────────────────────────────────────────────────────────────────────────
+_RC_BEGIN = "# >>> brain vault >>>"
+_RC_END = "# <<< brain vault <<<"
+
+
+def _shell_rc_path() -> Path:
+    shell = os.environ.get("SHELL", "/bin/zsh").rsplit("/", 1)[-1]
+    home = Path.home()
+    if shell == "zsh":
+        return home / ".zshrc"
+    if shell == "bash":
+        return home / ".bashrc"
+    return home / ".profile"
+
+
+def _persist_brain_dir_to_shell_rc(vault: Path) -> Path:
+    """Append (or replace) `export BRAIN_DIR="…"` block in the user's
+    shell rc. Returns the rc path so we can tell the user."""
+    rc = _shell_rc_path()
+    line = f'export BRAIN_DIR="{vault}"'
+    block = f"{_RC_BEGIN}\n{line}\n{_RC_END}\n"
+
+    if rc.exists() and _RC_BEGIN in rc.read_text():
+        text = rc.read_text()
+        text = re.sub(
+            rf"{re.escape(_RC_BEGIN)}.*?{re.escape(_RC_END)}\n",
+            block,
+            text,
+            flags=re.S,
+        )
+        rc.write_text(text)
+        _ok(f"updated BRAIN_DIR in {rc}")
+    else:
+        with rc.open("a") as f:
+            f.write(f"\n{block}")
+        _ok(f"added BRAIN_DIR export to {rc}")
+    return rc
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Detect & confirm an existing vault
+# ─────────────────────────────────────────────────────────────────────────
+def _detect_existing_vault() -> Path | None:
+    """Return the vault path from a prior install, or None.
+
+    Resolution order:
+      1. $BRAIN_DIR env var (current shell)
+      2. shell rc block we wrote previously
+    """
+    raw = os.environ.get("BRAIN_DIR")
+    if raw:
+        return Path(os.path.expandvars(os.path.expanduser(raw))).resolve()
+    rc = _shell_rc_path()
+    if rc.exists():
+        m = re.search(r'export BRAIN_DIR="([^"]+)"', rc.read_text())
+        if m:
+            return Path(os.path.expandvars(os.path.expanduser(m.group(1)))).resolve()
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# install.sh hand-off
+# ─────────────────────────────────────────────────────────────────────────
+def _run_install_sh(vault: Path) -> int:
     sh = PROJECT_DIR / "bin" / "install.sh"
     if not sh.exists():
         _warn(f"{sh} not found — skipping mechanical install")
         return 0
     _info("delegating to bin/install.sh for vault + MCP + launchd setup …")
     print()
-    return subprocess.call(["bash", str(sh)])
+    env = {**os.environ, "BRAIN_DIR": str(vault)}
+    return subprocess.call(["bash", str(sh)], env=env)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -275,23 +355,31 @@ def main(argv: list[str] | None = None) -> int:
         description="Interactive setup wizard for the brain.",
     )
     p.add_argument("--preset", help="Skip preset prompt (e.g. developer, doctor).")
+    p.add_argument("--vault", help="Vault path (skips the vault prompt).")
     p.add_argument("--no-install", action="store_true",
                    help="Write config + identity, skip bin/install.sh.")
     p.add_argument("--force-identity", action="store_true",
                    help="Overwrite identity/who-i-am.md even if it exists.")
     p.add_argument("--yes", "-y", action="store_true",
-                   help="Non-interactive: accept defaults (developer preset).")
+                   help="Non-interactive (CI). Requires --vault or $BRAIN_DIR.")
     args = p.parse_args(argv)
 
     _header("👋  brain init  —  set up your second brain")
-    _info(f"vault    : {BRAIN_DIR}")
-    _info(f"project  : {PROJECT_DIR}")
 
-    if BRAIN_DIR.exists() and any(BRAIN_DIR.iterdir()):
-        _warn(f"{BRAIN_DIR} already exists. Re-running is safe — existing data is preserved.")
+    # ── Resolve vault: --vault flag > $BRAIN_DIR/rc > prompt ─────────
+    vault: Path | None = None
+    if args.vault:
+        vault = Path(os.path.expandvars(os.path.expanduser(args.vault))).resolve()
+    elif args.yes:
+        existing = _detect_existing_vault()
+        if not existing:
+            _err("--yes requires --vault or $BRAIN_DIR set.")
+            return 2
+        vault = existing
 
     # ── Non-interactive shortcut ──────────────────────────────────────
     if args.yes:
+        assert vault is not None
         preset_slug = args.preset or "developer"
         preset = load_preset(preset_slug)
         identity = {
@@ -304,41 +392,68 @@ def main(argv: list[str] | None = None) -> int:
     else:
         q = _ensure_questionary()
         try:
-            _header("1. Pick a profile")
+            # Existing-vault confirmation (only if user didn't pass --vault)
+            if vault is None:
+                detected = _detect_existing_vault()
+                if detected and detected.exists():
+                    keep = q.confirm(
+                        f"Found existing vault at {detected}. Keep using it?",
+                        default=True,
+                    ).unsafe_ask()
+                    if keep:
+                        vault = detected
+
+            step = 1
+            _header(f"{step}. Profile")
             preset = _pick_preset(q, args.preset)
+            step += 1
 
             if preset["_slug"] == "custom" or not preset["entity_types"]:
-                _header("2. Custom entity types")
+                _header(f"{step}. Custom entity types")
                 types = _collect_custom_types(q)
+                step += 1
             else:
                 types = preset["entity_types"]
 
-            _header("3. Identity")
-            identity = _collect_identity(q, preset)
+            if vault is None:
+                _header(f"{step}. Vault")
+                vault = _ask_vault_path(q)
 
-            _header("4. LLM")
-            llm = _collect_llm(q)
+            identity = {
+                "name": _detect_default_name(),
+                "role": preset["identity"].get("role_hint", ""),
+                "field": preset["identity"].get("field", ""),
+            }
+            llm = {"provider": "claude"}
         except KeyboardInterrupt:
             _err("aborted")
             return 130
 
+    assert vault is not None
+
     # ── Apply ─────────────────────────────────────────────────────────
     _header("Applying configuration")
-    cfg = _merge_config(preset, types, identity, llm)
-    _write_config(cfg)
-    _create_entity_dirs(types)
-    _render_who_i_am(preset, identity, force=args.force_identity)
+    _info(f"vault    : {vault}")
+    _info(f"profile  : {preset['_slug']} ({preset.get('display_name', '')})")
+    _info(f"identity : {identity['name']} — {identity['role']}")
+
+    cfg = _merge_config(vault, preset, types, identity, llm)
+    _write_config(vault, cfg)
+    _create_entity_dirs(vault, types)
+    _render_who_i_am(vault, preset, identity, force=args.force_identity)
+    _persist_brain_dir_to_shell_rc(vault)
 
     if not args.no_install:
         _header("Running installer")
-        rc = _run_install_sh()
+        rc = _run_install_sh(vault)
         if rc != 0:
             _err(f"bin/install.sh exited {rc}")
             return rc
 
     _header("Done")
     _ok("Restart Claude Code / Cursor to pick up the brain MCP tools.")
-    _info(f"Re-run anytime: brain init   ·   diagnose: brain doctor")
+    _info(f"Open a new shell (or `source {_shell_rc_path()}`) so $BRAIN_DIR is loaded.")
+    _info("Re-run anytime: brain init   ·   diagnose: brain doctor")
     return 0
 
 

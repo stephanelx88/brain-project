@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# brain — Cursor sessionStart hook
+#
+# Mirrors the Claude SessionStart wiring (~/.claude/settings.json) so a
+# fresh Cursor session gets:
+#   1. A background harvest pass (so the just-ended Claude/Cursor session
+#      is on disk before this new session starts asking questions).
+#   2. The top-N audit block injected into the agent's initial system
+#      context — same single-screenful surface Claude already gets.
+#
+# Cursor contract (fire-and-forget):
+#   stdin  : {"session_id": "...", "is_background_agent": bool,
+#             "composer_mode": "agent"|"ask"|"edit"}
+#   stdout : {"additional_context": "<text>"}   (or {} for silence)
+#   exit 0 : always — a noisy hook would block session startup, and
+#            an audit failure isn't a reason to refuse the session.
+#
+# Background-agent skip: BG agents have no human reading the surface,
+# so we only do the harvest side-effect and emit empty JSON.
+
+set -uo pipefail
+
+PYTHON="{{PYTHON}}"
+PROJECT_SRC="{{PROJECT_DIR}}/src"
+BRAIN_DIR="{{BRAIN_DIR}}"
+LOG="$BRAIN_DIR/logs/cursor-session-start.log"
+mkdir -p "$(dirname "$LOG")"
+
+export PYTHONPATH="$PROJECT_SRC${PYTHONPATH:+:$PYTHONPATH}"
+export BRAIN_DIR
+
+# Read & discard stdin so Cursor's writer doesn't get EPIPE. We use the
+# `is_background_agent` flag below if jq is around, but it's optional.
+INPUT="$(cat 2>/dev/null || true)"
+
+is_bg="false"
+if command -v jq >/dev/null 2>&1; then
+  is_bg="$(printf '%s' "$INPUT" | jq -r '.is_background_agent // false' 2>/dev/null || echo false)"
+fi
+
+# Harvest runs in the background — never blocks session startup.
+# Output is silenced (we don't want it leaking into the JSON we emit on
+# stdout); errors land in the log.
+( "$PYTHON" -m brain.harvest_session >>"$LOG" 2>&1 ) &
+disown
+
+if [[ "$is_bg" == "true" ]]; then
+  # Background agent — no human is watching, skip surface.
+  printf '{}\n'
+  exit 0
+fi
+
+# brain.audit prints the block to stdout (or nothing if the brain is
+# clean). Always exit 0; we'd rather surface no audit than fail the hook.
+AUDIT_BLOCK="$("$PYTHON" -m brain.audit --limit 3 2>>"$LOG" || true)"
+
+if [[ -z "${AUDIT_BLOCK//[[:space:]]/}" ]]; then
+  printf '{}\n'
+  exit 0
+fi
+
+# Self-documenting directive: embed the surface-once rule INSIDE the
+# injected context so the agent knows what to do even when User Rules
+# weren't pasted into Cursor → Settings → Rules (the only way Cursor
+# accepts global agent rules — fragile, easily stale). Claude already
+# gets this rule from ~/.claude/CLAUDE.md, but duplicating it here is
+# harmless and makes the Cursor path independent of manual setup.
+DIRECTIVE='[agent — first reply only]: Prepend a single-line FYI to your reply stating the count and (optionally) the first item, e.g. "_FYI — brain has N items pending review (top: <label>). Say `audit` to walk through them._" Do not list every item. Do not nag on subsequent turns. If the user says `audit` / `show`, call brain_audit(limit=10).'
+
+# Emit JSON with `additional_context`. Use Python for safe escaping —
+# avoids jq-as-a-dependency and handles every quoting edge case
+# (passed via env so no shell-quoting can corrupt the payload).
+BRAIN_AUDIT_BLOCK="$AUDIT_BLOCK" BRAIN_AUDIT_DIRECTIVE="$DIRECTIVE" "$PYTHON" - <<'PY'
+import json, os
+block = os.environ.get("BRAIN_AUDIT_BLOCK", "")
+directive = os.environ.get("BRAIN_AUDIT_DIRECTIVE", "")
+payload = f"{block}\n{directive}\n" if directive else block
+print(json.dumps({"additional_context": payload}))
+PY

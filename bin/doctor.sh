@@ -139,6 +139,46 @@ else
   warn "  fix: claude mcp add brain -s user -e PYTHONPATH=$PROJECT_DIR/src -- $PYTHON -m brain.mcp_server"
 fi
 
+# SessionStart hooks: both files are JSON-merged by install.sh, so a
+# missing brain entry means the install ran before hook support shipped
+# OR the user nuked it. Either way doctor flags it; uninstall sets the
+# expected state to "absent" so we don't false-positive after teardown.
+SETTINGS="$HOME/.claude/settings.json"
+if [[ -f "$SETTINGS" ]] && grep -q "brain.audit" "$SETTINGS"; then
+  ok "Claude SessionStart hook wired (audit + harvest)"
+elif [[ -d "$HOME/.claude" ]]; then
+  warn "Claude SessionStart hook NOT wired in $SETTINGS"
+  warn "  fix: cd $PROJECT_DIR && bash bin/install.sh"
+fi
+
+CURSOR_HOOKS="$HOME/.cursor/hooks.json"
+if [[ -f "$CURSOR_HOOKS" ]] && grep -q "cursor-session-start.sh" "$CURSOR_HOOKS"; then
+  ok "Cursor sessionStart hook wired (audit + harvest)"
+  if [[ ! -x "$BRAIN_DIR/bin/cursor-session-start.sh" ]]; then
+    bad "  but $BRAIN_DIR/bin/cursor-session-start.sh is missing or not executable"
+  fi
+elif [[ -d "$HOME/.cursor" ]]; then
+  warn "Cursor sessionStart hook NOT wired in $CURSOR_HOOKS"
+  warn "  fix: cd $PROJECT_DIR && bash bin/install.sh"
+fi
+
+# Cursor user rules: stored opaquely in app settings, so we can't verify
+# the user actually pasted them. Best-effort: warn if the rendered file is
+# newer than the template (template just got an edit + re-render but
+# user hasn't re-pasted yet) OR newer than a 7-day cutoff (gentle nudge).
+CURSOR_RULES_RENDERED="$BRAIN_DIR/cursor-user-rules.md"
+CURSOR_RULES_TMPL="$PROJECT_DIR/templates/cursor/USER_RULES.md.tmpl"
+if [[ -d "$HOME/.cursor" && -f "$CURSOR_RULES_RENDERED" && -f "$CURSOR_RULES_TMPL" ]]; then
+  if [[ "$CURSOR_RULES_TMPL" -nt "$CURSOR_RULES_RENDERED" ]]; then
+    warn "Cursor user rules template updated since last render — re-run install.sh"
+  else
+    # Cursor stores user rules in opaque app state; we can only remind.
+    ok "Cursor user rules rendered ($CURSOR_RULES_RENDERED)"
+    warn "  reminder: paste into Cursor → Settings → Rules → User Rules if not done"
+    warn "  copy: pbcopy < $CURSOR_RULES_RENDERED"
+  fi
+fi
+
 hdr "4. data integrity"
 if [[ -f "$DB" ]]; then
   ROWS=$("$PYTHON" -c "import sqlite3; c=sqlite3.connect('$DB'); print(c.execute('SELECT COUNT(*) FROM entities').fetchone()[0], c.execute('SELECT COUNT(*) FROM facts').fetchone()[0], c.execute('SELECT COUNT(*) FROM notes').fetchone()[0])" 2>/dev/null)

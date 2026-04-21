@@ -13,7 +13,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{{HOME}}/.brain/bin/autoresearch-tick.sh</string>
+        <string>{{BRAIN_DIR}}/bin/autoresearch-tick.sh</string>
     </array>
 
     <!-- 30 minutes. Coarser than auto-extract's 5-min safety poll
@@ -40,12 +40,19 @@
     <integer>15</integer>
 
     <key>WorkingDirectory</key>
-    <string>{{HOME}}/.brain</string>
+    <string>{{BRAIN_DIR}}</string>
 
     <key>StandardOutPath</key>
-    <string>{{HOME}}/.brain/logs/autoresearch-launchd.log</string>
+    <string>{{BRAIN_DIR}}/logs/autoresearch-launchd.log</string>
 
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/.brain/logs/autoresearch-launchd.log</string>
+    <string>{{BRAIN_DIR}}/logs/autoresearch-launchd.log</string>
+
+    <!-- Inject BRAIN_DIR so brain.config picks up the user's chosen vault. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BRAIN_DIR</key>
+        <string>{{BRAIN_DIR}}</string>
+    </dict>
 </dict>
 </plist>

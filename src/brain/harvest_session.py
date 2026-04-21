@@ -4,8 +4,9 @@
 Scans all project JSONL files in ~/.claude/projects/, skips already-harvested
 sessions, and writes structured summaries to ~/.brain/raw/ for extraction.
 
-Called by the SessionStart hook in ~/.claude/settings.json.
-Runs on every new session — harvests whatever ended since last time.
+Called by the SessionStart hooks in `~/.claude/settings.json` and
+`~/.cursor/hooks.json` (both auto-wired by `bin/install.sh`). Runs on
+every new session — harvests whatever ended since last time.
 
 Incremental mode (the default now): a SQLite ledger at
 `~/.brain/.harvest.db` records `(session_id → (path, last_byte_offset,

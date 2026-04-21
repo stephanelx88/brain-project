@@ -293,3 +293,122 @@ def test_brain_live_sessions_include_self_returns_all(tmp_path, monkeypatch):
     out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300, include_self=True))
     sids = {r["session_id"] for r in out}
     assert sids == {"claude-self", "claude-peer"}
+
+
+# ---------- brain_recall envelope + weak_match ---------------------------
+
+def _call_brain_recall_with_stubbed_hits(monkeypatch, hits, *,
+                                         query="q", env=None):
+    """Stub out the semantic layer so brain_recall returns `hits` verbatim.
+
+    Yields the parsed JSON envelope. Avoids pulling torch / the real
+    embedding index into the unit test.
+    """
+    from brain import mcp_server
+
+    class _FakeSemantic:
+        @staticmethod
+        def ensure_built():
+            pass
+
+        @staticmethod
+        def hybrid_search(q, k=8, type=None):
+            return list(hits)
+
+    monkeypatch.setattr(mcp_server, "_semantic", lambda: _FakeSemantic)
+
+    class _NoLog:
+        @staticmethod
+        def log_live_recall(q):
+            pass
+
+    monkeypatch.setattr(
+        "brain.recall_metric.log_live_recall",
+        _NoLog.log_live_recall,
+        raising=False,
+    )
+    for key, val in (env or {}).items():
+        monkeypatch.setenv(key, val)
+    return json.loads(mcp_server.brain_recall(query))
+
+
+def test_brain_recall_envelope_has_expected_keys(monkeypatch):
+    out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
+        {"kind": "fact", "name": "Foo", "text": "alpha", "rrf": 0.08},
+    ])
+    assert set(out.keys()) == {"query", "weak_match", "top_score",
+                               "threshold", "guidance", "hits"}
+    assert out["query"] == "q"
+    assert isinstance(out["hits"], list)
+
+
+def test_brain_recall_strong_match_clears_weak_flag(monkeypatch):
+    out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
+        {"kind": "fact", "name": "Foo", "text": "alpha", "rrf": 0.08},
+        {"kind": "fact", "name": "Bar", "text": "beta", "rrf": 0.05},
+    ])
+    assert out["weak_match"] is False
+    assert out["guidance"] is None
+    assert out["top_score"] == 0.08
+    assert len(out["hits"]) == 2
+
+
+def test_brain_recall_weak_match_flags_and_guides(monkeypatch):
+    #  0.026 matches the real "đôi dép tôi đâu" failure (2026-04-21).
+    out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
+        {"kind": "note", "path": "Thuha va Trinh.md",
+         "snippet": "gio ho ve long xuyen roi", "rrf": 0.026},
+        {"kind": "fact", "name": "Other", "text": "x", "rrf": 0.025},
+    ])
+    assert out["weak_match"] is True
+    assert out["top_score"] == 0.026
+    assert out["guidance"] is not None
+    #  Guidance must steer the agent away from fabrication.
+    assert "fabricate" in out["guidance"].lower() \
+        or "not literally" in out["guidance"].lower() \
+        or "do not" in out["guidance"].lower()
+
+
+def test_brain_recall_empty_result_is_flagged_weak(monkeypatch):
+    out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[])
+    assert out["weak_match"] is True
+    assert out["top_score"] == 0.0
+    assert out["hits"] == []
+    assert out["guidance"] and "no record" in out["guidance"].lower()
+
+
+def test_brain_recall_threshold_boundary_just_above(monkeypatch):
+    #  Top score exactly at default threshold (0.035) must NOT flag weak.
+    out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
+        {"kind": "fact", "name": "A", "text": "t", "rrf": 0.035},
+    ])
+    assert out["weak_match"] is False
+    assert out["top_score"] == 0.035
+
+
+def test_brain_recall_threshold_boundary_just_below(monkeypatch):
+    out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
+        {"kind": "fact", "name": "A", "text": "t", "rrf": 0.0349},
+    ])
+    assert out["weak_match"] is True
+
+
+def test_brain_recall_threshold_env_override(monkeypatch):
+    #  Raise the bar so a previously-strong score is now weak.
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        hits=[{"kind": "fact", "name": "A", "text": "t", "rrf": 0.05}],
+        env={"BRAIN_RECALL_WEAK_RRF": "0.08"},
+    )
+    assert out["weak_match"] is True
+    assert out["threshold"] == 0.08
+
+
+def test_brain_recall_threshold_env_invalid_falls_back_to_default(monkeypatch):
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        hits=[{"kind": "fact", "name": "A", "text": "t", "rrf": 0.05}],
+        env={"BRAIN_RECALL_WEAK_RRF": "not-a-number"},
+    )
+    assert out["weak_match"] is False
+    assert out["threshold"] == 0.035

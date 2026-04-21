@@ -4,7 +4,9 @@
 # Removes:
 #   - launchd job + plist
 #   - Claude Code MCP registration
+#   - Claude SessionStart hook entry in ~/.claude/settings.json
 #   - Cursor MCP registration (brain entry in ~/.cursor/mcp.json)
+#   - Cursor sessionStart hook entry in ~/.cursor/hooks.json
 #   - generated scripts in ~/.brain/bin/
 #   - generated CLAUDE.md (restoring backup if one exists)
 #   - generated cursor-user-rules.md
@@ -62,17 +64,20 @@ for label_plist in \
   fi
 done
 
-echo "[2/5] MCP registrations"
+echo "[2/5] MCP registrations + SessionStart hooks"
 if command -v claude >/dev/null 2>&1; then
   claude mcp remove brain -s user >/dev/null 2>&1 || true
-  echo "      ✓ Claude Code deregistered"
+  echo "      ✓ Claude Code MCP deregistered"
 else
   echo "      - claude CLI not installed; skip"
 fi
 
 if [[ -n "$PYTHON" && -x "$PYTHON" ]]; then
+  # Cursor MCP registration is independent of hooks — drop it inline
+  # (uses the same JSON tools as brain.install_hooks; kept here so this
+  # script still works after `pip uninstall brain` runs in step [4/5]).
   "$PYTHON" - <<'PY'
-import json, os, sys
+import json, os, shutil, sys, time
 
 cfg = os.path.expanduser("~/.cursor/mcp.json")
 if not os.path.exists(cfg):
@@ -84,21 +89,35 @@ except json.JSONDecodeError:
     print("      ! ~/.cursor/mcp.json not valid JSON; skip")
     sys.exit(0)
 servers = data.get("mcpServers", {})
-if "brain" not in servers:
-    sys.exit(0)
-del servers["brain"]
-with open(cfg, "w") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-print("      ✓ Cursor deregistered (~/.cursor/mcp.json)")
+if "brain" in servers:
+    shutil.copy2(cfg, f"{cfg}.bak.{time.strftime('%Y%m%d%H%M%S')}")
+    del servers["brain"]
+    with open(cfg, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    print(f"      ✓ Cursor MCP deregistered ({cfg})")
 PY
+
+  # SessionStart hooks — drop brain entries from both Claude + Cursor
+  # using the same module that wired them. Safe even if brain itself is
+  # already pip-uninstalled (PYTHONPATH points at the source tree).
+  if [[ -d "${PROJECT_DIR:-}/src/brain" ]]; then
+    PYTHONPATH="${PROJECT_DIR}/src${PYTHONPATH:+:$PYTHONPATH}" \
+      "$PYTHON" -m brain.install_hooks remove
+  else
+    "$PYTHON" -m brain.install_hooks remove 2>/dev/null || \
+      echo "      - brain module unavailable; SessionStart hooks left in place (edit ~/.claude/settings.json + ~/.cursor/hooks.json by hand)"
+  fi
 fi
 
 echo "[3/5] generated files"
 rm -f "$BRAIN_DIR/bin/auto-extract.sh" \
       "$BRAIN_DIR/bin/autoresearch-tick.sh" \
+      "$BRAIN_DIR/bin/cursor-session-start.sh" \
       "$BRAIN_DIR/bin/doctor.sh" \
       "$BRAIN_DIR/.brain.conf" \
+      "$BRAIN_DIR/.claude-settings.brain.json" \
+      "$BRAIN_DIR/.cursor-hooks.brain.json" \
       "$BRAIN_DIR/cursor-user-rules.md"
 echo "      ✓ removed scripts + conf"
 

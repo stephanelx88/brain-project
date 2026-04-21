@@ -263,16 +263,39 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     semantic = _semantic()
     semantic.ensure_built()
     results = semantic.hybrid_search(query, k=k, type=type)
-    #  Live recall-ledger mode: every real call Son fires lands in
-    #  ~/.brain/recall-ledger.jsonl with its top cosine score, so
-    #  `recall_metric.live_coverage()` can report rolling coverage
-    #  computed from actual usage (not the synthetic eval set).
     try:
         from brain import recall_metric
         recall_metric.log_live_recall(query)
     except Exception:
         pass
-    return json.dumps(results, ensure_ascii=False, indent=2)
+
+    import os as _os
+    try:
+        threshold = float(_os.environ.get("BRAIN_RECALL_WEAK_RRF", "0.035"))
+    except (ValueError, TypeError):
+        threshold = 0.035
+    top_score = max((h.get("rrf") or 0.0 for h in results), default=0.0)
+    weak_match = top_score < threshold
+    if not results:
+        guidance = "The brain has no record of this."
+    elif weak_match:
+        guidance = (
+            "Hits are below the confidence threshold — do not fabricate answers "
+            "or paraphrase hits as answers. Name the file only; do not bridge "
+            "from a hit to an answer."
+        )
+    else:
+        guidance = None
+
+    envelope = {
+        "query": query,
+        "weak_match": weak_match,
+        "top_score": top_score,
+        "threshold": threshold,
+        "guidance": guidance,
+        "hits": results,
+    }
+    return json.dumps(envelope, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

@@ -1,0 +1,20 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "PYTHONPATH={{PROJECT_DIR}}/src BRAIN_DIR={{BRAIN_DIR}} {{PYTHON}} -m brain.harvest_session",
+            "timeout": 10000
+          },
+          {
+            "type": "command",
+            "command": "PYTHONPATH={{PROJECT_DIR}}/src BRAIN_DIR={{BRAIN_DIR}} {{PYTHON}} -m brain.audit",
+            "timeout": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

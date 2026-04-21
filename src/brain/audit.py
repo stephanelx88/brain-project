@@ -3,7 +3,9 @@
 The reconcile pass produces a long-form report; this module reduces that
 to the **3 most important things to look at right now** so the SessionStart
 hook can show them as a single screenful at the top of every Claude/Cursor
-session.
+session. Both hooks (`~/.claude/settings.json` and `~/.cursor/hooks.json`)
+are auto-wired by `bin/install.sh`; this module is the single source of
+truth for what either of them prints.
 
 Ranking: contested facts first (you've already flagged them as wrong),
 then pending dedupe merges from the ledger (LLM judge already said
@@ -16,6 +18,15 @@ cross-checked against on-disk file status — so an item disappears the
 moment its merge lands or one side gets archived, instead of nagging
 the user about already-resolved proposals.
 
+Low-confidence items get a separate de-nagging knob: once the user
+walks one via `brain audit` and picks `keep`, we stamp
+`reviewed: YYYY-MM-DD` into the entity's frontmatter and suppress it
+from the surface for `REVIEW_DECAY_DAYS` (default 90). After the decay
+window it re-surfaces — facts genuinely do go stale, so a recheck on a
+yearly-ish cadence is a feature, not a bug. `contest` flips the same
+entity into the contested bucket so it's still surfaced (as the higher-
+priority kind) until resolved.
+
 Output is intentionally <10 lines and *empty* when there's nothing to
 audit — empty stdout means the SessionStart hook adds zero context noise
 to a clean brain.
@@ -23,6 +34,10 @@ to a clean brain.
 Public API:
   top_n(limit=3) -> list[AuditItem]
   format_for_session(items) -> str   # the block injected into agent context
+  walk(items) -> dict[str,int]        # interactive walker (`brain audit`)
+  mark_reviewed(path) -> bool         # stamp frontmatter, suppress 90d
+  mark_contested(path) -> bool        # flip into contested bucket
+  resolve_contested(path) -> bool     # clear `status: contested`
   main() -> int                       # CLI: `python -m brain.audit`
 """
 
@@ -30,7 +45,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 
 import brain.config as config
@@ -43,6 +59,21 @@ class AuditItem:
     label: str          # one-line human-readable
     detail: str = ""    # optional second line (path / reason)
     priority: int = 0   # higher = surface first
+    # Path to the underlying entity file when there is one (low_confidence
+    # + contested). Dedupe items have two paths and stay None — the walker
+    # falls back to instructing the user to run `brain reconcile`.
+    path: Path | None = None
+    # Extra context the walker may need without re-parsing the label/detail
+    # (e.g. dedupe ledger key). Kept generic so future kinds can attach
+    # whatever they need without growing the dataclass.
+    extra: dict = field(default_factory=dict)
+
+
+# How many days a `reviewed: YYYY-MM-DD` stamp suppresses an item from the
+# low-confidence surface. After this window the item re-surfaces because a
+# fact that was true 90 days ago is no longer guaranteed to still be true,
+# and the whole point of this signal is "decayed single-source claims".
+REVIEW_DECAY_DAYS = 90
 
 
 _FRONTMATTER_STATUS = re.compile(
@@ -53,6 +84,9 @@ _FRONTMATTER_STATUS = re.compile(
     r"\A---\s*\n(.*?)\n---\s*\n",
     re.DOTALL,
 )
+_REVIEWED_LINE = re.compile(r"^\s*reviewed\s*:\s*(\d{4}-\d{2}-\d{2})\s*$",
+                            re.MULTILINE)
+_STATUS_LINE = re.compile(r"^\s*status\s*:.*$", re.MULTILINE)
 
 
 def _has_contested_frontmatter(text: str) -> bool:
@@ -63,6 +97,99 @@ def _has_contested_frontmatter(text: str) -> bool:
         if re.match(r"\s*status\s*:\s*contested\b", line):
             return True
     return False
+
+
+def _reviewed_recently(text: str, today: date | None = None) -> bool:
+    """True if frontmatter has `reviewed: YYYY-MM-DD` within the decay window.
+
+    A malformed date silently fails closed (returns False) so a hand-edit
+    typo can never permanently hide an item.
+    """
+    m = _FRONTMATTER_STATUS.match(text)
+    if not m:
+        return False
+    rm = _REVIEWED_LINE.search(m.group(1))
+    if not rm:
+        return False
+    try:
+        reviewed_on = date.fromisoformat(rm.group(1))
+    except ValueError:
+        return False
+    today = today or date.today()
+    age = (today - reviewed_on).days
+    return 0 <= age < REVIEW_DECAY_DAYS
+
+
+def _set_frontmatter_field(text: str, key: str, value: str) -> str:
+    """Insert-or-update a single `key: value` line inside the YAML
+    frontmatter. Synthesises a minimal frontmatter block if none exists.
+    Preserves all other lines (and the body) verbatim.
+    """
+    new_line = f"{key}: {value}"
+    line_re = re.compile(rf"^\s*{re.escape(key)}\s*:.*$", re.MULTILINE)
+    m = _FRONTMATTER_STATUS.match(text)
+    if not m:
+        return f"---\n{new_line}\n---\n\n" + text
+    fm = m.group(1)
+    if line_re.search(fm):
+        new_fm = line_re.sub(new_line, fm, count=1)
+    else:
+        new_fm = fm.rstrip() + "\n" + new_line
+    return "---\n" + new_fm + "\n---\n" + text[m.end():]
+
+
+def _drop_frontmatter_field(text: str, key: str) -> str:
+    """Remove a single `key: value` line from the frontmatter if present.
+    No-op when the key (or the frontmatter itself) isn't there."""
+    m = _FRONTMATTER_STATUS.match(text)
+    if not m:
+        return text
+    line_re = re.compile(rf"^\s*{re.escape(key)}\s*:.*\n?", re.MULTILINE)
+    new_fm = line_re.sub("", m.group(1)).rstrip()
+    if new_fm:
+        return "---\n" + new_fm + "\n---\n" + text[m.end():]
+    # Empty frontmatter after removal — drop the fences entirely so we
+    # don't leave behind a `---\n---\n` stub that other parsers choke on.
+    return text[m.end():]
+
+
+def mark_reviewed(path: Path, today: date | None = None) -> bool:
+    """Stamp `reviewed: YYYY-MM-DD` on the entity. Returns True if changed.
+
+    Idempotent: re-stamping with the same date is a no-op. A different
+    date overwrites (so re-confirming today resets the 90-day decay
+    window — that's the desired behaviour, not a bug).
+    """
+    today = today or date.today()
+    new_value = today.isoformat()
+    text = path.read_text()
+    new_text = _set_frontmatter_field(text, "reviewed", new_value)
+    if new_text == text:
+        return False
+    path.write_text(new_text)
+    return True
+
+
+def mark_contested(path: Path) -> bool:
+    """Flip `status: contested` into the entity's frontmatter.
+    Returns True if changed (already-contested → no-op)."""
+    text = path.read_text()
+    if _has_contested_frontmatter(text):
+        return False
+    new_text = _set_frontmatter_field(text, "status", "contested")
+    path.write_text(new_text)
+    return True
+
+
+def resolve_contested(path: Path) -> bool:
+    """Clear `status: contested` (drop the line entirely so we don't leave
+    behind an ambiguous `status:` with no value)."""
+    text = path.read_text()
+    if not _has_contested_frontmatter(text):
+        return False
+    new_text = _drop_frontmatter_field(text, "status")
+    path.write_text(new_text)
+    return True
 
 
 def _contested_items() -> list[AuditItem]:
@@ -87,6 +214,7 @@ def _contested_items() -> list[AuditItem]:
                     label=f"Contested · {name} ({type_dir.name})",
                     detail=str(rel),
                     priority=100 + _brain_boost(text, name),
+                    path=f,
                 ))
     return out
 
@@ -224,6 +352,12 @@ def _low_confidence_items(max_items: int = 20) -> list[AuditItem]:
             # status: contested is already surfaced separately
             if _has_contested_frontmatter(text):
                 continue
+            # User confirmed this single-source item recently → suppress
+            # until decay window expires. The whole point of the audit
+            # surface is to catch *unreviewed* claims, not to nag about
+            # ones already vouched for.
+            if _reviewed_recently(text):
+                continue
             date_m = _FRONTMATTER_DATE.search(text)
             sort_key = date_m.group(1) if date_m else "9999-99-99"
             name = f.stem.replace("-", " ").title()
@@ -243,6 +377,7 @@ def _low_confidence_items(max_items: int = 20) -> list[AuditItem]:
                 label=f"Confirm? · {name} ({type_key})",
                 detail=f"single-source, {sort_key} · {rel}",
                 priority=priority,
+                path=f,
             )))
 
     # Oldest single-source items first (most likely to be stale); the final
@@ -291,25 +426,177 @@ def format_for_session(items: list[AuditItem]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def main(argv: list[str] | None = None) -> int:
-    """`python -m brain.audit` — print the top-N audit block.
+def _print_head(path: Path, n: int = 25) -> None:
+    """Print the first `n` lines of an entity so the user can decide
+    without leaving the prompt. Bounded so a multi-KB body doesn't flood
+    the terminal."""
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError as e:
+        print(f"  (could not read: {e})")
+        return
+    print(f"  ── {path} ──")
+    for line in lines[:n]:
+        print(f"  | {line}")
+    if len(lines) > n:
+        print(f"  | … ({len(lines) - n} more lines)")
 
-    Designed for the SessionStart hook: silent when clean, compact when not.
-    Exit code is always 0 — a noisy hook would block agent startup, and a
-    failed audit isn't a reason to kill the session.
+
+def _ask(prompt: str, choices: str, _input=None) -> str:
+    """Prompt until the user types one of `choices` (case-insensitive
+    single chars). EOF / Ctrl-D is treated as `q` so piped input doesn't
+    spin forever.
+
+    `_input` defaults to the *current* `builtins.input` (resolved at call
+    time, not import time) so tests that monkeypatch `builtins.input`
+    actually take effect.
+    """
+    if _input is None:
+        import builtins
+        _input = builtins.input
+    valid = set(choices.lower())
+    while True:
+        try:
+            raw = _input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "q"
+        if raw and raw[0] in valid:
+            return raw[0]
+        print(f"  (please answer one of: {'/'.join(sorted(valid))})")
+
+
+def walk(items: list[AuditItem], _input=None,
+         _today: date | None = None) -> dict[str, int]:
+    """Interactive walker for `brain audit`. Returns a tally dict so the
+    CLI can print a one-line summary at the end.
+
+    `_input` is injectable so tests can drive the walker without TTY.
+    """
+    tally = {"reviewed": 0, "contested": 0, "resolved": 0,
+             "skipped": 0, "quit": 0}
+    for i, it in enumerate(items, 1):
+        print()
+        print(f"[{i}/{len(items)}] {it.label}")
+        if it.detail:
+            print(f"        {it.detail}")
+
+        if it.kind == "low_confidence" and it.path is not None:
+            choice = _ask(
+                "  (k)eep — mark reviewed  (c)ontest  (o)pen  (s)kip  (q)uit > ",
+                "kcosq", _input=_input,
+            )
+            if choice == "k":
+                if mark_reviewed(it.path, today=_today):
+                    print(f"  ✓ stamped reviewed: {(_today or date.today()).isoformat()}")
+                    tally["reviewed"] += 1
+                else:
+                    print("  · already reviewed today (no change)")
+            elif choice == "c":
+                if mark_contested(it.path):
+                    print("  ⚑ flagged status: contested")
+                    tally["contested"] += 1
+                else:
+                    print("  · already contested (no change)")
+            elif choice == "o":
+                _print_head(it.path)
+                # Re-ask the same item so `open` is a peek, not a decision.
+                # We do this by re-running the prompt loop on this index.
+                tally["skipped"] += 1  # provisional; will be corrected if
+                # the user then picks k/c on the re-ask. Cheap to over-count
+                # by one in the rare double-`o` case.
+                # Single-level re-ask (no recursion) — simpler than building
+                # a state machine for what is a peek-then-decide flow.
+                second = _ask(
+                    "  (k)eep  (c)ontest  (s)kip  (q)uit > ",
+                    "kcsq", _input=_input,
+                )
+                if second == "k" and mark_reviewed(it.path, today=_today):
+                    tally["reviewed"] += 1
+                    tally["skipped"] -= 1
+                    print("  ✓ stamped reviewed")
+                elif second == "c" and mark_contested(it.path):
+                    tally["contested"] += 1
+                    tally["skipped"] -= 1
+                    print("  ⚑ flagged contested")
+                elif second == "q":
+                    tally["skipped"] -= 1
+                    tally["quit"] += 1
+                    break
+            elif choice == "s":
+                tally["skipped"] += 1
+            elif choice == "q":
+                tally["quit"] += 1
+                break
+
+        elif it.kind == "contested" and it.path is not None:
+            choice = _ask(
+                "  (r)esolve — clear flag  (o)pen  (s)kip  (q)uit > ",
+                "rosq", _input=_input,
+            )
+            if choice == "r":
+                if resolve_contested(it.path):
+                    print("  ✓ cleared status: contested")
+                    tally["resolved"] += 1
+                else:
+                    print("  · was not contested (no change)")
+            elif choice == "o":
+                _print_head(it.path)
+                tally["skipped"] += 1
+            elif choice == "s":
+                tally["skipped"] += 1
+            elif choice == "q":
+                tally["quit"] += 1
+                break
+
+        else:
+            # Dedupe items hold *two* paths and the apply path is non-trivial;
+            # rather than half-implement merge-from-walker, hand off cleanly.
+            print("  → run `python -m brain.reconcile --apply` to handle merges")
+            choice = _ask("  (s)kip  (q)uit > ", "sq", _input=_input)
+            if choice == "q":
+                tally["quit"] += 1
+                break
+            tally["skipped"] += 1
+    return tally
+
+
+def _summarize_tally(tally: dict[str, int]) -> str:
+    parts = [f"{v} {k}" for k, v in tally.items() if v]
+    return ", ".join(parts) if parts else "nothing changed"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """`python -m brain.audit` — print or walk the top-N audit block.
+
+    Default behaviour (no `--walk`) is unchanged: print the same compact
+    block the SessionStart hook uses, exit 0. With `--walk`, drop into
+    the interactive walker so the user can mark items reviewed/contested
+    without hand-editing frontmatter.
+
+    Exit code is always 0 in non-walk mode — a noisy hook would block
+    agent startup, and a failed audit isn't a reason to kill the session.
     """
     import argparse
     p = argparse.ArgumentParser(description="Top-N brain audit summary")
     p.add_argument("--limit", "-n", type=int, default=3,
                    help="How many items to surface (default 3).")
+    p.add_argument("--walk", action="store_true",
+                   help="Drop into the interactive walker after listing.")
     args = p.parse_args(argv)
 
     try:
         config.ensure_dirs()
         items = top_n(limit=args.limit)
-        block = format_for_session(items)
-        if block:
-            print(block, end="")
+        if not items:
+            return 0
+        if args.walk:
+            print(format_for_session(items), end="")
+            tally = walk(items)
+            print()
+            print(f"Done — {_summarize_tally(tally)}.")
+        else:
+            print(format_for_session(items), end="")
     except Exception:
         # Belt and suspenders — `top_n` already swallows per-signal
         # errors, but if the *output formatting* itself blows up we still

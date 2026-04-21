@@ -17,7 +17,7 @@ Maintained autonomously by the assistant during planning/discussion turns.
 
 ---
 
-## Shipped (baseline as of 2026-04-20)
+## Shipped (baseline as of 2026-04-21)
 
 These predate the requirements log; captured here for context only.
 
@@ -25,15 +25,243 @@ These predate the requirements log; captured here for context only.
 - **Harvest pipeline** — `harvest → prefilter → batch-extract → reconcile → clean` (Claude + Cursor agent transcripts).
 - **Hybrid recall** — BM25 + dense + RRF fused via `brain_recall` MCP.
 - **SQLite + FTS5 mirror** — fast index over the markdown source-of-truth.
-- **MCP tool surface** — `brain_recall`, `brain_get`, `brain_recent`, `brain_identity`, `brain_stats`, `brain_audit`, `brain_history`, `brain_semantic`, `brain_status`.
+- **MCP tool surface** (17 tools) — `brain_recall`, `brain_search`, `brain_semantic`, `brain_get`, `brain_recent`, `brain_identity`, `brain_stats`, `brain_audit`, `brain_history`, `brain_status`, `brain_notes`, `brain_note_get`, `brain_entities`, `brain_live_sessions`, `brain_live_tail`, `brain_live_coverage`. (Plus `brain_audit` interactive walker via the `brain audit` CLI — see 2026-04-21 entry below.)
 - **Idle-gated launchd watcher** — `flock` singleton, skips LLM stages while a Claude/Cursor session is actively typing.
 - **Persona-aware `brain init`** — onboarding wizard with developer/researcher/student/lawyer/doctor/custom presets.
-- **Autoresearch loop** — `python -m brain.autoresearch` with fixed cycle budget (10-min wall-clock, 8 LLM calls), `playground/` agent sandbox, `program.md` spec. Now runs autonomously via launchd every 30 min (see Phase 0.5 entry below).
+- **Autoresearch loop** — `python -m brain.autoresearch` with fixed cycle budget (10-min wall-clock, 8 LLM calls), `playground/` agent sandbox, `program.md` spec. Runs autonomously via launchd every 30 min (see Phase 0.5 entry below). Auto-promotes high-confidence items per cycle, picker-driven concrete subjects per slot (see Phase 1 entries below).
+- **SessionStart hooks auto-wired in both Claude Code and Cursor** — audit block injected at every session start (see 2026-04-21 entry below).
+- **Question Coverage Score** — eval-set metric + live recall-ledger (rolling 7-day miss rate from real `brain_recall` calls).
 - **X crawler toolkit** — `~/.brain/bin/x/` (timeline, user_tweets, search, conversation) using authenticated Playwright session.
 
 ---
 
 ## Decision Log
+
+### 2026-04-21 — `brain audit` walker + `reviewed` decay fix the unbounded-queue bug
+
+**Decision:** Add interactive `brain audit` CLI walker and a
+`reviewed: YYYY-MM-DD` frontmatter field that suppresses single-source
+low-confidence items from the SessionStart audit surface for
+`REVIEW_DECAY_DAYS = 90` after the user explicitly confirms them.
+After the decay window the item re-surfaces (a fact that was true 90
+days ago is no longer guaranteed true). `contest` flips the same item
+into the higher-priority contested bucket so it stays surfaced until
+resolved; `resolve` clears the contested flag.
+
+**Rationale:** The audit block told users to `Run `brain audit` to
+walk merges interactively`, but (a) the `brain audit` subcommand did
+not exist (only `python -m brain.audit`, which just re-printed the
+same block — no walker), and (b) low-confidence single-source items
+had **no removal mechanism at all** other than waiting for a second
+source to bump `source_count` to 2. The same three insights from
+2026-04-11 had been re-surfacing in every Claude/Cursor session for
+ten days; the user reviewed them, decided they were correct, and the
+brain just kept nagging. This was a real "the audit queue grows
+forever" bug, not a UX preference.
+
+**Pieces shipped:**
+- `src/brain/audit.py` — added `AuditItem.path` + `AuditItem.extra`
+  fields so the walker can act on items directly without re-parsing
+  detail strings; `_reviewed_recently()` checks the decay window;
+  `_low_confidence_items()` skips recently-reviewed items;
+  `_set_frontmatter_field()` / `_drop_frontmatter_field()` are
+  insert-or-update mutators that preserve all other YAML lines + the
+  body verbatim; `mark_reviewed()`, `mark_contested()`,
+  `resolve_contested()` are the public mutators; `walk()` is the
+  interactive driver (`(k)eep / (c)ontest / (o)pen / (s)kip / (q)uit`
+  for low-confidence; `(r)esolve / (o)pen / (s)kip / (q)uit` for
+  contested; dedupe items hand off cleanly to `python -m brain.reconcile
+  --apply` since merge-from-walker is non-trivial).
+- `src/brain/cli.py` — `brain audit [--limit N] [--list]` subcommand.
+  `--list` matches the legacy print-only behaviour; default drops into
+  the walker.
+- `tests/test_audit.py` — 15 new tests covering: recently-reviewed
+  suppression, decay window expiry, malformed-date fail-open,
+  end-to-end mark→top_n round-trip, idempotency, contest routing,
+  resolve clearing, frontmatter preservation, and the walker
+  (keep/contest/resolve/quit/EOF paths + `main --walk`).
+
+**Edge cases handled:**
+- Malformed `reviewed:` date (typo / hand-edit) fails *open* — better
+  to nag than to silently disappear an item forever.
+- `mark_reviewed` is idempotent same-day (returns False, no write) so
+  walking twice in one day is a no-op.
+- EOF / Ctrl-D in the walker is treated as `quit` so piped/empty
+  stdin doesn't spin.
+- `_input` parameter resolves `builtins.input` at call time (not
+  import time) so `monkeypatch.setattr("builtins.input", …)` actually
+  reaches the walker — a real test failure caught the import-time
+  default-arg footgun before merge.
+- Empty frontmatter after `_drop_frontmatter_field` removes the `---`
+  fences entirely instead of leaving a `---\n---\n` stub.
+
+**Status:** shipped — 269/269 tests pass (15 new in
+`tests/test_audit.py`). Smoke-tested on real `~/.brain` via
+`python -m brain.cli audit --list`.
+**Source:** this session (2026-04-21) — user observed
+"toi audit roi thi kien thuc duoc audit phai duoc remove ra khoi
+queue chu phai khong" (audited items should leave the queue, right?).
+**Linked code:** `src/brain/audit.py`, `src/brain/cli.py`,
+`tests/test_audit.py`, `README.md` (CLI table + behaviour note).
+
+---
+
+### 2026-04-21 — SessionStart hooks auto-wired in BOTH Claude Code and Cursor
+
+**Decision:** `bin/install.sh` now installs the brain SessionStart hook
+into Cursor (`~/.cursor/hooks.json` → `sessionStart` event) in addition
+to Claude Code (`~/.claude/settings.json` → `SessionStart` event), and
+manages both files via the same idempotent merge module
+(`brain.install_hooks`). Onboarding requires zero manual edits to
+either app's config — `brain init` → `bin/install.sh` is the single
+entry point and both surfaces light up.
+
+**Rationale:** Cursor's hook API (introduced after the brain shipped)
+exposes a `sessionStart` event that returns `additional_context` to be
+prepended to the agent's initial system context — semantically
+identical to what Claude's `SessionStart` already does for us. Before
+this push:
+- Cursor sessions never saw the `🧠 Brain audit —` block.
+- Cursor harvest only ran via the launchd watcher every 5 min, so a
+  fresh Cursor session had no chance of seeing freshly-ended Claude
+  work without a multi-minute lag.
+- The `~/.claude/settings.json` block itself was hand-edited on first
+  install (install.sh never touched it), so a fresh-clone install on a
+  new machine would silently skip the audit surface until the user
+  noticed and copied the JSON by hand.
+
+**Pieces shipped:**
+- `templates/cursor/hooks.json.tmpl` — `sessionStart` entry pointing
+  at `{{BRAIN_DIR}}/bin/cursor-session-start.sh` (10 s timeout).
+- `templates/cursor/hooks/session-start.sh.tmpl` — the script Cursor
+  invokes. Reads stdin (Cursor passes `session_id`,
+  `is_background_agent`, `composer_mode`), runs harvest in the
+  background (never blocks), runs `brain.audit` synchronously, emits
+  `{"additional_context": "<block>"}` (or `{}` when clean). Always
+  exits 0 — a noisy hook would block session startup. Background
+  agents skip the surface (no human reading) but still trigger
+  harvest as a side-effect.
+- `templates/claude/settings.json.tmpl` — the previously-hand-written
+  Claude block, now templated and machine-rendered. Adds explicit
+  `BRAIN_DIR=…` env vars (the hand-edit had relied on shell rc),
+  closing a subtle bug where Claude sessions launched outside an
+  interactive shell would harvest into the wrong vault.
+- `src/brain/install_hooks.py` — idempotent JSON-merge module for
+  both files. Replaces only brain-owned entries on uninstall (matched
+  by command substring), preserves siblings, backs up on every
+  mutation, silently no-ops when the parent app dir is missing (so a
+  Cursor-only or Claude-only machine doesn't get noisy warnings about
+  the other). Single source of truth for what counts as "brain-owned"
+  via `CLAUDE_BRAIN_MARKERS` + `CURSOR_BRAIN_MARKER`.
+- `bin/install.sh` — renders both JSON templates + the Cursor hook
+  script, then delegates the merge to `python -m brain.install_hooks
+  install`. Step renumbered: `[5/8]` is now "register MCP server +
+  SessionStart hooks (Claude Code + Cursor)".
+- `bin/uninstall.sh` — symmetric teardown via `python -m
+  brain.install_hooks remove`. Falls back gracefully if the brain
+  package was already pip-uninstalled (PYTHONPATH points at the
+  source tree as a last resort).
+- `bin/doctor.sh` — two new green-line checks: "Claude SessionStart
+  hook wired" and "Cursor sessionStart hook wired", with a `bad` line
+  if the Cursor hooks.json points at a missing/non-executable
+  `cursor-session-start.sh` (regression guard for future template
+  renames).
+- `templates/cursor/USER_RULES.md.tmpl` + `templates/claude/CLAUDE.md.tmpl`
+  — agent-facing rules updated to drop the "Cursor has no SessionStart
+  hook, call brain_audit yourself on first message" fallback. Both
+  tools now follow the same surface-once contract on the same hook
+  output. The fallback rule remains as a doctor-flagged degraded
+  mode, so the agent still does the right thing on a half-installed
+  machine.
+- `src/brain/audit.py` + `src/brain/harvest_session.py` — module
+  docstrings updated to reflect that both tools call them.
+
+**Edge cases handled (locked in by `tests/test_install_hooks.py`, 20
+cases):**
+- Re-running install never duplicates entries (3× install → still
+  exactly one SessionStart group).
+- Sibling hooks (other `SessionStart` entries the user added by hand,
+  other event hooks like `beforeShellExecution`) survive both install
+  and remove.
+- Unrelated top-level keys (`skipDangerousModePermissionPrompt`,
+  custom user keys) survive.
+- Malformed target JSON degrades to skip — we never clobber an
+  in-progress hand-edit. Doctor flags it as not-wired.
+- Empty groups are pruned on remove so the surrounding JSON stays
+  clean.
+- Missing app dirs (~/.claude or ~/.cursor) are silent skips, not
+  warnings — many machines only run one of the two.
+
+**Known Cursor-side limitation:** there are open Cursor forum bug
+reports (Mar–Apr 2026) that `additional_context` from `sessionStart`
+sometimes fails to actually reach the Agent Window. The hook still
+emits valid JSON either way, and the USER_RULES degraded-mode rule
+("if hook block is missing, call `brain_audit(limit=3)` yourself")
+catches the case if/when it happens. When Cursor fixes the upstream
+bug, no brain code changes are needed.
+
+**Status:** shipped — 232 tests pass (20 new in
+`tests/test_install_hooks.py`). Doctor green on real `~/.brain` after
+end-to-end install: both hook lines tick, no warnings.
+**Source:** this session (2026-04-21)
+**Linked code:** `src/brain/install_hooks.py` (new),
+`templates/cursor/hooks.json.tmpl` (new),
+`templates/cursor/hooks/session-start.sh.tmpl` (new),
+`templates/claude/settings.json.tmpl` (new),
+`bin/install.sh`, `bin/uninstall.sh`, `bin/doctor.sh`,
+`templates/cursor/USER_RULES.md.tmpl`,
+`templates/claude/CLAUDE.md.tmpl`,
+`src/brain/audit.py`, `src/brain/harvest_session.py`,
+`tests/test_install_hooks.py` (new).
+
+---
+
+### 2026-04-21 — Phase 1 (fourth push): smarter round-robin — picker-driven concrete subjects
+
+**Decision:** Replace `autoresearch.ROUND_ROBIN_QUESTIONS` (six static English
+sentences) with a new module `brain.round_robin` that runs a tiny SQL picker
+per slot to embed a *concrete* subject (a real entity name, decision, or
+domain) into the question before the LLM ever sees it. The legacy generic
+prompts stay as `FALLBACK_QUESTIONS`, used only when a slot's picker can't
+find an eligible subject.
+
+**Rationale:** With static prompts the LLM had to do its own retrieval to
+decide *which* person/decision/issue to talk about. Once the obvious
+candidate had been written about, every subsequent same-slot cycle would
+print "saturated — nothing new to add" and burn ~100 s of LLM time
+producing nothing. Concrete pre-targeted prompts eliminate that loop.
+Added bonuses:
+- **Saturation guard for slot 1 (cross-project person)** — pickers skip
+  any subject already covered by an article/insight in the last 14 days,
+  so the wheel naturally rotates through new people instead of resurfacing
+  the same well-known one.
+- **Young-vault relaxation (slots 3 + 5)** — strict cutoffs from
+  `program.md` (decisions ≥30d, issues ≥14d) would starve a brand-new
+  vault. Pickers try the strict cutoff first, then relax to ">3 days
+  old" before giving up — so even a 10-day-old vault gets concrete
+  prompts.
+- **NOT-IN status filter (slots 3 + 5)** — vault uses 12+ free-text
+  status values (`current`, `approved for commit`, `code_complete_pending_commits`,
+  …). Picker now filters by an explicit *closed* set (`accepted`,
+  `committed`, `fixed`, `resolved`, …) so the very common default
+  `current` status is correctly auditable. Allow-listing `'open'` would
+  have missed 99% of live decisions.
+
+**Live verification on `~/.brain` (10-day-old vault):** 3 of 6 slots now
+return concrete subjects (slot 2: a stale decision, slot 4: an unresolved
+issue, slot 5: an under-covered domain). Slots 0/1/3 correctly fall back
+to generic prompts (vault has nothing 60+ days old yet, the only multi-
+project person was already covered in last 14 days, only 2 corrections
+total). Mature vault should fire all 6 slots.
+
+**Status:** `shipped`
+**Source:** Cycle 22 follow-up — `brain status` showed round-robin firing
+the same 6 generic prompts every cycle for ~10 hours; this kills the loop.
+**Linked code:** `src/brain/round_robin.py` (new), `src/brain/autoresearch.py`
+(`_next_round_robin` now delegates), `tests/test_round_robin.py` (25 tests
+covering each picker + young-vault relaxation + slot rotation).
+
+---
 
 ### 2026-04-21 — Phase 1 (third push): per-kind promote rules — hypotheses + contradictions go live
 

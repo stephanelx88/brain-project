@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{{HOME}}/.brain/bin/auto-extract.sh</string>
+        <string>{{BRAIN_DIR}}/bin/auto-extract.sh</string>
     </array>
 
     <!-- Safety-net poll every 5 minutes. Day-to-day we run via WatchPaths. -->
@@ -21,8 +21,8 @@
          session captures had to wait for the 5-min safety poll. -->
     <key>WatchPaths</key>
     <array>
-        <string>{{HOME}}/.brain</string>
-        <string>{{HOME}}/.brain/raw</string>
+        <string>{{BRAIN_DIR}}</string>
+        <string>{{BRAIN_DIR}}/raw</string>
         <string>{{HOME}}/.claude/projects</string>
         <string>{{HOME}}/.cursor/projects</string>
     </array>
@@ -35,12 +35,21 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>{{HOME}}/.brain/logs/launchd-stdout.log</string>
+    <string>{{BRAIN_DIR}}/logs/launchd-stdout.log</string>
 
     <key>StandardErrorPath</key>
-    <string>{{HOME}}/.brain/logs/launchd-stderr.log</string>
+    <string>{{BRAIN_DIR}}/logs/launchd-stderr.log</string>
 
     <key>WorkingDirectory</key>
-    <string>{{HOME}}/.brain</string>
+    <string>{{BRAIN_DIR}}</string>
+
+    <!-- Inject BRAIN_DIR so brain.config picks up the user's chosen vault.
+         launchd doesn't read the user's shell rc — without this, the
+         Python subprocess would fall back to ~/.brain. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BRAIN_DIR</key>
+        <string>{{BRAIN_DIR}}</string>
+    </dict>
 </dict>
 </plist>
