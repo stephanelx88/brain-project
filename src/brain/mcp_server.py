@@ -39,23 +39,44 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP
 
 import brain.config as config
-from brain import db, harvest_session, semantic
+from brain import db, harvest_session
+
+# NOTE: `brain.semantic` is intentionally NOT imported here. It pulls
+# torch + sentence-transformers (~2.8 s cold import on M-series Macs),
+# which delays the MCP stdio handshake. Cursor surfaces that delay as
+# "Brain MCP is still connecting" and the agent falls back to raw-file
+# reads — exactly the failure mode we hit on 2026-04-21 with the
+# "where is Trinh and Thuha" query. Tools that genuinely need semantic
+# import it lazily inside their function bodies (see `_semantic()` below).
 
 mcp = FastMCP("brain")
 
 
+def _semantic():
+    """Lazy import of brain.semantic — pays ~3 s on first call instead
+    of every server boot. Subsequent calls hit the module cache."""
+    from brain import semantic
+    return semantic
+
+
 def _warmup() -> None:
     """Pre-load the embedding model + run one dummy encode so the first
-    real `brain_recall` call doesn't pay the ~7 s cold-start (torch import
-    + model weights + first-encode JIT). Runs synchronously before
-    mcp.run() so the model is in RAM by the time Claude's first tool call
-    lands. Adds ~7 s to server boot, but boot happens before the user
-    types — so it's invisible.
+    real `brain_recall` call doesn't pay the ~17 s cold-start (torch
+    import + model weights + first-encode JIT).
 
-    Set BRAIN_WARMUP=0 to disable (useful for tests / fast-start dev)."""
+    Run in a background thread by `main()` AFTER `mcp.run()` starts —
+    we used to call this synchronously before mcp.run(), which delayed
+    the MCP handshake by ~20 s and made Cursor timeout. Now the server
+    answers BM25/SQLite tools (the common case) instantly while the
+    embedding model loads in the background. Semantic tools called
+    before warmup completes pay the cost on first call (one-time).
+
+    Set BRAIN_WARMUP=0 to skip the background load entirely (useful in
+    tests / on machines without enough RAM for the model)."""
     if os.environ.get("BRAIN_WARMUP", "1") == "0":
         return
     try:
+        semantic = _semantic()
         semantic.ensure_built()
         semantic._embed(["warmup"])
     except Exception:
@@ -135,6 +156,7 @@ def brain_notes(query: str, k: int = 8) -> str:
     Returns JSON list of {title, path, snippet, mtime}.
     """
     k = max(1, min(int(k), 25))
+    semantic = _semantic()
     semantic.ensure_built()
     # Prefer the lexical hit when present (exact filename matches), then
     # backfill with semantic. Caller gets the union, deduped by path.
@@ -236,6 +258,7 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     where it came from. Sorted by Reciprocal-Rank Fusion score.
     """
     k = max(1, min(int(k), 25))
+    semantic = _semantic()
     semantic.ensure_built()
     results = semantic.hybrid_search(query, k=k, type=type)
     #  Live recall-ledger mode: every real call Son fires lands in
@@ -254,6 +277,7 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
 def brain_semantic(query: str, k: int = 8, type: str | None = None) -> str:
     """Pure semantic (dense-vector) fact search. Use when you want
     paraphrase recall and don't care about exact keyword matches."""
+    semantic = _semantic()
     k = max(1, min(int(k), 25))
     semantic.ensure_built()
     results = semantic.search_facts(query, k=k, type=type)
@@ -583,7 +607,17 @@ def identity_resource() -> str:
 
 
 def main():
-    _warmup()
+    # Kick warmup off in a daemon thread BEFORE mcp.run() so the
+    # embedding model loads in the background while the MCP stdio
+    # handshake completes immediately. Previously we ran _warmup()
+    # synchronously here, which delayed the handshake by ~20 s and
+    # caused Cursor to report "Brain MCP is still connecting" — the
+    # agent then fell back to raw-file reads (incident 2026-04-21).
+    #
+    # Daemon=True: don't block server shutdown if warmup is still
+    # mid-load (rare; Mac mps usually finishes in ~15 s).
+    import threading
+    threading.Thread(target=_warmup, daemon=True).start()
     mcp.run()
 
 
