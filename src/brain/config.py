@@ -50,6 +50,7 @@ GRAPH_STORE_DIR = BRAIN_DIR / ".brain.rdf"
 PENDING_TRIPLES_PATH = BRAIN_DIR / "pending_triples.jsonl"
 TRIPLE_RULES_PATH = IDENTITY_DIR / "triple_rules.jsonl"
 TRIPLE_RULES_MD_PATH = IDENTITY_DIR / "triple_rules.md"
+PREDICATE_REGISTRY_PATH = IDENTITY_DIR / "predicates.jsonl"
 
 # Hard-coded fallback when no preset has been picked yet. Kept tiny so a
 # fresh install is still usable without `brain init`.

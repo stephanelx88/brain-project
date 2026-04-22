@@ -13,9 +13,10 @@ SPARQL example:
   PREFIX bp: <http://brain.local/p/>
   SELECT ?org WHERE { be:son bp:worksAt ?org }
 
-Valid predicates: worksAt, workedAt, knows, manages, reportsTo,
-  partOf, locatedIn, builds, uses, involves, relatedTo, about,
-  decidedOn, learnedFrom, contradicts
+Predicate vocabulary lives in ``brain.predicate_registry`` — an
+audit-gated learning ledger. ``add_triple`` only writes for predicates
+whose status is ``active``; ``unknown`` and ``proposed`` predicates
+route to the discovery queue; ``retired`` ones drop + log a failure.
 """
 
 from __future__ import annotations
@@ -30,11 +31,15 @@ BRAIN_NS = "http://brain.local/"
 ENTITY_NS = f"{BRAIN_NS}e/"
 PREDICATE_NS = f"{BRAIN_NS}p/"
 
-VALID_PREDICATES: frozenset[str] = frozenset({
-    "worksAt", "workedAt", "knows", "manages", "reportsTo",
-    "partOf", "locatedIn", "builds", "uses", "involves",
-    "relatedTo", "about", "decidedOn", "learnedFrom", "contradicts",
-})
+
+def is_valid_predicate(pred: str) -> bool:
+    """True iff the predicate is ``active`` in the registry.
+
+    Kept as a thin wrapper so callers outside this module don't need to
+    know about registry internals.
+    """
+    from brain import predicate_registry
+    return predicate_registry.status(pred) == "active"
 
 
 def _store():
@@ -80,13 +85,41 @@ def _slug_from_node(node) -> str:
 
 
 def add_triple(subject: str, predicate: str, obj: str, source: str = "") -> bool:
-    """Add one triple to the store. Returns False if predicate is invalid."""
-    if predicate not in VALID_PREDICATES:
+    """Add one triple to the store.
+
+    Returns True iff the triple was written. Unknown and proposed
+    predicates are routed to the registry's discovery queue (returns
+    False — the triple doesn't land, but the predicate accumulates
+    audit evidence). Retired predicates drop silently and append to
+    ``failures.jsonl`` with ``source=retired_predicate`` so silent
+    drops stay discoverable.
+    """
+    from brain import predicate_registry
+    stat = predicate_registry.status(predicate)
+
+    if stat == "active":
+        from pyoxigraph import Quad, DefaultGraph
+        store = _store()
+        store.add(Quad(_en(subject), _pn(predicate), _val(obj), DefaultGraph()))
+        return True
+
+    basis = f"{subject} {predicate} {obj}"
+    if stat in ("unknown", "proposed"):
+        predicate_registry.observe(predicate, basis=basis)
         return False
-    from pyoxigraph import Quad, DefaultGraph
-    store = _store()
-    store.add(Quad(_en(subject), _pn(predicate), _val(obj), DefaultGraph()))
-    return True
+
+    # retired — drop + log so we can grep for false-negative surprises
+    try:
+        from brain.failures import record_failure
+        record_failure(
+            source="retired_predicate",
+            tool="graph.add_triple",
+            query=predicate,
+            result_digest=basis,
+        )
+    except Exception:
+        pass
+    return False
 
 
 def remove_triple(subject: str, predicate: str, obj: str) -> None:

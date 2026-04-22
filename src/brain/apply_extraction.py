@@ -52,17 +52,29 @@ def _apply_triples(triples: list[dict], source_label: str) -> None:
     if not triples:
         return
     try:
-        from brain.graph import add_triple, VALID_PREDICATES
+        from brain.graph import add_triple
         from brain.triple_audit import add_pending
         from brain.triple_rules import adjusted_confidence
+        from brain import predicate_registry
     except Exception:
         return  # graph layer is optional; don't break extraction if missing
 
     high, low = [], []
     for t in triples:
         pred = t.get("predicate", "")
-        if pred not in VALID_PREDICATES:
+        stat = predicate_registry.status(pred)
+        if stat == "retired":
+            continue  # retired predicate — drop extracted triple
+        if stat in ("unknown", "proposed"):
+            # Predicate vocabulary is not yet audited. Observe so the
+            # discovery loop sees it, and park the triple in the pending
+            # queue regardless of LLM confidence — the predicate itself
+            # needs a human yes/no before any triple using it lands.
+            basis = f"{t.get('subject','')} {pred} {t.get('object','')}"
+            predicate_registry.observe(pred, basis=basis)
+            low.append(t)
             continue
+        # active
         raw = float(t.get("confidence", 0.5))
         adj = adjusted_confidence(pred, raw)
         t = dict(t, confidence=adj)

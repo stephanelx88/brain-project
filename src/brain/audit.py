@@ -402,6 +402,38 @@ def _low_confidence_items(max_items: int = 20) -> list[AuditItem]:
     return [item for _, item in candidates[:max_items]]
 
 
+def _proposed_predicate_items() -> list[AuditItem]:
+    """New predicates the LLM proposed that haven't cleared the audit gate.
+
+    Surfaced so the user can promote (→ triples using this predicate
+    become write-allowed) or retire (→ future triples drop silently).
+    Gated between pending_triples and low_confidence in priority because
+    promoting a predicate unblocks *all* triples that use it.
+    """
+    try:
+        from brain import predicate_registry
+        proposed = predicate_registry.list_proposed()
+    except Exception:
+        return []
+    out = []
+    for r in proposed[:10]:
+        pred = r.get("predicate", "?")
+        confirmed = r.get("confirmed", 0)
+        rejected = r.get("rejected", 0)
+        examples = r.get("examples", [])
+        first_example = examples[0] if examples else ""
+        out.append(AuditItem(
+            kind="proposed_predicate",
+            label=f"Predicate? · `{pred}` — promote to vocabulary?",
+            detail=f"{confirmed}✓ {rejected}✗ · "
+                   f"{len(examples)} example(s)"
+                   + (f' · e.g. "{first_example}"' if first_example else ""),
+            priority=58,
+            extra={"predicate": pred, "examples": examples},
+        ))
+    return out
+
+
 def _pending_triple_items() -> list[AuditItem]:
     """Triples waiting for user confirmation before entering the RDF store."""
     try:
@@ -432,7 +464,8 @@ def top_n(limit: int = 3) -> list[AuditItem]:
     Returns [] if the brain is clean — caller should surface nothing.
     """
     pool: list[AuditItem] = []
-    for fn in (_contested_items, _dedupe_items, _pending_triple_items, _low_confidence_items):
+    for fn in (_contested_items, _dedupe_items, _proposed_predicate_items,
+               _pending_triple_items, _low_confidence_items):
         try:
             pool.extend(fn())
         except Exception:
@@ -550,6 +583,30 @@ def walk(items: list[AuditItem], _input=None,
             else:
                 tally["quit"] += 1
                 break
+
+        elif it.kind == "proposed_predicate":
+            pred = it.extra.get("predicate", "")
+            choice = _ask("  y/n/q  (y=promote/confirm, n=reject) > ", "ynq",
+                          _input=_input)
+            try:
+                from brain import predicate_registry
+                if choice == "y":
+                    predicate_registry.record_decision(pred, "y")
+                    new_status = predicate_registry.status(pred)
+                    print(f"  ✓ {pred} → {new_status}")
+                    tally["yes"] += 1
+                elif choice == "n":
+                    predicate_registry.record_decision(pred, "n")
+                    new_status = predicate_registry.status(pred)
+                    print(f"  ✗ {pred} → {new_status}")
+                    tally["no"] += 1
+                else:
+                    tally["quit"] += 1
+                    break
+            except Exception as e:
+                print(f"  ! error: {e}")
+                if choice == "q":
+                    break
 
         elif it.kind == "pending_triple":
             choice = _ask("  y/n/q  (y=add to graph, n=reject) > ", "ynq",
