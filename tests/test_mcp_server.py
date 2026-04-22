@@ -345,6 +345,71 @@ def test_brain_recall_envelope_has_expected_keys(monkeypatch):
     assert isinstance(out["hits"], list)
 
 
+def test_brain_recall_fact_hits_include_entity_summary(tmp_brain_for_mcp, monkeypatch):
+    """Fact hits must carry entity_summary so the agent doesn't need brain_get."""
+    from brain import mcp_server
+
+    class _FakeSemantic:
+        @staticmethod
+        def ensure_built():
+            pass
+
+        @staticmethod
+        def hybrid_search(q, k=8, type=None):
+            return [{
+                "kind": "fact",
+                "type": "projects",
+                "name": "Foo Project",
+                "text": "alpha bravo charlie",
+                "rrf": 0.09,
+            }]
+
+    monkeypatch.setattr(mcp_server, "_semantic", lambda: _FakeSemantic)
+    monkeypatch.setattr("brain.recall_metric.log_live_recall",
+                        lambda q: None, raising=False)
+
+    out = json.loads(mcp_server.brain_recall("alpha"))
+    hits = out["hits"]
+    assert len(hits) == 1
+    assert hits[0]["entity_summary"] == "thing one"
+
+
+def test_brain_recall_note_hits_have_no_entity_summary(monkeypatch):
+    """Note hits must not get entity_summary — they're not entities."""
+    out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
+        {"kind": "note", "path": "foo.md", "snippet": "some note", "rrf": 0.07},
+    ])
+    assert "entity_summary" not in out["hits"][0]
+
+
+def test_brain_recall_entity_summary_absent_when_empty(tmp_brain_for_mcp, monkeypatch):
+    """Fact hit for entity with no summary must not include the key."""
+    from brain import db, mcp_server
+
+    # Clear the summary
+    with db.connect() as conn:
+        conn.execute("UPDATE entities SET summary=NULL WHERE name='Foo Project'")
+
+    class _FakeSemantic:
+        @staticmethod
+        def ensure_built():
+            pass
+
+        @staticmethod
+        def hybrid_search(q, k=8, type=None):
+            return [{
+                "kind": "fact", "type": "projects", "name": "Foo Project",
+                "text": "alpha bravo charlie", "rrf": 0.09,
+            }]
+
+    monkeypatch.setattr(mcp_server, "_semantic", lambda: _FakeSemantic)
+    monkeypatch.setattr("brain.recall_metric.log_live_recall",
+                        lambda q: None, raising=False)
+
+    out = json.loads(mcp_server.brain_recall("alpha"))
+    assert "entity_summary" not in out["hits"][0]
+
+
 def test_brain_recall_strong_match_clears_weak_flag(monkeypatch):
     out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
         {"kind": "fact", "name": "Foo", "text": "alpha", "rrf": 0.08},

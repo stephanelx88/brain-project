@@ -337,6 +337,10 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
 
     Each result has a `kind` field of "fact" or "note" so you can tell
     where it came from. Sorted by Reciprocal-Rank Fusion score.
+
+    Fact hits include `entity_summary` — a one-line description of the
+    entity the fact belongs to. Use this to understand context without
+    needing a follow-up brain_get call.
     """
     k = max(1, min(int(k), 25))
     semantic = _semantic()
@@ -347,6 +351,21 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
         recall_metric.log_live_recall(query)
     except Exception:
         pass
+
+    # Enrich fact hits with entity_summary so agents can understand context
+    # without a follow-up brain_get call (saves one full-file load per entity).
+    fact_keys = list({
+        (h["type"], h["name"])
+        for h in results
+        if h.get("kind") == "fact" and h.get("type") and h.get("name")
+    })
+    if fact_keys:
+        summaries = db.get_entity_summaries(fact_keys)
+        for h in results:
+            if h.get("kind") == "fact":
+                s = summaries.get((h.get("type"), h.get("name")))
+                if s:
+                    h["entity_summary"] = s
 
     import os as _os
     try:

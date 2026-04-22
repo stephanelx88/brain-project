@@ -816,6 +816,24 @@ def find_stale_provenance() -> list[dict]:
     return result
 
 
+def get_entity_summaries(keys: list[tuple]) -> dict:
+    """Batch-fetch summaries for a list of (type, name) pairs.
+
+    Returns {(type, name): summary} for rows that have a non-empty summary.
+    Designed for post-processing search results without N individual queries.
+    """
+    if not keys:
+        return {}
+    where = " OR ".join("(type=? AND name=?)" for _ in keys)
+    flat = [v for t, n in keys for v in (t, n)]
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT type, name, summary FROM entities WHERE {where}",
+            flat,
+        ).fetchall()
+    return {(r[0], r[1]): r[2] for r in rows if r[2]}
+
+
 def search(query: str, k: int = 10, type: str | None = None) -> list[dict]:
     """BM25 fact search. Returns list of dicts joined to their entity."""
     safe_q = _sanitize_fts(query)
