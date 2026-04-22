@@ -347,6 +347,20 @@ def main():
             CACHE_FILE.unlink()
         except FileNotFoundError:
             pass
+        # Post-extraction sync: GC phantom/untracked index entries and
+        # requeue any note-sourced facts whose source note changed.
+        try:
+            from brain.verify import post_extraction_sync
+            sync = post_extraction_sync()
+            parts = []
+            if sync["gc_removed"] or sync["gc_added"]:
+                parts.append(f"gc -/+{sync['gc_removed']}/{sync['gc_added']}")
+            if sync["notes_requeued"]:
+                parts.append(f"requeued {sync['notes_requeued']} note(s)")
+            if parts:
+                print(f"  verify: {', '.join(parts)}", flush=True)
+        except Exception as exc:
+            print(f"  verify sync skipped: {exc}", flush=True)
         # Refresh semantic index so MCP recall sees the new facts.
         # Failure here is non-fatal — semantic is a perf layer, not source of truth.
         try:

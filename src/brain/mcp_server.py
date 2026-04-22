@@ -3,8 +3,8 @@
 Replaces the "preload index.md into the system prompt" model with
 on-demand retrieval. Tools:
 
-  brain_search(query, k, type)         → BM25 fact search across the vault
-  brain_entities(query, k)             → entity-name search (with summary)
+  brain_search(query, k, type)         → hybrid fact search (BM25 + semantic fallback)
+  brain_entities(query, k)             → hybrid entity-name search (BM25 + semantic fallback)
   brain_get(type, name)                → full entity card
   brain_notes(query, k)                → user-note search (BM25 + semantic)
   brain_note_get(path)                 → full body of one vault note
@@ -88,10 +88,14 @@ def _warmup() -> None:
 
 @mcp.tool()
 def brain_search(query: str, k: int = 8, type: str | None = None) -> str:
-    """BM25 fact search across the brain.
+    """Hybrid fact search across the brain (BM25 + semantic fallback).
+
+    BM25 handles exact-keyword queries; semantic fills the gap for
+    Vietnamese / CJK / paraphrase queries where BM25 produces zero or
+    sparse results. Results are deduped; BM25 hits take priority.
 
     Args:
-      query: free-text. Punctuation is ignored; tokens are OR-combined.
+      query: free-text. May be Vietnamese, Chinese, or any language.
       k: max results (default 8, capped 25)
       type: optional filter — one of people, projects, clients, domains,
             decisions, issues, insights, evolutions, meetings.
@@ -99,19 +103,71 @@ def brain_search(query: str, k: int = 8, type: str | None = None) -> str:
     Returns a JSON array of {type,name,path,text,source,date,score}.
     """
     k = max(1, min(int(k), 25))
-    rows = db.search(query, k=k, type=type)
-    return json.dumps(rows, ensure_ascii=False, indent=2)
+    seen: set = set()
+    out: list = []
+
+    for hit in db.search(query, k=k, type=type):
+        key = (hit["type"], hit["name"], (hit["text"] or "")[:80])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(hit)
+
+    sem = _semantic()
+    sem.ensure_built()
+    for hit in sem.search_facts(query, k=k, type=type):
+        key = (hit["type"], hit["name"], (hit["text"] or "")[:80])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({
+            "type": hit["type"],
+            "name": hit["name"],
+            "path": f"entities/{hit['type']}/{hit['slug']}.md",
+            "text": hit["text"],
+            "source": hit.get("source") or "",
+            "date": None,
+            "score": hit["score"],
+        })
+        if len(out) >= k:
+            break
+
+    return json.dumps(out[:k], ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
 def brain_entities(query: str, k: int = 8) -> str:
-    """Entity-name search. Use when you want the entity itself, not facts.
+    """Hybrid entity-name search (BM25 + semantic fallback).
+
+    Use when you want the entity itself, not individual facts.
+    BM25 handles exact-name queries; semantic fills gaps for
+    Vietnamese / CJK / paraphrase names.
 
     Returns a JSON array of {type,name,path,summary,score}.
     """
     k = max(1, min(int(k), 25))
-    rows = db.search_entities(query, k=k)
-    return json.dumps(rows, ensure_ascii=False, indent=2)
+    seen: set = set()
+    out: list = []
+
+    for hit in db.search_entities(query, k=k):
+        key = (hit["type"], hit["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(hit)
+
+    sem = _semantic()
+    sem.ensure_built()
+    for hit in sem.search_entities(query, k=k):
+        key = (hit["type"], hit["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(hit)
+        if len(out) >= k:
+            break
+
+    return json.dumps(out[:k], ensure_ascii=False, indent=2)
 
 
 @mcp.tool()
@@ -297,8 +353,44 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
         threshold = float(_os.environ.get("BRAIN_RECALL_WEAK_RRF", "0.035"))
     except (ValueError, TypeError):
         threshold = 0.035
+
+    # Option A — non-ASCII query adjustment.
+    # BM25 returns near-zero scores for Vietnamese/CJK queries (no token
+    # overlap with English content), cutting the max achievable RRF by ~half.
+    # Scale the threshold down proportionally so a correct semantic hit isn't
+    # silently classified as weak_match purely due to query language.
+    # Ratio 0.55 ≈ 2 semantic branches / 4 total branches, with a small
+    # buffer. Tunable via BRAIN_RECALL_NON_ASCII_SCALE (default 0.55).
+    if any(ord(c) > 127 for c in query):
+        try:
+            scale = float(_os.environ.get("BRAIN_RECALL_NON_ASCII_SCALE", "0.55"))
+        except (ValueError, TypeError):
+            scale = 0.55
+        threshold *= scale
+
     top_score = max((h.get("rrf") or 0.0 for h in results), default=0.0)
     weak_match = top_score < threshold
+
+    # Option C — semantic fallback override.
+    # If RRF says weak but the embedding model found a confident cosine-sim
+    # hit (score ≥ BRAIN_RECALL_SEMANTIC_FALLBACK), trust the semantic branch.
+    # This is the architecturally correct fix: BM25 missing on a cross-lingual
+    # query is not evidence of a bad match — it's a language mismatch.
+    if weak_match and results:
+        semantic_top = max(
+            (h.get("score") or 0.0 for h in results
+             if h.get("semantic_rank") is not None),
+            default=0.0,
+        )
+        try:
+            sem_fallback = float(
+                _os.environ.get("BRAIN_RECALL_SEMANTIC_FALLBACK", "0.20")
+            )
+        except (ValueError, TypeError):
+            sem_fallback = 0.20
+        if semantic_top >= sem_fallback:
+            weak_match = False
+
     if not results:
         guidance = "The brain has no record of this."
     elif weak_match:

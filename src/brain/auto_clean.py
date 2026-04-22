@@ -163,7 +163,16 @@ def apply_rules(
 
     Designed to run silently as a pre-step in `brain audit`. Errors on
     individual files are swallowed so one bad file can't abort the pass.
+    Runs a GC pass first so phantom index entries from previously-deleted
+    files don't pollute recall between clean runs.
     """
+    if not dry_run:
+        try:
+            from brain.db import gc_orphaned_entities
+            gc_orphaned_entities()
+        except Exception:
+            pass
+
     rules = load_rules(rules_file)
     if not rules:
         return []
@@ -219,7 +228,7 @@ _KEYWORD_GROUPS: list[tuple[str, list[str]]] = [
     ("milestone_announcements", _MILESTONE_KEYWORDS),
     ("changelog_entries", _CHANGELOG_KEYWORDS),
     ("stale_metric_estimates", _METRIC_KEYWORDS),
-    ("feedback_loop_goal_statements", _GOAL_KEYWORDS),
+    ("vague_goal_statements", _GOAL_KEYWORDS),
 ]
 
 

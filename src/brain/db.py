@@ -158,6 +158,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE facts ADD COLUMN superseded_at TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS facts_status_idx ON facts(status)")
 
+    # 2026-04-22 — source integrity: store the note's sha256 at the
+    # time a fact was extracted so verify.py can detect when a source
+    # note has been edited (current sha != source_sha → potentially
+    # stale) or deleted (no notes row → orphaned).
+    if "source_sha" not in cols("fact_provenance"):
+        conn.execute("ALTER TABLE fact_provenance ADD COLUMN source_sha TEXT")
+
 
 @contextmanager
 def connect():
@@ -474,12 +481,16 @@ def rebuild() -> dict:
         raise
 
     # Swap the freshly-built DB over the original in one atomic call.
-    # SQLite's WAL sidecars (-wal, -shm) are ephemeral; connect() will
-    # recreate them lazily against the new file.
+    # SQLite WAL sidecars (-wal, -shm) are ephemeral and must be removed
+    # for both the original (stale after replace) and the temp .new file
+    # (dangling after replace). Leaving either set causes the next
+    # connect() to see a mismatched WAL and read 0 rows from a valid DB.
     _os.replace(new_path, orig_path)
     for sidecar in (
         orig_path.with_name(orig_path.name + "-wal"),
         orig_path.with_name(orig_path.name + "-shm"),
+        new_path.with_name(new_path.name + "-wal"),
+        new_path.with_name(new_path.name + "-shm"),
     ):
         if sidecar.exists():
             try:
@@ -641,8 +652,14 @@ def record_fact_provenance(
     entity_path: Path | str,
     fact_text: str,
     note_paths: Iterable[str | Path],
+    source_sha: str | None = None,
 ) -> int:
-    """Link `fact_text` to one or more source notes. Idempotent."""
+    """Link `fact_text` to one or more source notes. Idempotent.
+
+    `source_sha` is the sha256 of the source note at extraction time.
+    Stored alongside the provenance row so verify.py can later detect
+    whether the note has changed (stale) or been deleted (orphaned).
+    """
     import time as _time
 
     paths_norm: list[str] = []
@@ -673,9 +690,9 @@ def record_fact_provenance(
         for np_ in paths_norm:
             cur.execute(
                 """INSERT OR IGNORE INTO fact_provenance
-                   (entity_path, fact_hash, note_path, recorded_at)
-                   VALUES (?,?,?,?)""",
-                (epath, fh, np_, now),
+                   (entity_path, fact_hash, note_path, recorded_at, source_sha)
+                   VALUES (?,?,?,?,?)""",
+                (epath, fh, np_, now, source_sha),
             )
             written += cur.rowcount
     return written
@@ -714,6 +731,89 @@ def forget_note_provenance(note_path: str | Path) -> int:
             "DELETE FROM fact_provenance WHERE note_path=?", (np_,)
         )
         return cur.rowcount
+
+
+def gc_orphaned_entities() -> list[str]:
+    """Remove DB + FTS index entries for entity files deleted from disk.
+
+    Called at the start of auto_clean and verify passes so phantom
+    entries left by manual deletes or auto_clean don't pollute recall.
+    Returns vault-relative paths of the removed entries.
+    """
+    with connect() as conn:
+        rows = conn.execute("SELECT path FROM entities").fetchall()
+
+    removed: list[str] = []
+    for (rel_path,) in rows:
+        abs_path = config.BRAIN_DIR / rel_path
+        if not abs_path.exists():
+            delete_entity_by_path(rel_path)
+            removed.append(rel_path)
+    return removed
+
+
+def index_untracked_entities() -> list[str]:
+    """Upsert entity files that exist on disk but are missing from the DB index.
+
+    The inverse of gc_orphaned_entities. Happens when entity files are
+    created outside the normal extraction path or when the DB is rebuilt
+    from a stale snapshot that predates recent files.
+    Returns vault-relative paths of the newly-indexed entries.
+    """
+    with connect() as conn:
+        indexed = {row[0] for row in conn.execute("SELECT path FROM entities").fetchall()}
+
+    added: list[str] = []
+    for type_dir in config.ENTITY_TYPES.values():
+        if not type_dir.exists():
+            continue
+        for f in sorted(type_dir.glob("*.md")):
+            if f.name.startswith("_"):
+                continue
+            try:
+                rel = str(f.relative_to(config.BRAIN_DIR))
+            except ValueError:
+                continue
+            if rel not in indexed:
+                try:
+                    upsert_entity_from_file(f)
+                    added.append(rel)
+                except Exception:
+                    continue
+    return added
+
+
+def find_stale_provenance() -> list[dict]:
+    """Return provenance rows whose source note has changed or been deleted.
+
+    Only rows with a recorded `source_sha` are considered — older rows
+    (NULL source_sha, pre-migration) are skipped since we have no baseline.
+
+    Returns list of dicts with keys:
+      entity_path, fact_hash, note_path, source_sha, current_sha, status
+    where `status` is 'orphaned' (note gone) or 'stale' (note edited).
+    """
+    with connect() as conn:
+        rows = conn.execute("""
+            SELECT fp.entity_path, fp.fact_hash, fp.note_path,
+                   fp.source_sha, n.sha AS current_sha
+            FROM fact_provenance fp
+            LEFT JOIN notes n ON n.path = fp.note_path
+            WHERE fp.source_sha IS NOT NULL
+              AND (n.sha IS NULL OR n.sha != fp.source_sha)
+        """).fetchall()
+
+    result = []
+    for entity_path, fact_hash, note_path, source_sha, current_sha in rows:
+        result.append({
+            "entity_path": entity_path,
+            "fact_hash": fact_hash,
+            "note_path": note_path,
+            "source_sha": source_sha,
+            "current_sha": current_sha,
+            "status": "orphaned" if current_sha is None else "stale",
+        })
+    return result
 
 
 def search(query: str, k: int = 10, type: str | None = None) -> list[dict]:

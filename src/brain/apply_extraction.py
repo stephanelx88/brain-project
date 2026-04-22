@@ -112,6 +112,7 @@ def _apply_entity(
     updated: list[str],
     touched_paths: set | None = None,
     source_note_paths: list[str] | None = None,
+    source_sha: str | None = None,
 ) -> None:
     """Apply one generic entity from the extraction payload.
 
@@ -178,7 +179,8 @@ def _apply_entity(
     ):
         for fact_text in facts:
             try:
-                record_fact_provenance(path, fact_text, source_note_paths)
+                record_fact_provenance(path, fact_text, source_note_paths,
+                                       source_sha=source_sha)
             except Exception as exc:
                 print(f"provenance write failed for {path}: {exc}")
 
@@ -226,6 +228,7 @@ def apply_extraction(
     do_commit: bool = True,
     do_rebuild_index: bool = True,
     source_note_paths: list[str] | None = None,
+    source_sha: str | None = None,
 ) -> dict:
     """Apply an extraction payload to the brain.
 
@@ -254,6 +257,7 @@ def apply_extraction(
         _apply_entity(
             entity, source_label, now, created, updated, touched,
             source_note_paths=source_note_paths,
+            source_sha=source_sha,
         )
 
     _apply_corrections(extraction.get("corrections", []), source_label, now)

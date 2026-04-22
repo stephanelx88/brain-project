@@ -216,6 +216,17 @@ def main(argv: list[str] | None = None) -> int:
         (["--dry-run"] if a.dry_run else []) +
         (["--rules-file", a.rules_file] if a.rules_file else [])))
 
+    p_vf = sub.add_parser("verify",
+                          help="GC phantom index entries and detect stale facts")
+    p_vf.add_argument("--gc-only", action="store_true",
+                      help="Only run GC pass.")
+    p_vf.add_argument("--stale-only", action="store_true",
+                      help="Only report stale/orphaned facts.")
+    p_vf.set_defaults(func=lambda a: __import__(
+        "brain.verify", fromlist=["main"]).main(
+        (["--gc-only"] if a.gc_only else []) +
+        (["--stale-only"] if a.stale_only else [])))
+
     args = p.parse_args(argv)
     if args.version:
         try:

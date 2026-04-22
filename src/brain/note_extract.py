@@ -217,6 +217,7 @@ def process_pending(
                 do_commit=False,        # batch one commit at the end
                 do_rebuild_index=False, # ditto
                 source_note_paths=[note["path"]],
+                source_sha=note["sha"],
             )
         except Exception as exc:
             summary["errors"] += 1
@@ -237,6 +238,22 @@ def process_pending(
 
     if summary["touched_paths"]:
         rebuild_index()
+        # Post-extraction sync: GC phantom/untracked entities and requeue
+        # stale note provenance for re-extraction next cycle.
+        try:
+            from brain.verify import post_extraction_sync
+            sync = post_extraction_sync()
+            if verbose:
+                parts = []
+                if sync["gc_removed"] or sync["gc_added"]:
+                    parts.append(f"gc -/+{sync['gc_removed']}/{sync['gc_added']}")
+                if sync["notes_requeued"]:
+                    parts.append(f"requeued {sync['notes_requeued']} note(s)")
+                if parts:
+                    print(f"  verify: {', '.join(parts)}", flush=True)
+        except Exception as exc:
+            if verbose:
+                print(f"  verify sync skipped: {exc}", flush=True)
         paths = sorted(summary["touched_paths"]) + [
             "log.md", "index.md", "identity/corrections.md"
         ]

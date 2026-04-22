@@ -42,6 +42,9 @@ def tmp_brain_for_mcp(tmp_path, monkeypatch):
         conn.execute(
             "INSERT INTO fts_facts (rowid, text, source) VALUES (1, 'alpha bravo charlie', 'src1')"
         )
+        conn.execute(
+            "INSERT INTO fts_entity (rowid, name, aliases, summary) VALUES (1, 'Foo Project', 'foo-alias', 'thing one')"
+        )
 
     # Write the entity file so brain_get can read it
     (brain_dir / "entities" / "projects").mkdir(parents=True)
@@ -412,3 +415,240 @@ def test_brain_recall_threshold_env_invalid_falls_back_to_default(monkeypatch):
     )
     assert out["weak_match"] is False
     assert out["threshold"] == 0.035
+
+
+# ---------- Option A: non-ASCII threshold scaling -------------------------
+
+def test_brain_recall_vietnamese_query_scaled_threshold(monkeypatch):
+    # "thuha o dau" observed rrf=0.0259 — below 0.035 but above scaled threshold
+    # (0.035 * 0.55 = 0.01925). Should NOT be weak_match.
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="thuha ở đâu",
+        hits=[{"kind": "fact", "name": "Thuha", "text": "Thuha is at the beach",
+               "rrf": 0.0259}],
+    )
+    assert out["weak_match"] is False, (
+        f"Vietnamese query should use scaled threshold; got top_score={out['top_score']}, "
+        f"threshold={out['threshold']}"
+    )
+
+
+def test_brain_recall_ascii_query_unchanged_threshold(monkeypatch):
+    # Pure ASCII query: threshold must NOT be scaled
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="where is Thuha",
+        hits=[{"kind": "fact", "name": "Thuha", "text": "Thuha is at the beach",
+               "rrf": 0.0259}],
+    )
+    # rrf=0.0259 < 0.035 → weak for ASCII
+    assert out["weak_match"] is True
+
+
+def test_brain_recall_non_ascii_scale_env_override(monkeypatch):
+    # Confirm scale is tunable via env var
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="thuha ở đâu",
+        hits=[{"kind": "fact", "name": "Thuha", "text": "Thuha is at the beach",
+               "rrf": 0.025}],
+        env={"BRAIN_RECALL_NON_ASCII_SCALE": "0.8"},
+    )
+    # threshold = 0.035 * 0.8 = 0.028 > 0.025 → still weak
+    assert out["weak_match"] is True
+
+
+# ---------- Option C: semantic fallback override --------------------------
+
+def test_brain_recall_semantic_fallback_overrides_weak_rrf(monkeypatch):
+    # BM25 missed (no lexical_rank), semantic found confident hit (score=0.35)
+    # RRF is low (0.020) but semantic score > 0.20 threshold → not weak_match
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="where is Thuha",
+        hits=[{
+            "kind": "fact", "name": "Thuha",
+            "text": "Thuha is at the beach",
+            "rrf": 0.020,
+            "score": 0.35,          # cosine-sim from semantic branch
+            "semantic_rank": 0,
+        }],
+    )
+    assert out["weak_match"] is False, (
+        "Semantic score 0.35 >= fallback threshold 0.20 should override weak_match"
+    )
+
+
+def test_brain_recall_semantic_fallback_below_threshold_stays_weak(monkeypatch):
+    # Semantic score too low (0.12) — should remain weak_match
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="unrelated query",
+        hits=[{
+            "kind": "fact", "name": "Foo", "text": "something",
+            "rrf": 0.018,
+            "score": 0.12,
+            "semantic_rank": 0,
+        }],
+    )
+    assert out["weak_match"] is True
+
+
+def test_brain_recall_semantic_fallback_no_semantic_rank_stays_weak(monkeypatch):
+    # Hit came from BM25 only (no semantic_rank) — Option C should not fire
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="some query",
+        hits=[{
+            "kind": "fact", "name": "Foo", "text": "something",
+            "rrf": 0.018,
+            "score": 0.50,          # high score but no semantic_rank
+            "lexical_rank": 0,
+        }],
+    )
+    assert out["weak_match"] is True
+
+
+def test_brain_recall_semantic_fallback_env_override(monkeypatch):
+    # Raise fallback threshold so score=0.25 doesn't trigger
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="where is Thuha",
+        hits=[{
+            "kind": "fact", "name": "Thuha",
+            "text": "Thuha is at the beach",
+            "rrf": 0.018,
+            "score": 0.25,
+            "semantic_rank": 0,
+        }],
+        env={"BRAIN_RECALL_SEMANTIC_FALLBACK": "0.30"},
+    )
+    # 0.25 < 0.30 → no override → still weak
+    assert out["weak_match"] is True
+
+
+def test_brain_recall_both_options_vietnamese_with_semantic(monkeypatch):
+    # Realistic case: Vietnamese query, BM25 miss, semantic hit (score=0.36)
+    # Option A scales threshold; Option C fires regardless — both protect the hit
+    out = _call_brain_recall_with_stubbed_hits(
+        monkeypatch,
+        query="thuha ở đâu",
+        hits=[{
+            "kind": "fact", "name": "Thuha",
+            "text": "Thuha is at the beach",
+            "rrf": 0.0259,
+            "score": 0.36,
+            "semantic_rank": 0,
+        }],
+    )
+    assert out["weak_match"] is False
+
+
+# ---------- brain_search hybrid (BM25 + semantic fallback) ------------------
+
+def _stub_semantic_for_search(monkeypatch, *, fact_hits=None, entity_hits=None):
+    """Replace brain.semantic with a fake that returns controlled hits."""
+    from brain import mcp_server
+
+    class _FakeSemantic:
+        @staticmethod
+        def ensure_built():
+            pass
+
+        @staticmethod
+        def search_facts(query, k=8, type=None):
+            return list(fact_hits or [])
+
+        @staticmethod
+        def search_entities(query, k=8):
+            return list(entity_hits or [])
+
+    monkeypatch.setattr(mcp_server, "_semantic", lambda: _FakeSemantic)
+
+
+def test_brain_search_bm25_hit_no_semantic_needed(tmp_brain_for_mcp, monkeypatch):
+    """BM25 finds a hit — semantic results deduped out."""
+    _stub_semantic_for_search(monkeypatch, fact_hits=[{
+        "type": "projects", "name": "Foo Project", "slug": "foo",
+        "text": "alpha bravo charlie", "source": "src1", "score": 0.9,
+    }])
+    from brain import mcp_server
+    rows = json.loads(mcp_server.brain_search("alpha", k=5))
+    # BM25 and semantic both returned same fact — should appear once
+    assert len(rows) == 1
+    assert rows[0]["name"] == "Foo Project"
+
+
+def test_brain_search_semantic_fills_when_bm25_empty(tmp_brain_for_mcp, monkeypatch):
+    """Non-ASCII query: BM25 returns nothing, semantic backfills."""
+    _stub_semantic_for_search(monkeypatch, fact_hits=[{
+        "type": "people", "name": "Thuha", "slug": "thuha",
+        "text": "Thuha lives in Long Xuyen", "source": "note:thuha.md", "score": 0.72,
+    }])
+    from brain import mcp_server
+    rows = json.loads(mcp_server.brain_search("thuha ở đâu", k=5))
+    # BM25 returns nothing for Vietnamese query; semantic backfills
+    assert len(rows) >= 1
+    assert any(r["name"] == "Thuha" for r in rows)
+
+
+def test_brain_search_semantic_respects_k_cap(tmp_brain_for_mcp, monkeypatch):
+    """Semantic results respect the k cap even when BM25 is empty."""
+    many_hits = [
+        {"type": "people", "name": f"P{i}", "slug": f"p{i}",
+         "text": f"fact {i}", "source": "s", "score": 0.5}
+        for i in range(10)
+    ]
+    _stub_semantic_for_search(monkeypatch, fact_hits=many_hits)
+    from brain import mcp_server
+    rows = json.loads(mcp_server.brain_search("unmatched query", k=3))
+    assert len(rows) <= 3
+
+
+def test_brain_search_dedup_across_bm25_and_semantic(tmp_brain_for_mcp, monkeypatch):
+    """Same fact from BM25 and semantic must not appear twice."""
+    _stub_semantic_for_search(monkeypatch, fact_hits=[{
+        "type": "projects", "name": "Foo Project", "slug": "foo",
+        "text": "alpha bravo charlie", "source": "src1", "score": 0.8,
+    }])
+    from brain import mcp_server
+    rows = json.loads(mcp_server.brain_search("alpha", k=10))
+    texts = [r["text"] for r in rows]
+    assert texts.count("alpha bravo charlie") == 1
+
+
+# ---------- brain_entities hybrid -------------------------------------------
+
+def test_brain_entities_bm25_hit_returned(tmp_brain_for_mcp, monkeypatch):
+    _stub_semantic_for_search(monkeypatch, entity_hits=[])
+    from brain import mcp_server
+    rows = json.loads(mcp_server.brain_entities("Foo", k=5))
+    assert any(r["name"] == "Foo Project" for r in rows)
+
+
+def test_brain_entities_semantic_fills_when_bm25_empty(tmp_brain_for_mcp, monkeypatch):
+    """Vietnamese entity name: BM25 returns nothing, semantic backfills."""
+    _stub_semantic_for_search(monkeypatch, entity_hits=[{
+        "type": "people", "name": "Nguyễn Thị Thu Hà", "slug": "thu-ha",
+        "path": "entities/people/thu-ha.md", "summary": "lives in HCMC",
+        "score": 0.81,
+    }])
+    from brain import mcp_server
+    rows = json.loads(mcp_server.brain_entities("thu ha", k=5))
+    # BM25 finds nothing for "thu ha" (no entity named that in fixture)
+    # but semantic fills in Nguyễn Thị Thu Hà
+    assert any(r["name"] == "Nguyễn Thị Thu Hà" for r in rows)
+
+
+def test_brain_entities_dedup_across_bm25_and_semantic(tmp_brain_for_mcp, monkeypatch):
+    """Same entity from BM25 and semantic must appear once."""
+    _stub_semantic_for_search(monkeypatch, entity_hits=[{
+        "type": "projects", "name": "Foo Project", "slug": "foo",
+        "path": "entities/projects/foo.md", "summary": "thing one",
+        "score": 0.7,
+    }])
+    from brain import mcp_server
+    rows = json.loads(mcp_server.brain_entities("Foo", k=10))
+    names = [r["name"] for r in rows]
+    assert names.count("Foo Project") == 1
