@@ -1,0 +1,88 @@
+# Golden set for WS1 benchmark — seed v0 (2026-04-23).
+#
+# Each entry is consumed by `brain.benchmark.load_golden_yaml` into a
+# GoldenQuery. Two shapes:
+#
+#   POSITIVE: query + expected (list of identifiers; any match = hit)
+#     - identifier format: `fact:<type>/<slug>`  or  `note:<path>`
+#     - matches `brain.benchmark.hit_identifier` output
+#
+#   NEGATIVE / weak-match anchor: query + expected_weak_match: true
+#     - the retrieval layer MUST classify this query as weak
+#       (top RRF below threshold, or semantic-fallback threshold)
+#     - catches the dép-2026-04-21 class: subject-mismatch queries
+#       that today return confident-but-wrong hits
+#
+# Distribution target (PM 2026-04-23 13:30):
+#   people 25% / projects 30% / decisions 15% / cross-lingual 10% +
+#   weak-match anchors for the residual.
+#
+# 4 queries marked `# PM-VERBATIM` are from the live test on
+# 2026-04-23 14:30 and must not be edited without PM sign-off.
+
+# ---- people (~25%) ---------------------------------------------
+- query: "son decisive execution after alignment"
+  expected: ["fact:people/stephane"]
+  description: "working-style paraphrase"
+- query: "son autonomous mode vietnamese directives"
+  expected: ["fact:people/stephane"]
+  description: "autonomous-work habit"
+- query: "son journal capture convention"
+  expected: ["fact:people/stephane"]
+  description: "journal-as-capture"
+- query: "where is trinh"
+  expected: ["fact:people/trinh"]
+- query: "trinh đang ở đâu"
+  expected: ["fact:people/trinh"]
+  description: "VI — OOV for BM25, semantic-only hit"
+
+# ---- projects (~30%) -------------------------------------------
+- query: "cross-platform scheduler launchd systemd"
+  expected: ["fact:projects/brain-project"]
+- query: "query rewriter paraphrase cross-variant RRF"
+  expected: ["fact:projects/brain-project"]
+- query: "gc_orphaned_entities tick"
+  expected: ["fact:projects/brain-project"]
+- query: "test-fixture DB leak lazy _db_path"
+  expected: ["fact:projects/brain-project"]
+- query: "brain 100x roles security architect ontologist"
+  expected: ["fact:projects/brain-project"]
+- query: "architecture plan golden-set bench episodic semantic sqlite-vec"
+  expected: ["fact:projects/brain-project"]
+- query: "forget primitive tombstone retract persist"
+  expected: ["fact:projects/brain-project"]
+  description: "PM-VERBATIM — live test 2026-04-23 14:30"
+
+# ---- issues ----------------------------------------------------
+- query: "test isolation config BRAIN_DIR monkeypatch"
+  expected: ["fact:issues/brain-test-isolation-bug-config-values-captured-at-import-time"]
+  description: "PM-VERBATIM — live test 2026-04-23 14:30"
+
+# ---- decisions (~15%) ------------------------------------------
+- query: "forget primitive persistent deletion tombstone"
+  expected: ["fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
+- query: "tombstones block re-extraction"
+  expected: ["fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
+- query: "why does retract alone not persist"
+  expected: ["fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
+
+# ---- cross-lingual (~10%) --------------------------------------
+- query: "Son ở đâu bây giờ"
+  expected: ["fact:people/stephane"]
+  description: "VI paraphrase of 'where does son live now'"
+- query: "ngôn ngữ giao tiếp với son"
+  expected: ["fact:people/stephane"]
+  description: "VI language pref"
+
+# ---- weak-match anchors ----------------------------------------
+# brain MUST return weak_match=true for these. They anchor the WS7a
+# subject-mismatch regression class from CLAUDE.md.
+- query: "stephane nơi ở ngôn ngữ"
+  expected_weak_match: true
+  description: "PM-VERBATIM — subject=stephane but no location/language facts; must NOT return unrelated 10x-plan hits"
+- query: "compact MCP envelope token reduction"
+  expected_weak_match: true
+  description: "PM-VERBATIM — WS2 not shipped; brain has no content on this topic"
+- query: "đôi dép tôi đâu?"
+  expected_weak_match: true
+  description: "dép-2026-04-21 regression class — must NOT return thuha/trinh"
