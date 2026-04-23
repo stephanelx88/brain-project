@@ -345,7 +345,19 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     k = max(1, min(int(k), 25))
     semantic = _semantic()
     semantic.ensure_built()
-    results = semantic.hybrid_search(query, k=k, type=type)
+    # When BRAIN_QUERY_REWRITE=1, fan out to LLM-generated paraphrases and
+    # RRF-fuse across variants. Falls back to single-query hybrid_search
+    # on any failure (LLM offline, disabled, empty variants). Imported
+    # lazily so the disabled-default path pays zero startup cost.
+    import os as _os_qr
+    if _os_qr.environ.get("BRAIN_QUERY_REWRITE", "0") == "1":
+        from brain import query_rewriter
+        results = query_rewriter.expanded_hybrid_search(
+            query, k=k, type=type,
+            search_fn=semantic.hybrid_search,
+        )
+    else:
+        results = semantic.hybrid_search(query, k=k, type=type)
     try:
         from brain import recall_metric
         recall_metric.log_live_recall(query)
