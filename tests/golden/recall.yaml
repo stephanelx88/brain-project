@@ -1,26 +1,37 @@
-# Golden set for WS1 benchmark — seed v0 (2026-04-23).
+# Golden set for WS1 benchmark — v1 expansion (2026-04-23 round-2).
 #
 # Each entry is consumed by `brain.benchmark.load_golden_yaml` into a
-# GoldenQuery. Two shapes:
+# GoldenQuery. Three shapes:
 #
 #   POSITIVE: query + expected (list of identifiers; any match = hit)
 #     - identifier format: `fact:<type>/<slug>`  or  `note:<path>`
 #     - matches `brain.benchmark.hit_identifier` output
 #
-#   NEGATIVE / weak-match anchor: query + expected_weak_match: true
+#   WEAK-MATCH anchor: query + expected_weak_match: true
 #     - the retrieval layer MUST classify this query as weak
 #       (top RRF below threshold, or semantic-fallback threshold)
-#     - catches the dép-2026-04-21 class: subject-mismatch queries
-#       that today return confident-but-wrong hits
+#     - pure anchors: no subject OR subject exists but no fact matches
 #
-# Distribution target (PM 2026-04-23 13:30):
-#   people 25% / projects 30% / decisions 15% / cross-lingual 10% +
-#   weak-match anchors for the residual.
+#   ADVERSARIAL (subject-mismatch): query + expected_weak_match: true
+#     - query subject IS defined (proper noun or possessive) but the
+#       vault has no fact about that subject on that topic; filter MUST
+#       drop the confidently-wrong hit that today surfaces instead.
+#     - this is the "thuha dang o dau" / "đôi dép tôi đâu" regression class.
+#
+# Distribution target (PM 2026-04-23 18:43):
+#   40 positive (people 6 / projects 12 / decisions 6 / insights 10 /
+#                issues 5 / cross-lingual 1)
+#   15 weak-match anchors (3 PM-verbatim preserved + 12 new)
+#   5 adversarial subject-mismatch
 #
 # 4 queries marked `# PM-VERBATIM` are from the live test on
 # 2026-04-23 14:30 and must not be edited without PM sign-off.
 
-# ---- people (~25%) ---------------------------------------------
+# ============================================================
+# POSITIVE (40)
+# ============================================================
+
+# ---- people (6) ------------------------------------------------
 - query: "son decisive execution after alignment"
   expected: ["fact:people/stephane"]
   description: "working-style paraphrase"
@@ -30,13 +41,17 @@
 - query: "son journal capture convention"
   expected: ["fact:people/stephane"]
   description: "journal-as-capture"
-- query: "where is trinh"
-  expected: ["fact:people/trinh"]
-- query: "trinh đang ở đâu"
-  expected: ["fact:people/trinh"]
-  description: "VI — OOV for BM25, semantic-only hit"
+- query: "stephane prefers systematic framework fixes"
+  expected: ["fact:people/stephane"]
+  description: "directive paraphrase"
+- query: "stephane mac and ubuntu brain development"
+  expected: ["fact:people/stephane"]
+  description: "two-platform dev"
+- query: "stephane PM role 100x initiative 4-agent team"
+  expected: ["fact:people/stephane"]
+  description: "PM directed 100x"
 
-# ---- projects (~30%) -------------------------------------------
+# ---- projects (12) ---------------------------------------------
 - query: "cross-platform scheduler launchd systemd"
   expected: ["fact:projects/brain-project"]
 - query: "query rewriter paraphrase cross-variant RRF"
@@ -46,37 +61,85 @@
 - query: "test-fixture DB leak lazy _db_path"
   expected: ["fact:projects/brain-project"]
 - query: "brain 100x roles security architect ontologist"
-  expected: ["fact:projects/brain-project"]
+  expected: ["fact:projects/brain-100x", "fact:projects/brain-project"]
 - query: "architecture plan golden-set bench episodic semantic sqlite-vec"
   expected: ["fact:projects/brain-project"]
 - query: "forget primitive tombstone retract persist"
+  expected: ["fact:projects/brain-project", "fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
+  description: "PM-VERBATIM — live test 2026-04-23 14:30"
+- query: "brain_note_add daily journal append"
   expected: ["fact:projects/brain-project"]
-  description: "PM-VERBATIM — live test 2026-04-23 14:30"
+- query: "semantic search_facts retracted stale embeddings"
+  expected: ["fact:projects/brain-project"]
+- query: "brain 100x 10 workstream ontologist architect security"
+  expected: ["fact:projects/brain-100x"]
+- query: "58.8 percent byte reduction MCP envelope"
+  expected: ["fact:projects/brain-100x"]
+- query: "WS3 fs-watcher ingest latency 1 second"
+  expected: ["fact:projects/brain-100x"]
 
-# ---- issues ----------------------------------------------------
+# ---- issues (5) ------------------------------------------------
 - query: "test isolation config BRAIN_DIR monkeypatch"
-  expected: ["fact:issues/brain-test-isolation-bug-config-values-captured-at-import-time"]
+  expected: ["fact:issues/brain-test-isolation-bug-config-values-captured-at-import-time", "fact:insights/test-isolation-lazy-resolution-pattern"]
   description: "PM-VERBATIM — live test 2026-04-23 14:30"
+- query: "linux inotifywait systemd.path 5 minute indexing delay"
+  expected: ["fact:issues/indexing-delay-linux"]
+- query: "session_idle gate blocks extraction tmux team agents"
+  expected: ["fact:issues/indexing-delay-live-session"]
+- query: "resource_guard IDLE_L2 IDLE_L3 idle thresholds"
+  expected: ["fact:issues/indexing-delay-live-session"]
+- query: "weak match threshold 0.035 too permissive RRF saturate"
+  expected: ["fact:issues/recall-weak-match-threshold-loose"]
 
-# ---- decisions (~15%) ------------------------------------------
+# ---- decisions (6) ---------------------------------------------
 - query: "forget primitive persistent deletion tombstone"
   expected: ["fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
 - query: "tombstones block re-extraction"
   expected: ["fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
 - query: "why does retract alone not persist"
   expected: ["fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
+- query: "10 workstream breakdown WS1 gate critical path"
+  expected: ["fact:decisions/brain-100x-workstream-plan"]
+- query: "daily journal pattern vs per-note orphan files"
+  expected: ["fact:decisions/brain-vault-organization"]
+- query: "journal YYYY-MM-DD file per day decision"
+  expected: ["fact:decisions/brain-vault-organization"]
 
-# ---- cross-lingual (~10%) --------------------------------------
+# ---- insights (10) ---------------------------------------------
+- query: "agent-team tmux 4 panes claude CLI append-system-prompt"
+  expected: ["fact:insights/agent-team-tmux-pattern"]
+- query: "shared chat.md coordination Monitor tail -F READY"
+  expected: ["fact:insights/agent-team-tmux-pattern"]
+- query: "autoresearch Karpathy propose-code-run-measure brain fitness"
+  expected: ["fact:insights/autoresearch-fitness-for-brain"]
+- query: "Goodhart law p@1 multi-metric token burn"
+  expected: ["fact:insights/autoresearch-fitness-for-brain"]
+- query: "brain ratchet one-way additive primitives deletion asymmetry"
+  expected: ["fact:insights/brain-asymmetry-remember-vs-forget"]
+- query: "walk brain_audit one item at a time terse vietnamese"
+  expected: ["fact:insights/brain-audit-walkthrough-pattern"]
+- query: "doctor.sh BRAIN_DIR drift Step 0 early validation"
+  expected: ["fact:insights/brain-install-doctor-validation"]
+- query: "systematic fix principle framework not per-machine workaround"
+  expected: ["fact:insights/systematic-fix-principle"]
+- query: "lazy call-time config resolution monkeypatch _db_path"
+  expected: ["fact:insights/test-isolation-lazy-resolution-pattern"]
+- query: "9 workstreams shipped 2 hour autonomous smoke test"
+  expected: ["fact:insights/brain-10x-implementation-findings"]
+
+# ---- cross-lingual (1) -----------------------------------------
 - query: "Son ở đâu bây giờ"
   expected: ["fact:people/stephane"]
   description: "VI paraphrase of 'where does son live now'"
-- query: "ngôn ngữ giao tiếp với son"
-  expected: ["fact:people/stephane"]
-  description: "VI language pref"
 
-# ---- weak-match anchors ----------------------------------------
-# brain MUST return weak_match=true for these. They anchor the WS7a
-# subject-mismatch regression class from CLAUDE.md.
+# ============================================================
+# WEAK-MATCH ANCHORS (15)
+# ============================================================
+#
+# brain MUST return weak_match=true. Includes PM-verbatim + new
+# pure-anchor queries (no subject OR subject exists but brain has
+# no fact on that axis).
+
 - query: "stephane nơi ở ngôn ngữ"
   expected_weak_match: true
   description: "PM-VERBATIM — subject=stephane but no location/language facts; must NOT return unrelated 10x-plan hits"
@@ -86,3 +149,65 @@
 - query: "đôi dép tôi đâu?"
   expected_weak_match: true
   description: "dép-2026-04-21 regression class — must NOT return thuha/trinh"
+- query: "stephane birthday"
+  expected_weak_match: true
+  description: "subject=stephane but no birthday fact"
+- query: "stephane favorite color"
+  expected_weak_match: true
+  description: "subject=stephane but no color fact"
+- query: "son current phone number"
+  expected_weak_match: true
+  description: "owner self-reference; no phone fact"
+- query: "TCP three-way handshake explanation"
+  expected_weak_match: true
+  description: "generic knowledge outside brain scope"
+- query: "HTTP/2 multiplexing"
+  expected_weak_match: true
+  description: "generic knowledge outside brain scope"
+- query: "airspeed velocity of an unladen swallow"
+  expected_weak_match: true
+  description: "nonsense anchor"
+- query: "banana bread recipe"
+  expected_weak_match: true
+  description: "out-of-scope topic"
+- query: "Madhav Kamath"
+  expected_weak_match: true
+  description: "person not in vault"
+- query: "X-crawl Karpathy twitter"
+  expected_weak_match: true
+  description: "entity not in vault"
+- query: "where did I leave my laptop"
+  expected_weak_match: true
+  description: "owner possessive; no laptop fact"
+- query: "my keys location"
+  expected_weak_match: true
+  description: "owner possessive; no keys fact"
+- query: "¿dónde están mis llaves?"
+  expected_weak_match: true
+  description: "ES possessive — no keys fact"
+
+# ============================================================
+# ADVERSARIAL SUBJECT-MISMATCH (5)
+# ============================================================
+#
+# Each query has a PARSEABLE subject (proper noun or owner-voice
+# possessive), but the vault has no fact for (that subject, that
+# topic). Today's bug class: brain confidently returns a fact about
+# a DIFFERENT subject that happens to mention the query subject.
+# WS7a subject-reject must drop those; weak_match then fires.
+
+- query: "thuha đang ở đâu"
+  expected_weak_match: true
+  description: "ADVERSARIAL — thuha.md deleted 2026-04-23; must NOT return stale Cần Thơ fact (live incident)"
+- query: "where is thuha"
+  expected_weak_match: true
+  description: "ADVERSARIAL — EN twin of the thuha incident"
+- query: "trinh đang ở đâu"
+  expected_weak_match: true
+  description: "ADVERSARIAL — no trinh entity in vault; must not return proxies"
+- query: "where is Trinh"
+  expected_weak_match: true
+  description: "ADVERSARIAL — EN twin; WS7a subject-reject territory"
+- query: "what did I eat yesterday"
+  expected_weak_match: true
+  description: "ADVERSARIAL — owner possessive; no meal facts; must not return another subject's food fact"
