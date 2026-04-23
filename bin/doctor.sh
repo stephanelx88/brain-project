@@ -196,11 +196,29 @@ else
   echo "$MCP_OUT" | tail -3 | sed 's/^/      /'
 fi
 
-if [[ -f "$HOME/.claude.json" ]] && grep -q '"brain"' "$HOME/.claude.json"; then
-  ok "brain registered in Claude Code (~/.claude.json)"
-else
-  warn "brain NOT registered in Claude Code"
-  warn "  fix: claude mcp add brain -s user -e PYTHONPATH=$PROJECT_DIR/src -- $PYTHON -m brain.mcp_server"
+if [[ -f "$HOME/.claude.json" ]]; then
+  CLAUDE_HAS_READ=0
+  CLAUDE_HAS_WRITE=0
+  CLAUDE_HAS_LEGACY=0
+  grep -q '"brain-read"'  "$HOME/.claude.json" && CLAUDE_HAS_READ=1
+  grep -q '"brain-write"' "$HOME/.claude.json" && CLAUDE_HAS_WRITE=1
+  grep -q '"brain"'       "$HOME/.claude.json" && CLAUDE_HAS_LEGACY=1
+  if [[ $CLAUDE_HAS_READ -eq 1 && $CLAUDE_HAS_WRITE -eq 1 ]]; then
+    ok "brain-read + brain-write registered in Claude Code (WS5 split)"
+  elif [[ $CLAUDE_HAS_READ -eq 1 && $CLAUDE_HAS_WRITE -eq 0 ]]; then
+    warn "brain-read registered but brain-write missing — this host can recall but not mutate"
+    warn "  if this is the primary host, rewire via: cd $PROJECT_DIR && bash bin/install.sh"
+    warn "  if this is intentional (untrusted host), you can ignore this."
+  elif [[ $CLAUDE_HAS_READ -eq 0 && $CLAUDE_HAS_WRITE -eq 1 ]]; then
+    bad "brain-write registered WITHOUT brain-read — anomaly (write without query)"
+    warn "  fix: cd $PROJECT_DIR && bash bin/install.sh"
+  elif [[ $CLAUDE_HAS_LEGACY -eq 1 ]]; then
+    warn "legacy 'brain' server registered; WS5 split not wired on this host"
+    warn "  fix: cd $PROJECT_DIR && bash bin/install.sh  (will register brain-read + brain-write)"
+  else
+    warn "brain NOT registered in Claude Code"
+    warn "  fix: cd $PROJECT_DIR && bash bin/install.sh"
+  fi
 fi
 
 # SessionStart hooks: both files are JSON-merged by install.sh, so a
@@ -269,7 +287,22 @@ else
   warn "  fix: $PYTHON -m brain.semantic build"
 fi
 
-hdr "5. ingest round-trip (write → wait → verify → cleanup)"
+hdr "5. audit ledger (WS5 hash chain)"
+LEDGER="$BRAIN_DIR/.audit/ledger.jsonl"
+if [[ ! -f "$LEDGER" ]]; then
+  ok "audit ledger empty (no write tools called yet)"
+else
+  LEDGER_OUT=$("$PYTHON" -m brain._audit_ledger validate 2>&1)
+  if echo "$LEDGER_OUT" | grep -q "^ok=True"; then
+    ROWS=$(echo "$LEDGER_OUT" | sed -n 's/.*rows=\([0-9]*\).*/\1/p')
+    ok "audit chain validates ($ROWS rows, head at $LEDGER)"
+  else
+    bad "audit chain BROKEN: $LEDGER_OUT"
+    warn "  fix: inspect $LEDGER around the first_bad row; do NOT try to 'repair' — truncation is a last resort"
+  fi
+fi
+
+hdr "6. ingest round-trip (write → wait → verify → cleanup)"
 TESTFILE="$BRAIN_DIR/doctor-roundtrip-$$.md"
 TESTQUERY="DOCTORTOKEN$$"
 # Attribute the actual failure: if the write itself dies, previous doctor

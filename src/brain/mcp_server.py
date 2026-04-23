@@ -1,7 +1,22 @@
-"""Brain MCP server — exposes the brain to Claude Code as native tools.
+"""Brain MCP server — aggregate (DEPRECATED, transition only).
 
-Replaces the "preload index.md into the system prompt" model with
-on-demand retrieval. Tools:
+.. deprecated:: 2026-04-23 (WS5)
+   New installs register the split pair `brain-read` + `brain-write`
+   (see `brain.mcp_server_read`, `brain.mcp_server_write`). This
+   module stays around for one release cycle so hosts wired against
+   the old single `brain` server keep working; all tool logic lives
+   here and the split servers delegate to it. Remove after WS5 has
+   been in main for 2 weeks and `brain doctor` has had time to
+   re-wire every host.
+
+Blast-radius split (WS5): read tools are safe for any local process;
+write tools mutate the vault + append a hash-chained audit entry.
+Host wiring: untrusted hosts get `brain-read` only; the user's
+primary host gets both.
+
+Exposes the brain to Claude Code as native tools. Replaces the
+"preload index.md into the system prompt" model with on-demand
+retrieval. Tools:
 
   brain_search(query, k, type, verbose=False, debug=False)
                                        → hybrid fact search (BM25 + semantic fallback)
@@ -52,7 +67,14 @@ from datetime import datetime, timedelta, timezone
 from mcp.server.fastmcp import FastMCP
 
 import brain.config as config
-from brain import _projection, db
+from brain import _audit_ledger, _projection, db
+
+
+def _sha8(s: str) -> str:
+    """8-char sha256 prefix — stable correlation key for the audit
+    ledger without leaking the original content."""
+    import hashlib
+    return hashlib.sha256((s or "").encode("utf-8")).hexdigest()[:8]
 
 # NOTE: `brain.semantic` is intentionally NOT imported here. It pulls
 # torch + sentence-transformers (~2.8 s cold import on M-series Macs),
@@ -516,6 +538,12 @@ def brain_note_add(text: str, tags: list[str] | None = None) -> str:
         new_body = header + bullet + "\n"
     from brain.io import atomic_write_text
     atomic_write_text(path, new_body)
+    _audit_ledger.append("note_add", {
+        "path": rel,
+        "bullet_sha8": _sha8(bullet),
+        "tag_count": len([t for t in (tags or []) if t and t.strip()]),
+        "journal_existed": existed,
+    })
     return json.dumps(
         {"path": rel, "line": bullet, "journal_existed": existed},
         ensure_ascii=False,
@@ -950,7 +978,9 @@ def brain_mark_reviewed(path: str) -> str:
     if err is not None:
         return err
     changed = audit_mod.mark_reviewed(p)
-    return json.dumps({"changed": changed, "path": str(p.relative_to(config.BRAIN_DIR.resolve()))})
+    rel = str(p.relative_to(config.BRAIN_DIR.resolve()))
+    _audit_ledger.append("mark_reviewed", {"path": rel, "changed": changed})
+    return json.dumps({"changed": changed, "path": rel})
 
 
 @mcp.tool()
@@ -967,7 +997,9 @@ def brain_mark_contested(path: str) -> str:
     if err is not None:
         return err
     changed = audit_mod.mark_contested(p)
-    return json.dumps({"changed": changed, "path": str(p.relative_to(config.BRAIN_DIR.resolve()))})
+    rel = str(p.relative_to(config.BRAIN_DIR.resolve()))
+    _audit_ledger.append("mark_contested", {"path": rel, "changed": changed})
+    return json.dumps({"changed": changed, "path": rel})
 
 
 @mcp.tool()
@@ -984,7 +1016,9 @@ def brain_resolve_contested(path: str) -> str:
     if err is not None:
         return err
     changed = audit_mod.resolve_contested(p)
-    return json.dumps({"changed": changed, "path": str(p.relative_to(config.BRAIN_DIR.resolve()))})
+    rel = str(p.relative_to(config.BRAIN_DIR.resolve()))
+    _audit_ledger.append("resolve_contested", {"path": rel, "changed": changed})
+    return json.dumps({"changed": changed, "path": rel})
 
 
 @mcp.tool()
@@ -1021,6 +1055,12 @@ def brain_failure_record(
         session_id=session_id,
         extra=dict(extra) if extra else None,
     )
+    _audit_ledger.append("failure_record", {
+        "id": fid,
+        "source": source,
+        "tool": tool,
+        "tag_count": len(list(tags) if tags else []),
+    })
     return json.dumps({"id": fid})
 
 
@@ -1103,6 +1143,11 @@ def brain_retract_fact(
         text = retract_mod.retract_fact(
             entity_type, entity_name, fact_text, retracted_by="user-correction"
         )
+        _audit_ledger.append("retract_fact", {
+            "entity": f"{entity_type}/{entity_name}",
+            "match_sha8": _sha8(fact_text),
+            "retracted_sha8": _sha8(text),
+        })
         return json.dumps({"retracted": text}, ensure_ascii=False)
     except (ValueError, RuntimeError) as e:
         return json.dumps({"error": str(e)})
@@ -1137,6 +1182,11 @@ def brain_correct_fact(
             entity_type, entity_name, wrong_fact, correct_fact,
             source="user-correction",
         )
+        _audit_ledger.append("correct_fact", {
+            "entity": f"{entity_type}/{entity_name}",
+            "wrong_sha8": _sha8(wrong_fact),
+            "correct_sha8": _sha8(correct_fact),
+        })
         return json.dumps(result, ensure_ascii=False)
     except (ValueError, RuntimeError) as e:
         return json.dumps({"error": str(e)})
@@ -1188,6 +1238,11 @@ def brain_forget(
         if entity_type and entity_name
         else "global"
     )
+    _audit_ledger.append("forget", {
+        "scope": scope,
+        "text_sha8": _sha8(text),
+        "written": bool(written),
+    })
     return json.dumps(
         {"tombstoned": written, "claim": (text or "").strip(), "scope": scope},
         ensure_ascii=False,
@@ -1221,6 +1276,11 @@ def brain_remember(
         if entity_type and entity_name
         else "global"
     )
+    _audit_ledger.append("remember", {
+        "scope": scope,
+        "text_sha8": _sha8(text),
+        "removed": int(n),
+    })
     return json.dumps(
         {"removed": int(n), "claim": (text or "").strip(), "scope": scope},
         ensure_ascii=False,

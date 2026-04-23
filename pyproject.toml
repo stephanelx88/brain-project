@@ -40,6 +40,8 @@ dev = [
 [project.scripts]
 brain = "brain.cli:main"
 brain-mcp = "brain.mcp_server:main"
+brain-mcp-read = "brain.mcp_server_read:main"
+brain-mcp-write = "brain.mcp_server_write:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
