@@ -8,6 +8,7 @@ on-demand retrieval. Tools:
   brain_get(type, name)                → full entity card
   brain_notes(query, k)                → user-note search (BM25 + semantic)
   brain_note_get(path)                 → full body of one vault note
+  brain_note_add(text, tags)           → append knowledge bullet to today's journal file
   brain_recent(hours, type, k)         → entities updated since cutoff
   brain_identity()                     → identity + active corrections
   brain_recall(query, k, type)         → hybrid fact + note search (RRF)
@@ -259,6 +260,59 @@ def brain_note_get(path: str) -> str:
     if not p.exists() or not p.is_file():
         return json.dumps({"error": f"not found: {path}"})
     return p.read_text(errors="replace")
+
+
+@mcp.tool()
+def brain_note_add(text: str, tags: list[str] | None = None) -> str:
+    """Append a knowledge bullet to today's journal file. THIS IS HOW AGENTS
+    CAPTURE USER KNOWLEDGE — never use the generic Write tool to create
+    one-off `.md` files under ~/.brain/, or the vault root fills with
+    single-line orphans (the `messy vault` problem).
+
+    Convention: one journal file per local day at
+    `journal/YYYY-MM-DD.md`. Each call appends one line:
+        - _HH:MM_ <text> #tag1 #tag2
+
+    The line is the unit of fact-extraction provenance — keep it
+    one-statement, plain prose. The extractor (note_extract.py) reads
+    each new sha and turns it into entity facts on the next scheduler
+    tick. Returns `{path, line, journal_existed}` so the agent knows
+    what landed.
+
+    `tags` — optional, gets joined as `#tag` tokens on the same line.
+    Useful for steering extraction (e.g. ["people", "location"]).
+    """
+    text = (text or "").strip()
+    if not text:
+        return json.dumps({"error": "empty text"})
+    # Local date — journal is for the user, not for UTC machines. A
+    # journal entry written at 6 AM Vietnam time should land in today's
+    # local file, not yesterday's UTC file.
+    now = datetime.now()
+    rel = f"journal/{now.strftime('%Y-%m-%d')}.md"
+    path = config.BRAIN_DIR / rel
+    existed = path.exists()
+    bullet = f"- _{now.strftime('%H:%M')}_ {text}"
+    if tags:
+        clean = [t.strip().lstrip("#") for t in tags if t and t.strip()]
+        if clean:
+            bullet += " " + " ".join(f"#{t}" for t in clean)
+    if existed:
+        body = path.read_text(errors="replace")
+        if not body.endswith("\n"):
+            body += "\n"
+        new_body = body + bullet + "\n"
+    else:
+        # First entry of the day — give the file a heading so it renders
+        # nicely in Obsidian and gives note_extract a date anchor.
+        header = f"# Journal — {now.strftime('%Y-%m-%d')}\n\n"
+        new_body = header + bullet + "\n"
+    from brain.io import atomic_write_text
+    atomic_write_text(path, new_body)
+    return json.dumps(
+        {"path": rel, "line": bullet, "journal_existed": existed},
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()
