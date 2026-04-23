@@ -266,6 +266,95 @@ def _title_from(path: Path, body: str) -> str:
     return path.stem.replace("-", " ").replace("_", " ").strip()
 
 
+def ingest_one(path: Path | str) -> dict:
+    """Ingest a single note file. Complements `ingest_all`.
+
+    Used by the fs-event watcher (`brain watcher`) to react to individual
+    file writes without re-walking the vault. Semantics mirror the
+    per-file branch of `ingest_all`:
+      * skipped if path is outside BRAIN_DIR, under a machine-managed
+        dir, non-`.md`, or starts with an underscore;
+      * skipped if oversized (`MAX_BYTES`);
+      * a short-circuit when mtime is unchanged (sha still recomputed
+        only if mtime moved, mirroring ingest_all's ledger semantics).
+
+    Returns `{"status": str, "rel_path": str | None, "changed": bool,
+    "deleted": bool}`. `status` is one of `changed | unchanged |
+    deleted | skipped`. The caller (watcher) is responsible for
+    follow-up semantic reindexing.
+    """
+    p = Path(path)
+    root = config.BRAIN_DIR
+    out: dict = {"status": "skipped", "rel_path": None, "changed": False, "deleted": False}
+
+    # Resolve relative path; reject anything outside the vault.
+    try:
+        rel = str(p.resolve().relative_to(root.resolve()))
+    except (ValueError, OSError):
+        return out
+    out["rel_path"] = rel
+
+    # Machine-managed dir or non-note filename — the walker skips
+    # these; apply the same rule here so `inotify` noise from
+    # `entities/`, `raw/`, `.git/`, `.vec/` etc. is a no-op.
+    rel_path = Path(rel)
+    if any(part in EXCLUDE_DIR_NAMES or part.startswith(".") for part in rel_path.parts[:-1]):
+        return out
+    if _should_skip_file(p):
+        return out
+
+    if not p.exists():
+        # Deletion path — reuse ingest_all's cascade.
+        try:
+            inv = invalidate_facts_for_note(rel, verbose=False)
+        except Exception:
+            inv = {"facts_invalidated": 0, "entities_touched": 0, "tombstones_written": 0}
+        db.delete_note_by_path(rel)
+        try:
+            from brain import semantic
+            semantic.update_notes_via_worker(changed=[], deleted_paths=[rel])
+        except Exception:
+            pass
+        out.update({"status": "deleted", "deleted": True,
+                    "facts_invalidated": inv.get("facts_invalidated", 0)})
+        return out
+
+    try:
+        stat = p.stat()
+    except OSError:
+        return out
+    if stat.st_size > MAX_BYTES:
+        return out
+    try:
+        text = p.read_text(errors="replace")
+    except OSError:
+        return out
+    sha = _sha(text)
+    title = _title_from(p, text)
+
+    prev_map = db.list_note_ledger()
+    prev = prev_map.get(rel)
+    if prev and prev[1] == sha:
+        # Content unchanged; only bump mtime so the ledger stays
+        # tight with the fs. No semantic work.
+        db.upsert_note(rel, title, text, stat.st_mtime, sha)
+        out["status"] = "unchanged"
+        return out
+
+    db.upsert_note(rel, title, text, stat.st_mtime, sha)
+    # Push to semantic worker (or fall back to in-process build).
+    try:
+        from brain import semantic
+        semantic.update_notes_via_worker(
+            changed=[(rel, title, text)],
+            deleted_paths=[],
+        )
+    except Exception:
+        pass
+    out.update({"status": "changed", "changed": True})
+    return out
+
+
 def ingest_all(verbose: bool = False) -> dict:
     """Diff-walk the vault and upsert any changed notes."""
     root = config.BRAIN_DIR

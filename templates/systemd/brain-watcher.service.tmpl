@@ -1,0 +1,32 @@
+[Unit]
+Description=Brain — fs-event watcher (inotify → note/entity ingest)
+Documentation=https://github.com/stephanelx88/brain-project
+After=default.target
+
+[Service]
+# Long-running foreground process. systemd owns lifecycle + restarts.
+Type=simple
+ExecStart={{BRAIN_CMD}} watch
+WorkingDirectory={{BRAIN_DIR}}
+
+# Inject BRAIN_DIR so brain.config picks up the user's chosen vault —
+# user-level systemd units don't source .bashrc/.zshrc.
+Environment="BRAIN_DIR={{BRAIN_DIR}}"
+Environment="PATH={{HOME}}/.local/bin:{{HOME}}/.pyenv/shims:/usr/local/bin:/usr/bin:/bin"
+
+# Journal captures stdout/stderr by default; access via
+# `journalctl --user -u brain-watcher -f`.
+StandardOutput=journal
+StandardError=journal
+
+# Background work — interactive MCP queries should always win CPU.
+Nice=10
+IOSchedulingClass=idle
+
+# inotifywait can leak memory if it misses a rotation; cycle daily.
+RuntimeMaxSec=1d
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
