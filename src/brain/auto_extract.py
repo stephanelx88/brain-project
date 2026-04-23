@@ -376,6 +376,8 @@ def main():
                 parts.append(f"gc -/+{sync['gc_removed']}/{sync['gc_added']}")
             if sync["notes_requeued"]:
                 parts.append(f"requeued {sync['notes_requeued']} note(s)")
+            if sync.get("semantic_rebuilt"):
+                parts.append("semantic drift → rebuilt")
             if parts:
                 print(f"  verify: {', '.join(parts)}", flush=True)
         except Exception as exc:

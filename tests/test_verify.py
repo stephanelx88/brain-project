@@ -375,7 +375,74 @@ def test_post_sync_idempotent(tmp_vault):
 
     r1 = verify.post_extraction_sync()
     r2 = verify.post_extraction_sync()
-    assert r1 == r2 == {"gc_removed": 0, "gc_added": 0, "notes_requeued": 0}
+    assert r1 == r2 == {
+        "gc_removed": 0, "gc_added": 0, "notes_requeued": 0,
+        "semantic_rebuilt": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# _semantic_notes_drift + post_extraction_sync semantic rebuild safety net
+# ---------------------------------------------------------------------------
+
+def _write_sem_notes_json(vault, entries):
+    """Helper — write a synthetic .vec/notes.json to the test vault."""
+    import json
+    vec = vault / ".vec"
+    vec.mkdir(exist_ok=True)
+    (vec / "notes.json").write_text(json.dumps(entries))
+
+
+def test_semantic_drift_false_when_no_index(tmp_vault):
+    """Fresh vault — no .vec/notes.json yet — drift False (nothing to drift)."""
+    from brain import verify
+    assert verify._semantic_notes_drift() is False
+
+
+def test_semantic_drift_true_when_ghost_note_in_index(tmp_vault):
+    """notes.json lists a path the DB doesn't have → drift detected."""
+    from brain import verify
+    _write_sem_notes_json(tmp_vault, [
+        {"id": 1, "path": "deleted-note.md", "title": "gone", "body": ""}
+    ])
+    assert verify._semantic_notes_drift() is True
+
+
+def test_semantic_drift_false_when_aligned(tmp_vault):
+    """notes.json and DB match → no drift."""
+    from brain import verify, ingest_notes
+    (tmp_vault / "foo.md").write_text("# foo\nfoo body")
+    ingest_notes.ingest_all()
+    _write_sem_notes_json(tmp_vault, [
+        {"id": 1, "path": "foo.md", "title": "foo", "body": "foo body"}
+    ])
+    assert verify._semantic_notes_drift() is False
+
+
+def test_post_extraction_sync_rebuilds_semantic_on_drift(tmp_vault, monkeypatch):
+    """End-to-end: drift triggers semantic.build() call."""
+    from brain import verify, semantic
+    _write_sem_notes_json(tmp_vault, [
+        {"id": 1, "path": "ghost.md", "title": "ghost", "body": ""}
+    ])
+    rebuilds: list[int] = []
+    monkeypatch.setattr(semantic, "build", lambda: rebuilds.append(1) or {})
+
+    result = verify.post_extraction_sync()
+    assert result["semantic_rebuilt"] is True
+    assert len(rebuilds) == 1
+
+
+def test_post_extraction_sync_no_rebuild_when_aligned(tmp_vault, monkeypatch):
+    """No notes.json = no drift signal = build() never called."""
+    from brain import verify, semantic
+
+    def fake_build():
+        raise AssertionError("rebuild should not be called when aligned")
+    monkeypatch.setattr(semantic, "build", fake_build)
+
+    result = verify.post_extraction_sync()
+    assert result["semantic_rebuilt"] is False
 
 
 # ---------------------------------------------------------------------------

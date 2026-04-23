@@ -56,10 +56,47 @@ def gc() -> dict:
     }
 
 
+def _semantic_notes_drift() -> bool:
+    """Detect whether the semantic notes index is out of sync with the DB.
+
+    The ``ingest_notes`` pipeline has incremental semantic updates
+    (worker → in-process fallback). If *both* paths fail, the DB
+    reflects the deletion but ``.vec/notes.json`` still embeds the
+    ghost entry — we saw julia/hana/ivan surface in rankings for
+    deleted files. Returns ``True`` when the two disagree on path set.
+
+    Path is derived from the live ``config.BRAIN_DIR`` at call time
+    rather than the import-time constant in ``semantic`` so tests
+    that monkeypatch ``BRAIN_DIR`` see their own vault's index
+    instead of leaking into the real one.
+    """
+    from brain import db, config
+    import json
+
+    notes_json = config.BRAIN_DIR / ".vec" / "notes.json"
+    if not notes_json.exists():
+        return False  # nothing built yet; let the first build handle it
+    try:
+        sem_meta = json.loads(notes_json.read_text())
+        sem_paths = {m.get("path", "") for m in sem_meta}
+    except (json.JSONDecodeError, OSError):
+        return True  # malformed = drifted for our purposes
+
+    try:
+        with db.connect() as conn:
+            db_paths = {
+                r[0] for r in conn.execute("SELECT path FROM notes").fetchall()
+            }
+    except Exception:
+        return False  # DB unreadable — let caller's own error handler deal
+
+    return sem_paths != db_paths
+
+
 def post_extraction_sync() -> dict:
     """Run after any extraction batch to ensure index + provenance consistency.
 
-    Two passes:
+    Three passes:
 
     1. GC — sync DB index with disk in both directions:
          phantom entries (in DB, file deleted) are removed;
@@ -73,8 +110,16 @@ def post_extraction_sync() -> dict:
          re-derives fresh facts. This closes the loop: session extraction
          can't mutate notes, but it can flag them for re-verification.
 
-    Returns {"gc_removed": N, "gc_added": M, "notes_requeued": K}.
-    Safe to call even when nothing changed — all passes are idempotent.
+    3. Semantic-notes drift safety net — if the semantic notes index
+         disagrees with the DB on path set, force a full rebuild.
+         Belt-and-suspenders for the silent-failure case where
+         ``ingest_notes`` updated the DB but the semantic worker AND
+         the in-process fallback both errored (leaving ghost entries
+         that surface as wrong hits in ``brain_recall``).
+
+    Returns ``{"gc_removed": N, "gc_added": M, "notes_requeued": K,
+    "semantic_rebuilt": bool}``. All passes idempotent — safe to call
+    repeatedly.
     """
     from brain.db import (
         gc_orphaned_entities, index_untracked_entities,
@@ -94,10 +139,20 @@ def post_extraction_sync() -> dict:
                     (note_path,),
                 )
 
+    semantic_rebuilt = False
+    if _semantic_notes_drift():
+        try:
+            from brain.semantic import build as semantic_build
+            semantic_build()
+            semantic_rebuilt = True
+        except Exception:
+            pass  # non-fatal; surfaces again next run
+
     return {
         "gc_removed": len(removed_paths),
         "gc_added": len(added_paths),
         "notes_requeued": len(stale_notes),
+        "semantic_rebuilt": semantic_rebuilt,
     }
 
 
