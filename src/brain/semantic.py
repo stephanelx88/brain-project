@@ -94,6 +94,99 @@ def _ensure_dir():
     VEC_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _current_scrub_tag() -> str:
+    """Return the active sanitize ruleset version string.
+
+    Lazy import so a stripped environment (tests without sanitize
+    wired, or a future scrubber-less subset of the codebase) falls
+    back to a sentinel rather than crashing the builder. Sentinel
+    cannot match `sanitize.VERSION` so it would force a rebuild on
+    the next tick if the scrubber is re-enabled — safer than assuming
+    "no scrubber == scrubbed".
+    """
+    try:
+        from brain.sanitize import VERSION as _v
+        return _v
+    except Exception:
+        return "no-scrubber"
+
+
+def _meta_scrub_tag() -> str | None:
+    """Return the scrub_tag recorded in `.vec/meta.json`, or None."""
+    if not META_JSON.exists():
+        return None
+    try:
+        meta = json.loads(META_JSON.read_text())
+    except Exception:
+        return None
+    tag = meta.get("scrub_tag")
+    return tag if isinstance(tag, str) else None
+
+
+def _stamp_scrub_tag_in_place(tag: str) -> None:
+    """Write `scrub_tag = tag` into an existing `.vec/meta.json`
+    without rebuilding the index. Used for the one-shot migration
+    when the bundle predates this field — we don't know whether the
+    embedded content is actually older than the current scrubber, so
+    we adopt the current tag rather than force rebuild.
+    """
+    if not META_JSON.exists():
+        return
+    try:
+        meta = json.loads(META_JSON.read_text())
+    except Exception:
+        return
+    meta["scrub_tag"] = tag
+    atomic_write_text(META_JSON, json.dumps(meta, indent=2))
+
+
+def _audit_scrub_version_init(*, new_tag: str) -> None:
+    """Record the one-shot migration that stamps an existing `.vec`
+    bundle with its first scrub_tag. Distinct op from
+    `scrub_version_bump_reingest` because no re-embedding happened —
+    an incident responder looking at the ledger needs to tell
+    "migrated unknown" apart from "redid because ruleset bumped".
+    """
+    try:
+        from brain import _audit_ledger
+        _audit_ledger.append(
+            "scrub_version_init",
+            {"new_scrub_tag": new_tag},
+            actor="semantic.ensure_built",
+        )
+    except Exception:
+        pass
+
+
+def _audit_scrub_version_bump(
+    *, old_tag: str | None, new_tag: str, reingested: int
+) -> None:
+    """Record a scrub-version forced re-ingest in the WS5 ledger.
+
+    Fired exactly once per detected bump (never on every tick). Payload:
+    * `old_scrub_tag` — what the `.vec` bundle was stamped with (may
+      be null if the bundle predates the field).
+    * `new_scrub_tag` — `sanitize.VERSION` at the moment of rebuild.
+    * `reingested` — count of fact rows re-embedded.
+
+    Counter-only, no raw content. Best-effort: import/disk failures
+    are swallowed so the rebuild path is never blocked by audit.
+    """
+    try:
+        from brain import _audit_ledger
+        _audit_ledger.append(
+            "scrub_version_bump_reingest",
+            {
+                "old_scrub_tag": old_tag or "",
+                "new_scrub_tag": new_tag,
+                "reingested": int(reingested),
+            },
+            actor="semantic.ensure_built",
+        )
+    except Exception:
+        pass
+
+
 def _atomic_save_npy(path: Path, arr: np.ndarray) -> None:
     """Atomic `np.save` equivalent.
 
@@ -200,6 +293,12 @@ def build() -> dict:
                 "fact_max_id": max((m["rowid"] for m in fact_meta), default=0),
                 "entity_max_id": max((m["id"] for m in ent_meta), default=0),
                 "build_seconds": round(time.time() - t0, 2),
+                # WS4 scrub-version cross-reference. The embedded text
+                # was produced by this ruleset; `ensure_built()`
+                # compares against `sanitize.VERSION` at read time and
+                # forces a full re-embed on mismatch so a scrubber
+                # upgrade can't leave pre-upgrade content in the index.
+                "scrub_tag": _current_scrub_tag(),
             },
             indent=2,
         ),
@@ -560,12 +659,76 @@ def ensure_built(rebuild_if_stale: bool = False) -> dict | None:
     built when META was absent, so every new fact stayed dark until the
     next scheduled full rebuild.
 
+    **Scrub-version cross-reference (WS4 follow-up)**: when the `.vec`
+    bundle's `scrub_tag` disagrees with the active `sanitize.VERSION`,
+    force a full rebuild. Rationale: a newer scrubber may redact or
+    reject content the older one kept. Without this check, the
+    embeddings + on-disk meta keep surfacing pre-upgrade text
+    (including flagged-but-not-rejected injection strings) until the
+    next 6 h stale-rebuild — same "v1 → v2 prompt-injection window"
+    Security flagged in the 18:24 stale-fact post. Fires a WS5
+    `scrub_version_bump_reingest` audit entry exactly once per bump.
+
     Failures in the incremental path are swallowed and fall through to
     the old behaviour (no refresh) — the recall hot path must never be
     broken by an indexing error.
     """
     if not META_JSON.exists():
         return build()
+
+    # Scrub-version cross-reference — runs BEFORE the incremental
+    # path so a bump triggers a full rebuild, not an append of new
+    # rows on top of a stale old-version bundle.
+    #
+    # Three states:
+    #   stored is None           → bundle predates this field entirely
+    #                              (pre-WS4-cross-ref vault). Stamp the
+    #                              current tag in-place, DON'T rebuild.
+    #                              This is a one-shot migration — we
+    #                              don't know the bundle is actually
+    #                              stale w.r.t. the scrubber, and
+    #                              forcing a full rebuild on every
+    #                              legacy vault penalises correct
+    #                              behaviour. Emit `scrub_version_init`
+    #                              for audit visibility but don't touch
+    #                              the index.
+    #   stored == current        → no-op (hot-path common case).
+    #   stored != current (both non-null)
+    #                            → real version bump. Force full
+    #                              rebuild + `scrub_version_bump_reingest`
+    #                              audit. The existing bundle may hold
+    #                              content the new ruleset would have
+    #                              redacted/rejected.
+    stored = _meta_scrub_tag()
+    current = _current_scrub_tag()
+    if stored is None:
+        try:
+            _stamp_scrub_tag_in_place(current)
+            _audit_scrub_version_init(new_tag=current)
+        except Exception:
+            pass  # never block the read path
+    elif stored != current:
+        try:
+            # Peek fact count *before* rebuild so the audit ledger
+            # records how many rows were forcibly re-embedded. This
+            # is what a downstream incident-response tool wants to
+            # know ("the bump touched N facts").
+            try:
+                pre_count = len(json.loads(FACTS_JSON.read_text()))
+            except Exception:
+                pre_count = 0
+            result = build()
+            _audit_scrub_version_bump(
+                old_tag=stored,
+                new_tag=current,
+                reingested=pre_count,
+            )
+            return result
+        except Exception:
+            # Rebuild failed — fall through rather than leave the
+            # read path broken. The next tick retries.
+            pass
+
     try:
         if _has_new_rows():
             incremental_update_facts_entities()

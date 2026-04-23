@@ -49,6 +49,29 @@ import brain.config as config
 
 
 # ---------------------------------------------------------------------------
+# scrubber version
+# ---------------------------------------------------------------------------
+
+# Bump when ANY of the following change materially:
+#   * the set or order of passes in `sanitize()`
+#   * the secret-regex table (_SECRET_PATTERNS)
+#   * the injection-tripwire table (_INJECTION_RULES)
+#   * the entropy thresholds or carve-outs
+#
+# Consumers (`.vec` bundle build, `semantic.ensure_built`) compare
+# their stored `scrub_tag` against this constant. A mismatch means the
+# embedded text was produced by an older ruleset — the downstream
+# pipeline may be holding content the current scrubber would have
+# redacted/rejected. Treated as a forced full re-ingest trigger.
+#
+# Format: `ws4-vN` (lexicographically orderable; allows simple
+# "newer than" checks with tuple comparison on the suffix). History:
+#   v1 — initial (2026-04-23): 22 secret regex + 11 injection rules +
+#        4-pass order (secret → injection → entropy → length-elide).
+VERSION = "ws4-v1"
+
+
+# ---------------------------------------------------------------------------
 # report shape
 # ---------------------------------------------------------------------------
 
@@ -545,6 +568,11 @@ def _summarise(pairs: Iterable[tuple[str, str]]) -> dict[str, int]:
 def _write_audit(report: SanitizeReport, source_kind: str, source_path: str) -> None:
     entry = {
         "ts": datetime.now(timezone.utc).isoformat(),
+        # Which scrubber ruleset produced this row. Consumers of this
+        # ledger (e.g. `semantic.ensure_built`) compare against
+        # `sanitize.VERSION` to detect rows scrubbed by an older
+        # ruleset and force re-ingest on bump.
+        "scrub_tag": VERSION,
         "source_kind": source_kind,
         "source_path": source_path,
         "redactions": _summarise(report.redactions),
