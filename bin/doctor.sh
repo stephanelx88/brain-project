@@ -63,23 +63,47 @@ else
   bad "brain submodule import failed"
 fi
 
-hdr "2. launchd"
-# Snapshot once to avoid `launchctl list | grep -q` which trips SIGPIPE
-# under `set -o pipefail` (launchctl gets killed before its output
-# drains, pipeline exit=141, `if` branch treats it as false even when
-# the pattern matched). Observed on darwin 24 with long job lists.
-LAUNCHCTL_LIST=$(launchctl list 2>/dev/null || true)
-if echo "$LAUNCHCTL_LIST" | grep -q "com\.${USERNAME}\.brain-auto-extract"; then
-  ok "auto-extract launchd job loaded"
-else
-  bad "auto-extract launchd job not loaded"
-  warn "  fix: launchctl load $PLIST"
-fi
-if echo "$LAUNCHCTL_LIST" | grep -q "com\.${USERNAME}\.brain-semantic-worker"; then
-  ok "semantic-worker launchd job loaded"
-else
-  warn "semantic-worker not loaded — ingest will cold-start the model each run"
-fi
+DOCTOR_OS="$(uname -s)"
+hdr "2. scheduler ($DOCTOR_OS)"
+case "$DOCTOR_OS" in
+  Darwin)
+    # Snapshot once to avoid `launchctl list | grep -q` which trips SIGPIPE
+    # under `set -o pipefail` (launchctl gets killed before its output
+    # drains, pipeline exit=141, `if` branch treats it as false even when
+    # the pattern matched). Observed on darwin 24 with long job lists.
+    LAUNCHCTL_LIST=$(launchctl list 2>/dev/null || true)
+    if echo "$LAUNCHCTL_LIST" | grep -q "com\.${USERNAME}\.brain-auto-extract"; then
+      ok "auto-extract launchd job loaded"
+    else
+      bad "auto-extract launchd job not loaded"
+      warn "  fix: launchctl load $PLIST"
+    fi
+    if echo "$LAUNCHCTL_LIST" | grep -q "com\.${USERNAME}\.brain-semantic-worker"; then
+      ok "semantic-worker launchd job loaded"
+    else
+      warn "semantic-worker not loaded — ingest will cold-start the model each run"
+    fi
+    ;;
+  Linux)
+    # systemctl --user returns nonzero for inactive units and we don't
+    # want `set -e` (if ever enabled) to trip — keep the `|| true` guard.
+    if systemctl --user is-active brain-auto-extract.timer >/dev/null 2>&1; then
+      ok "auto-extract systemd timer active"
+    else
+      bad "brain-auto-extract.timer not active"
+      warn "  fix: systemctl --user enable --now brain-auto-extract.timer"
+      warn "  (headless? run 'loginctl enable-linger $USERNAME' first)"
+    fi
+    if systemctl --user is-active brain-semantic-worker.service >/dev/null 2>&1; then
+      ok "semantic-worker systemd service active"
+    else
+      warn "semantic-worker not active — ingest will cold-start the model each run"
+    fi
+    ;;
+  *)
+    warn "scheduler checks skipped — platform $DOCTOR_OS not supported"
+    ;;
+esac
 
 if [[ -f "$LOG" ]]; then
   LAST_RUN=$(grep "auto-extract run" "$LOG" | tail -1 | awk '{print $2}')
@@ -170,7 +194,11 @@ if [[ -d "$HOME/.cursor" && -f "$CURSOR_RULES_RENDERED" && -f "$CURSOR_RULES_TMP
     # Cursor stores user rules in opaque app state; we can only remind.
     ok "Cursor user rules rendered ($CURSOR_RULES_RENDERED)"
     warn "  reminder: paste into Cursor → Settings → Rules → User Rules if not done"
-    warn "  copy: pbcopy < $CURSOR_RULES_RENDERED"
+    # Clipboard copy command differs by platform.
+    case "$DOCTOR_OS" in
+      Darwin) warn "  copy: pbcopy < $CURSOR_RULES_RENDERED" ;;
+      Linux)  warn "  copy: xclip -selection clipboard < $CURSOR_RULES_RENDERED  (or wl-copy)" ;;
+    esac
   fi
 fi
 

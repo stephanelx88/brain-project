@@ -52,8 +52,17 @@ TODAY="$(date +%Y-%m-%d)"
 # point HOME at /tmp/sandbox to "test a fresh install", pip will happily
 # overwrite the editable install in your real Python — silently breaking
 # your existing brain. Discovered the hard way 2026-04-19.
+#
+# `dscl` is macOS-only; on Linux we read /etc/passwd (or NSS) via
+# `getent`. Either way the check is advisory and skipped when the lookup
+# fails.
 # ──────────────────────────────────────────────────────────────────────
-REAL_HOME="$(dscl . -read "/Users/$USERNAME" NFSHomeDirectory 2>/dev/null | awk '{print $2}')"
+OS="$(uname -s)"
+REAL_HOME=""
+case "$OS" in
+  Darwin) REAL_HOME="$(dscl . -read "/Users/$USERNAME" NFSHomeDirectory 2>/dev/null | awk '{print $2}')" ;;
+  Linux)  REAL_HOME="$(getent passwd "$USERNAME" 2>/dev/null | cut -d: -f6)" ;;
+esac
 if [[ -n "$REAL_HOME" && "$REAL_HOME" != "$HOME_DIR" && "$ALLOW_SANDBOX" -ne 1 ]]; then
   echo "✗ \$HOME ($HOME_DIR) does not match $USERNAME's real home ($REAL_HOME)."
   echo
@@ -66,13 +75,15 @@ if [[ -n "$REAL_HOME" && "$REAL_HOME" != "$HOME_DIR" && "$ALLOW_SANDBOX" -ne 1 ]
   exit 1
 fi
 
-OS="$(uname -s)"
-if [[ "$OS" != "Darwin" ]]; then
-  echo "✗ Only macOS is supported by this installer (detected: $OS)."
-  echo "  The Python package itself is portable; only the launchd plist + MCP"
-  echo "  registration are macOS-specific. PRs for systemd-user welcome."
-  exit 1
-fi
+case "$OS" in
+  Darwin|Linux) : ;;
+  *)
+    echo "✗ Unsupported platform: $OS."
+    echo "  The Python package works on any Unix, but the scheduler install"
+    echo "  flow (launchd / systemd) has no backend for this OS."
+    exit 1
+    ;;
+esac
 
 # ──────────────────────────────────────────────────────────────────────
 # Pick python — prefer pyenv if present, else system python3.11+
@@ -96,17 +107,21 @@ fi
 PYVER="$("$PYTHON" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
 
 # ──────────────────────────────────────────────────────────────────────
-# Pre-flight: project must NOT live under ~/Desktop, ~/Documents, ~/Downloads
-# (macOS TCC denies launchd-spawned processes read access there).
+# Pre-flight: on macOS, project must NOT live under
+# ~/Desktop, ~/Documents, ~/Downloads — macOS TCC denies launchd-spawned
+# processes read access there. Linux has no equivalent restriction, so
+# the check is scoped to Darwin.
 # ──────────────────────────────────────────────────────────────────────
-case "$PROJECT_DIR" in
-  "$HOME_DIR/Desktop"/*|"$HOME_DIR/Documents"/*|"$HOME_DIR/Downloads"/*)
-    echo "✗ Project lives at $PROJECT_DIR, which macOS TCC blocks from launchd."
-    echo "  Move it: mv \"$PROJECT_DIR\" \"$HOME_DIR/code/$(basename "$PROJECT_DIR")\""
-    echo "  Then re-run this installer."
-    exit 1
-    ;;
-esac
+if [[ "$OS" == "Darwin" ]]; then
+  case "$PROJECT_DIR" in
+    "$HOME_DIR/Desktop"/*|"$HOME_DIR/Documents"/*|"$HOME_DIR/Downloads"/*)
+      echo "✗ Project lives at $PROJECT_DIR, which macOS TCC blocks from launchd."
+      echo "  Move it: mv \"$PROJECT_DIR\" \"$HOME_DIR/code/$(basename "$PROJECT_DIR")\""
+      echo "  Then re-run this installer."
+      exit 1
+      ;;
+  esac
+fi
 
 echo "── brain install ─────────────────────────────────────"
 echo "  HOME       : $HOME_DIR"
@@ -184,15 +199,10 @@ EOF
 # Doctor lives in the source repo so it tracks code changes; just symlink it.
 ln -sf "$PROJECT_DIR/bin/doctor.sh" "$BRAIN_DIR/bin/doctor.sh"
 
-PLIST="$HOME_DIR/Library/LaunchAgents/com.${USERNAME}.brain-auto-extract.plist"
-mkdir -p "$(dirname "$PLIST")"
-render "$PROJECT_DIR/templates/launchd/brain-auto-extract.plist.tmpl" "$PLIST"
-
-# Persistent semantic-embedding worker — keeps sentence-transformers warm
-# so each ingest pays ~0.5 s instead of ~10 s cold-start. Optional, but
-# the only way to hit the ≤10 s sync goal.
-SEM_PLIST="$HOME_DIR/Library/LaunchAgents/com.${USERNAME}.brain-semantic-worker.plist"
-render "$PROJECT_DIR/templates/launchd/brain-semantic-worker.plist.tmpl" "$SEM_PLIST"
+# Scheduler units (launchd plist on macOS, systemd --user units on Linux)
+# are rendered + installed in step [7/8] below via the scheduler dispatcher.
+# Keeping it out of step [3/8] so the MCP registration / hook wiring can
+# still proceed on platforms with no supported scheduler backend.
 
 CLAUDE_MD="$HOME_DIR/.claude/CLAUDE.md"
 mkdir -p "$(dirname "$CLAUDE_MD")"
@@ -305,34 +315,14 @@ echo "[6/8] build database + semantic index"
 echo "      ✓ index ready"
 
 # ──────────────────────────────────────────────────────────────────────
-# 7. Load launchd job (unload first so re-runs pick up plist changes)
+# 7. Install scheduler units (launchd on macOS, systemd --user on Linux)
 # ──────────────────────────────────────────────────────────────────────
-echo "[7/8] load launchd watcher + semantic worker"
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load "$PLIST"
-launchctl unload "$SEM_PLIST" 2>/dev/null || true
-launchctl load "$SEM_PLIST"
-# launchctl load is asynchronous — the job may take a beat to appear in
-# `launchctl list`. Poll briefly so the success message is honest.
-LAUNCHD_LABEL="com.${USERNAME}.brain-auto-extract"
-SEM_LABEL="com.${USERNAME}.brain-semantic-worker"
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if launchctl list | grep -q "$LAUNCHD_LABEL" \
-     && launchctl list | grep -q "$SEM_LABEL"; then break; fi
-  sleep 0.3
-done
-if launchctl list | grep -q "$LAUNCHD_LABEL"; then
-  echo "      ✓ watcher live (1 s throttle on $BRAIN_DIR + ~/.claude/projects + ~/.cursor/projects)"
-else
-  echo "      ✗ launchctl load returned 0 but '$LAUNCHD_LABEL' is not visible."
-  echo "        Check $PLIST then run: launchctl bootstrap gui/\$(id -u) $PLIST"
-  exit 1
-fi
-if launchctl list | grep -q "$SEM_LABEL"; then
-  echo "      ✓ semantic worker live (cold-start once, warm forever)"
-else
-  echo "      ! semantic worker not visible — ingest will fall back to in-process embedding"
-fi
+echo "[7/8] install scheduler ($(uname -s))"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/_scheduler.sh"
+scheduler_render_and_install \
+  "$PROJECT_DIR" "$HOME_DIR" "$USERNAME" "$BRAIN_DIR" "$PYTHON" "$TODAY"
+scheduler_verify "$USERNAME"
 
 # ──────────────────────────────────────────────────────────────────────
 # 8. Doctor — verify everything green

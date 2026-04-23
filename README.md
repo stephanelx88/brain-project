@@ -13,7 +13,7 @@
 <a href="https://github.com/stephanelx88/brain-project/graphs/contributors"><img alt="GitHub contributors" src="https://img.shields.io/github/contributors/stephanelx88/brain-project?color=2b9348"></a>
 <img src="https://img.shields.io/badge/license-MIT-2b9348" alt="License Badge"/>
 <img src="https://img.shields.io/badge/python-3.11%2B-blue" alt="Python Badge"/>
-<img src="https://img.shields.io/badge/platform-macOS-lightgrey" alt="Platform Badge"/>
+<img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey" alt="Platform Badge"/>
 
 <br><br>
 
@@ -80,7 +80,7 @@ Restart Claude Code / Cursor afterwards to pick up the brain MCP tools.
 
 The vault you point at can be a brand-new folder **or an existing Obsidian vault** — brain creates its own `entities/`, `raw/`, `identity/`, `logs/` dirs alongside whatever notes are already there. Brain reads your hand-written notes via `brain_recall` / `brain_notes` but never deletes them.
 
-> **Platform:** macOS only for the launchd watchers. The Python package itself is portable; PRs for `systemd-user` are welcome.
+> **Platform:** macOS (launchd) and Linux (systemd `--user` timers). The installer dispatches automatically on `uname -s`. On headless Linux servers run `loginctl enable-linger $USER` once so user units run outside a login session.
 
 ---
 

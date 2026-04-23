@@ -43,27 +43,11 @@ echo "  PYTHON     : ${PYTHON:-<unknown>}"
 echo "  PURGE VAULT: $PURGE"
 echo
 
-PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-auto-extract.plist"
-SEM_PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-semantic-worker.plist"
-
-echo "[1/5] launchd"
-# Also sweep legacy autoresearch plist if a pre-removal install left it behind.
-LEGACY_AR_PLIST="$HOME/Library/LaunchAgents/com.${USERNAME}.brain-autoresearch.plist"
-for label_plist in \
-    "com.${USERNAME}.brain-auto-extract:$PLIST" \
-    "com.${USERNAME}.brain-semantic-worker:$SEM_PLIST" \
-    "com.${USERNAME}.brain-autoresearch:$LEGACY_AR_PLIST"; do
-  label="${label_plist%%:*}"
-  plist="${label_plist#*:}"
-  if launchctl list 2>/dev/null | grep -q "$label"; then
-    launchctl unload "$plist" 2>/dev/null || true
-    echo "      ✓ unloaded $label"
-  fi
-  if [[ -f "$plist" ]]; then
-    rm -f "$plist"
-    echo "      ✓ removed $plist"
-  fi
-done
+echo "[1/5] scheduler ($(uname -s))"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/_scheduler.sh"
+scheduler_uninstall "$USERNAME"
 
 echo "[2/5] MCP registrations + SessionStart hooks"
 if command -v claude >/dev/null 2>&1; then
