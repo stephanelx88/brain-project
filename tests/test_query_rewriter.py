@@ -27,7 +27,7 @@ def tmp_cache(tmp_path, monkeypatch):
 def rewriter_enabled(monkeypatch):
     """Enable the rewriter (default is off). Tests that assert the
     disabled-path explicitly unset this."""
-    monkeypatch.setattr(query_rewriter, "_ENABLED", True)
+    monkeypatch.setenv("BRAIN_QUERY_REWRITE", "1")
 
 
 @pytest.fixture
@@ -47,11 +47,39 @@ def stub_llm(monkeypatch):
 # ---------- expand_query --------------------------------------------------
 
 
+def test_enabled_is_re_read_per_call(monkeypatch):
+    """WS7b: the gate flag must be evaluated on every call, not
+    frozen at import time, so admin + tests can flip via env without
+    reloading the module."""
+    monkeypatch.delenv("BRAIN_QUERY_REWRITE", raising=False)
+    assert query_rewriter._enabled() is False
+    monkeypatch.setenv("BRAIN_QUERY_REWRITE", "1")
+    assert query_rewriter._enabled() is True
+    monkeypatch.setenv("BRAIN_QUERY_REWRITE", "0")
+    assert query_rewriter._enabled() is False
+
+
+def test_timeout_sec_default_and_env_override(monkeypatch):
+    """WS7b: the recall-path timeout must default to the short value
+    (3 s) and be env-overridable. Longer timeouts are fine for
+    scripted callers; the recall path must never pay the old 15 s."""
+    monkeypatch.delenv("BRAIN_QUERY_REWRITE_TIMEOUT_SEC", raising=False)
+    assert query_rewriter._timeout_sec() == query_rewriter.DEFAULT_TIMEOUT_SEC
+    assert query_rewriter.DEFAULT_TIMEOUT_SEC <= 5.0
+
+    monkeypatch.setenv("BRAIN_QUERY_REWRITE_TIMEOUT_SEC", "7.5")
+    assert query_rewriter._timeout_sec() == 7.5
+
+    # Garbage value falls back to the default.
+    monkeypatch.setenv("BRAIN_QUERY_REWRITE_TIMEOUT_SEC", "not-a-number")
+    assert query_rewriter._timeout_sec() == query_rewriter.DEFAULT_TIMEOUT_SEC
+
+
 def test_expand_query_disabled_returns_original_only(tmp_cache, stub_llm):
     """When BRAIN_QUERY_REWRITE=0 (default), no LLM call happens and the
     caller sees just [query] — the rewriter is opt-in."""
     stub_llm["response"] = '["paraphrase one", "paraphrase two"]'
-    # Do NOT enable: _ENABLED stays False
+    # Do NOT enable: _enabled() reads the default ("0") → False
     out = query_rewriter.expand_query("where is son")
     assert out == ["where is son"]
     assert stub_llm["calls"] == 0

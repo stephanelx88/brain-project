@@ -44,12 +44,35 @@ import brain.config as config
 
 CACHE_DIR = config.BRAIN_DIR / ".cache" / "rerank"
 CACHE_TTL_DAYS = 7
-_ENABLED = os.environ.get("BRAIN_RERANK", "0") == "1"
 
 # Upper bound on candidates per LLM call. Haiku handles ~30 short
 # passages comfortably in one JSON response; beyond that per-token
 # latency eats the recall benefit.
 MAX_RERANK_N = 30
+
+# WS7b (2026-04-23): timeout tightened from 20s to 4s on the recall
+# path — same reasoning as query_rewriter.DEFAULT_TIMEOUT_SEC. Rerank
+# is one LLM call per recall (not per candidate), so 4s is enough for
+# Haiku to score ≤30 passages; longer budgets only matter if the
+# model is overloaded, and in that case we'd rather fall back to the
+# RRF ordering than block the agent.
+DEFAULT_TIMEOUT_SEC = 4.0
+
+
+def _enabled() -> bool:
+    """Evaluated per call so tests and admin can flip via env without
+    reloading the module. Defaults OFF per WS7b bench gate — see
+    `brain.query_rewriter._enabled` for the measurement outcome.
+    Flip with `BRAIN_RERANK=1`.
+    """
+    return os.environ.get("BRAIN_RERANK", "0") == "1"
+
+
+def _timeout_sec() -> float:
+    try:
+        return float(os.environ.get("BRAIN_RERANK_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC))
+    except (ValueError, TypeError):
+        return DEFAULT_TIMEOUT_SEC
 
 
 RERANK_PROMPT = """You are ranking search results for a personal \
@@ -84,7 +107,7 @@ def _default_llm(prompt: str) -> str | None:
         from brain.auto_extract import call_claude
     except ImportError:
         return None
-    return call_claude(prompt, timeout=20)
+    return call_claude(prompt, timeout=int(round(_timeout_sec())))
 
 
 def _call_llm(prompt: str) -> str | None:
@@ -236,7 +259,7 @@ def rerank(
     """
     if not candidates:
         return []
-    if not _ENABLED:
+    if not _enabled():
         return candidates[:k]
 
     top_n = candidates[:MAX_RERANK_N]

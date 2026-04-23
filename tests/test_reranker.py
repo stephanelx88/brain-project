@@ -27,7 +27,7 @@ def tmp_cache(tmp_path, monkeypatch):
 
 @pytest.fixture
 def reranker_enabled(monkeypatch):
-    monkeypatch.setattr(reranker, "_ENABLED", True)
+    monkeypatch.setenv("BRAIN_RERANK", "1")
 
 
 @pytest.fixture
@@ -53,6 +53,25 @@ def _sample_candidates() -> list[dict]:
         {"kind": "note", "path": "son-snippet.md",
          "title": "Son snippet", "snippet": "casual note about Son"},
     ]
+
+
+def test_enabled_is_re_read_per_call(monkeypatch):
+    """WS7b: flag is re-read on every rerank() call so tests can flip
+    via env without reloading the module."""
+    monkeypatch.delenv("BRAIN_RERANK", raising=False)
+    assert reranker._enabled() is False
+    monkeypatch.setenv("BRAIN_RERANK", "1")
+    assert reranker._enabled() is True
+
+
+def test_timeout_sec_default_is_tight(monkeypatch):
+    """WS7b: recall-path rerank must use a short default (≤ 5 s) so
+    flipping the flag on can't push p50 latency past the gate. The
+    original 20 s budget was fine for a scripted opt-in but unsafe
+    as a default for every brain_recall call."""
+    monkeypatch.delenv("BRAIN_RERANK_TIMEOUT_SEC", raising=False)
+    assert reranker._timeout_sec() == reranker.DEFAULT_TIMEOUT_SEC
+    assert reranker.DEFAULT_TIMEOUT_SEC <= 5.0
 
 
 # ---------- disabled path ------------------------------------------------
