@@ -183,32 +183,36 @@ def process_pending(
                 print(f"    empty (marked extracted)", flush=True)
             continue
 
-        # If this is an EDIT (we extracted a previous version of this note),
-        # retract everything that previous version contributed BEFORE adding
-        # the new facts. Otherwise old + new pile up and contradict each
-        # other — the user-reported case where editing
-        # "ho dang o can tho" → "ho dang o con dao" left both facts live in
-        # entities/people/{thuha,trinh}.md.
+        # Always invalidate facts previously sourced from this note before
+        # applying the new extraction. `invalidate_facts_for_note` is a
+        # no-op when the `fact_provenance` table has no rows for this path
+        # (first-ever extraction) so it is safe to call unconditionally.
+        #
+        # Doing this only when `extracted_sha is not None` — the old guard
+        # — missed two cases observed in production: (1) `post_extraction_
+        # _sync` requeues a stale note by setting `extracted_sha = NULL`,
+        # which then looks like a first extraction to this branch and
+        # leaves pre-requeue facts live; (2) a manual reset (e.g. to force
+        # a re-extract after an LLM hallucinated an earlier fact) had the
+        # same effect. Symptom: `thuha.md` retained "Currently at the
+        # beach" even after re-extracting "ho dang o Con Dao" correctly.
         #
         # Order matters: invalidate FIRST (clears old provenance rows for
         # this note), then apply (writes fresh provenance rows). Doing it
         # after apply would also strikethrough the just-added new facts.
-        is_edit = note["extracted_sha"] is not None
-        if is_edit:
-            try:
-                inv = invalidate_facts_for_note(note["path"], verbose=False, reason="edited")
-                if verbose and inv["facts_invalidated"]:
-                    print(
-                        f"    edit detected — invalidated "
-                        f"{inv['facts_invalidated']} prior fact(s) "
-                        f"in {inv['entities_touched']} entity file(s)",
-                        flush=True,
-                    )
-                for ep in inv.get("entity_paths") or []:
-                    summary["touched_paths"].add(str(ep))
-            except Exception as exc:
-                if verbose:
-                    print(f"    edit-invalidate failed (non-fatal): {exc}", flush=True)
+        try:
+            inv = invalidate_facts_for_note(note["path"], verbose=False, reason="edited")
+            if verbose and inv["facts_invalidated"]:
+                print(
+                    f"    invalidated {inv['facts_invalidated']} prior "
+                    f"fact(s) in {inv['entities_touched']} entity file(s)",
+                    flush=True,
+                )
+            for ep in inv.get("entity_paths") or []:
+                summary["touched_paths"].add(str(ep))
+        except Exception as exc:
+            if verbose:
+                print(f"    invalidate failed (non-fatal): {exc}", flush=True)
 
         try:
             result = apply_extraction(
