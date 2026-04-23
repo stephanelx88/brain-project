@@ -21,6 +21,76 @@ def tmp_vault(tmp_path, monkeypatch):
     return vault
 
 
+def test_ingest_one_changes_note_without_walking_vault(tmp_vault):
+    from brain import ingest_notes, db
+
+    note = tmp_vault / "standalone.md"
+    note.write_text("# standalone\n\nbody\n")
+    out = ingest_notes.ingest_one(note)
+    assert out == {"status": "changed", "rel_path": "standalone.md",
+                   "changed": True, "deleted": False}
+
+    rows = db.search_notes("standalone", k=5)
+    assert any(r["path"] == "standalone.md" for r in rows)
+
+
+def test_ingest_one_unchanged_on_second_call(tmp_vault):
+    from brain import ingest_notes
+
+    note = tmp_vault / "idempotent.md"
+    note.write_text("same content")
+    first = ingest_notes.ingest_one(note)
+    assert first["status"] == "changed"
+    # Touch mtime to force the ledger probe past the content check
+    import os
+    st = note.stat()
+    os.utime(note, (st.st_atime, st.st_mtime + 5))
+    second = ingest_notes.ingest_one(note)
+    assert second["status"] == "unchanged"
+
+
+def test_ingest_one_skips_entity_dir(tmp_vault):
+    from brain import ingest_notes
+
+    ef = tmp_vault / "entities" / "people" / "e.md"
+    ef.parent.mkdir(parents=True, exist_ok=True)
+    ef.write_text("- fact")
+    out = ingest_notes.ingest_one(ef)
+    assert out["status"] == "skipped"
+
+
+def test_ingest_one_skips_machine_dir(tmp_vault):
+    from brain import ingest_notes
+
+    (tmp_vault / "raw").mkdir(exist_ok=True)
+    trans = tmp_vault / "raw" / "session.md"
+    trans.write_text("transient")
+    out = ingest_notes.ingest_one(trans)
+    assert out["status"] == "skipped"
+
+
+def test_ingest_one_rejects_path_outside_vault(tmp_vault, tmp_path):
+    from brain import ingest_notes
+    outside = tmp_path / "nope.md"
+    outside.write_text("nope")
+    out = ingest_notes.ingest_one(outside)
+    assert out["status"] == "skipped"
+
+
+def test_ingest_one_handles_delete(tmp_vault):
+    from brain import ingest_notes, db
+
+    note = tmp_vault / "tmp-note.md"
+    note.write_text("x")
+    ingest_notes.ingest_one(note)
+    assert any(r["path"] == "tmp-note.md" for r in db.search_notes("x", k=5))
+
+    note.unlink()
+    out = ingest_notes.ingest_one(note)
+    assert out["status"] == "deleted"
+    assert out["deleted"] is True
+
+
 def test_walker_skips_machine_dirs(tmp_vault, monkeypatch):
     from brain import ingest_notes
 
