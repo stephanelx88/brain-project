@@ -176,6 +176,20 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_watch(args: argparse.Namespace) -> int:
+    """`brain watch` — fs-event watcher daemon.
+
+    Without flags: runs the watcher in the foreground (Ctrl-C to exit).
+    `--install-unit`: renders the systemd user unit into
+        `$XDG_CONFIG_HOME/systemd/user/brain-watcher.service`,
+        reloads daemon, and enables+starts it. Linux only.
+    """
+    from brain import watcher
+    if getattr(args, "install_unit", False):
+        return watcher.install_unit(enable=not args.no_enable)
+    return watcher.watch_vault(verbose=args.verbose)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="brain", description="Personal brain CLI.")
     p.add_argument("--version", action="store_true")
@@ -282,6 +296,21 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("-v", "--verbose", action="store_true",
                          help="Print one line per query with rank / weak outcome")
     p_bench.set_defaults(func=_cmd_bench)
+
+    p_watch = sub.add_parser(
+        "watch",
+        help="fs-event watcher daemon (sub-second indexing on Linux)",
+    )
+    p_watch.add_argument("-v", "--verbose", action="store_true",
+                         help="Print one line per dispatched event")
+    p_watch.add_argument("--install-unit", action="store_true",
+                         dest="install_unit",
+                         help="Render + enable the systemd --user unit "
+                              "(Linux only). No-op on macOS.")
+    p_watch.add_argument("--no-enable", action="store_true",
+                         help="With --install-unit, write the unit but do "
+                              "not `systemctl --user enable --now` it.")
+    p_watch.set_defaults(func=_cmd_watch)
 
     args = p.parse_args(argv)
     if args.version:

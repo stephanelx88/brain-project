@@ -78,9 +78,8 @@ _LAST_FRESH_TICK: float = 0.0
 def _ensure_fresh() -> None:
     """Bring the indexes in line with current filesystem state.
 
-    Runs three cheap sweeps before a read tool answers so mutations
-    that happened since the last pipeline tick are reflected
-    immediately:
+    Runs cheap sweeps before a read tool answers so mutations that
+    happened since the last pipeline tick are reflected immediately:
 
       1. `sync_mutated_entities` — reindex entity files whose on-disk
          mtime is newer than the indexed_mtime column (direct edits
@@ -91,6 +90,14 @@ def _ensure_fresh() -> None:
       3. `gc_orphaned_entities` + incremental semantic update — purge
          entity rows whose markdown is gone and embed any facts that
          landed since the last `.vec` build.
+
+    **Per-source watermarks (WS3, 2026-04-23)**: each fs-walking sweep
+    is skipped when its source dir's newest mtime is not past the
+    watermark recorded at `<BRAIN_DIR>/.freshness.json`. An idle vault
+    therefore pays only the cheap recursive stat (via
+    `brain.freshness`) instead of three full walks. When a sweep runs,
+    it bumps the watermark. DB-side sweeps (gc, semantic probe) run
+    unconditionally — their inputs are rows, not file mtimes.
 
     **Called from every read-path tool** (brain_recall, brain_search,
     brain_notes, brain_semantic, brain_entities, brain_recent).
@@ -123,15 +130,33 @@ def _ensure_fresh() -> None:
     if now - _LAST_FRESH_TICK < throttle:
         return
     _LAST_FRESH_TICK = now
+
+    from brain import freshness
+
     try:
-        db.sync_mutated_entities()
+        entities_mtime = freshness.entities_dir_mtime()
     except Exception:
-        pass
+        entities_mtime = 0.0
     try:
-        from brain import ingest_notes
-        ingest_notes.ingest_all()
+        notes_mtime = freshness.notes_dir_mtime()
     except Exception:
-        pass
+        notes_mtime = 0.0
+
+    if freshness.needs_sweep("entities", probe_mtime=entities_mtime):
+        try:
+            db.sync_mutated_entities()
+            freshness.bump("entities", entities_mtime)
+        except Exception:
+            pass
+
+    if freshness.needs_sweep("notes", probe_mtime=notes_mtime):
+        try:
+            from brain import ingest_notes
+            ingest_notes.ingest_all()
+            freshness.bump("notes", notes_mtime)
+        except Exception:
+            pass
+
     try:
         db.gc_orphaned_entities()
     except Exception:
