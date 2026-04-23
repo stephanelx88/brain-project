@@ -56,25 +56,40 @@ MISS_RRF_THRESHOLD = float(_os.environ.get("BRAIN_MISS_RRF_THRESHOLD", "0.05"))
 
 
 DEFAULT_EVAL_QUERIES = [
-    # brain self-knowledge
+    # ---- brain self-knowledge ----
     "playground promotion to entities",
     "Question Coverage Score metric",
-    # X crawl project
+    "how does hybrid recall work",           # paraphrase of BM25+semantic explanation
+    # ---- X crawl project ----
     "x crawl playwright cookies authenticated session",
     "Karpathy tweets crawled persistent memory",
-    # cross-project / people
+    # ---- cross-project / people ----
     "Madhav Kamath role at Honeywell BMS",
     "stakeholder requirements driver in BMS Honeywell",
-    # operational lessons
+    "who works at Honeywell",                # name-agnostic paraphrase
+    # ---- operational lessons ----
     "dual-instance Mac freeze prevention",
     "active session guard auto extract idle",
     "semantic deduplication recency weighting",
     "brain_status MCP dashboard",
-    # personal context
+    "how to avoid concurrent extraction crashes",  # paraphrase of active session guard
+    # ---- personal context ----
     "son in long xuyen",
     "Vietnamese tone preferences corrections",
-    # shape-of-system queries
+    "where is son living now",               # paraphrase of "son in long xuyen"
+    "Son ở đâu",                             # Vietnamese paraphrase of above
+    "ngôn ngữ giao tiếp với son",             # "what language does son communicate in"
+    # ---- shape-of-system queries ----
     "session harvest pipeline ingest extract reconcile",
+    "how the fact extraction pipeline flows end-to-end",
+    # ---- query-rewriter + reranker regression anchors ----
+    # Aliased-entity recall: a query that doesn't use the canonical name
+    # must still find the entity via the rewriter's alias expansion.
+    "the person who runs brain",
+    # Multi-hop: a fact connected through two entities.
+    "what does the person at Honeywell work on",
+    # Edge-case typos: the rewriter should map common misspellings.
+    "Madhav Kamth BMS",                      # missing 'a'
 ]
 
 

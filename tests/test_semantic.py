@@ -312,6 +312,42 @@ def test_ensure_built_triggers_incremental_when_db_has_new_rows(
     assert _count_vec_rows(semantic.FACTS_NPY) == before_rows + 1
 
 
+def test_search_facts_drops_superseded_at_query_time(tmp_brain_with_db):
+    """Race condition: a fact indexed as active gets marked superseded
+    between rebuilds. Without query-time filtering, cosine search keeps
+    surfacing it because the embedding store is append-only."""
+    from brain import db
+    semantic.build()
+    # Mark fact 1 as superseded AFTER indexing.
+    with db.connect() as conn:
+        conn.execute("UPDATE facts SET status='superseded' WHERE id=1")
+
+    results = semantic.search_facts("alpha bravo", k=8)
+    # Fact 1 ("alpha bravo charlie") must NOT be in results anymore.
+    assert all(h["name"] != "Foo Project" for h in results), (
+        "superseded fact resurfaced via cosine"
+    )
+
+
+def test_search_facts_survives_db_lookup_failure(
+    tmp_brain_with_db, monkeypatch
+):
+    """If the status lookup fails (DB locked, wiped), search_facts must
+    still return results rather than going silent. Recall is
+    user-visible; status filtering is a soft guarantee."""
+    from brain import db as db_module
+    semantic.build()
+
+    # Break connect() so the status probe raises.
+    def boom():
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(db_module, "connect", boom)
+
+    # Must not raise; must still return something.
+    results = semantic.search_facts("alpha", k=5)
+    assert isinstance(results, list)
+
+
 def test_ensure_built_incremental_failure_swallowed(
     tmp_brain_with_db, monkeypatch
 ):

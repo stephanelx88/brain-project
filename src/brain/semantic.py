@@ -608,15 +608,53 @@ def _topk(query_vec: np.ndarray, mat: np.ndarray, k: int) -> list[tuple[int, flo
 
 
 def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
+    """Pure-semantic fact search, with a query-time supersession filter.
+
+    Over-fetches from the index, then drops any hit whose fact row has
+    been marked superseded since last build. Without this, a fact
+    active at index-time but contradicted between rebuilds keeps
+    surfacing via cosine similarity — the index is append-only and
+    status flips aren't reflected until the next full rebuild (6 h
+    cadence). The bulk status lookup is one SQL query keyed on the
+    top-k rowids; cheap even at k=32.
+    """
     vecs, meta = _load_facts()
     qv = _embed([query])[0]
-    over_k = k * 4 if type else k
-    hits = _topk(qv, vecs, over_k)
+    # Over-fetch so we still return `k` rows after dropping supersedes
+    # and applying the type filter; 3x covers the worst observed
+    # superseded-rate without eating noticeable latency.
+    over_k = max(k * 4, k + 16) if type else max(k * 3, k + 8)
+    hits = _topk(qv, vecs, min(over_k, vecs.shape[0]))
+
+    # One status lookup for every candidate, so a fact whose status flipped
+    # to 'superseded' after indexing gets dropped. The rowid in FACTS_JSON
+    # mirrors facts.id in the DB, so we can lookup directly.
+    rowids = [int(meta[i].get("rowid") or 0) for i, _ in hits]
+    status_by_id: dict[int, str | None] = {}
+    if rowids:
+        try:
+            with db.connect() as conn:
+                placeholders = ",".join("?" * len(rowids))
+                rows = conn.execute(
+                    f"SELECT id, status FROM facts WHERE id IN ({placeholders})",
+                    rowids,
+                ).fetchall()
+            status_by_id = {int(r[0]): r[1] for r in rows}
+        except Exception:
+            status_by_id = {}
+
     out: list[dict] = []
     for i, score in hits:
         m = meta[i]
         if type and m["type"] != type:
             continue
+        rowid = int(m.get("rowid") or 0)
+        # Drop rows whose status is superseded OR who no longer exist in
+        # the DB (retracted). Rows missing from the lookup (e.g. DB fault)
+        # pass through — never hide results on infrastructure errors.
+        if status_by_id and rowid in status_by_id:
+            if status_by_id[rowid] == "superseded":
+                continue
         out.append(
             {
                 "type": m["type"],
