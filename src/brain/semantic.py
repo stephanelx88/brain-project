@@ -887,6 +887,21 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
         adj = scores[k_] * _path_penalty(path) * _density_boost(hit) * _recency_factor(hit) * _primary_entity_boost(hit)
         fused.append({**hit, "rrf": adj})
     fused.sort(key=lambda x: -x["rrf"])
+
+    # WS7a subject-reject: hard filter on owner-self-reference +
+    # proper-noun queries, gated by BRAIN_SUBJECT_REJECT. When off,
+    # this is a cheap import-free no-op. When on, dropped hits leave
+    # an audit trail at ~/.brain/.audit/subject_reject.jsonl.
+    if os.environ.get("BRAIN_SUBJECT_REJECT", "0") == "1":
+        try:
+            from brain import subject_reject
+            hint = subject_reject.parse_query_subject(query)
+            if hint.subject_slug is not None:
+                fused = subject_reject.filter_hits(fused, hint, query=query)
+        except Exception:
+            # Filter must never break recall — silent fallback to the
+            # un-filtered pool if anything in the parser blows up.
+            pass
     return fused[:k]
 
 
