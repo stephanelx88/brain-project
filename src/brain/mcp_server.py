@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from mcp.server.fastmcp import FastMCP
@@ -66,11 +67,15 @@ def _semantic():
     return semantic
 
 
+_LAST_FRESH_TICK: float = 0.0
+
+
 def _ensure_fresh() -> None:
     """Bring the indexes in line with current filesystem state.
 
-    Runs three cheap sweeps before a recall answers so mutations that
-    happened since the last pipeline tick are reflected immediately:
+    Runs three cheap sweeps before a read tool answers so mutations
+    that happened since the last pipeline tick are reflected
+    immediately:
 
       1. `sync_mutated_entities` — reindex entity files whose on-disk
          mtime is newer than the indexed_mtime column (direct edits
@@ -82,13 +87,37 @@ def _ensure_fresh() -> None:
          entity rows whose markdown is gone and embed any facts that
          landed since the last `.vec` build.
 
-    Each sweep is idempotent and cheap on idle (stat-only pass). Set
-    `BRAIN_RECALL_ENSURE_FRESH=0` to disable if the cost ever shows up
-    in a hot-path profile — the pipeline will then fall back to its
-    scheduled ticks for consistency.
+    **Called from every read-path tool** (brain_recall, brain_search,
+    brain_notes, brain_semantic, brain_entities, brain_recent).
+    Previously only brain_recall paid this tax, which produced the
+    2026-04-23 `son.md` incident: a user wrote a note, asked about it,
+    claude's brain call happened to hit `brain_notes` / `brain_search`
+    — neither of which refreshed — so the just-written note didn't
+    surface and claude truthfully reported "brain has no record".
+    Making the sweep uniform closes that asymmetry.
+
+    **Throttled** to avoid hammering when claude makes 3-5 brain calls
+    in a row: if this ran within `BRAIN_RECALL_FRESH_THROTTLE_SEC`
+    (default 1.0 s), skip. The stat-sweep cost on a warm cache is
+    ~10-40 ms but paying it three times inside 300 ms would still show
+    up on latency-sensitive loops.
+
+    Each sweep is idempotent. Set `BRAIN_RECALL_ENSURE_FRESH=0` to
+    disable entirely if the cost ever shows up in a hot-path profile
+    — the pipeline will then fall back to its scheduled ticks for
+    consistency.
     """
+    global _LAST_FRESH_TICK
     if os.environ.get("BRAIN_RECALL_ENSURE_FRESH", "1") == "0":
         return
+    try:
+        throttle = float(os.environ.get("BRAIN_RECALL_FRESH_THROTTLE_SEC", "1.0"))
+    except (ValueError, TypeError):
+        throttle = 1.0
+    now = time.monotonic()
+    if now - _LAST_FRESH_TICK < throttle:
+        return
+    _LAST_FRESH_TICK = now
     try:
         db.sync_mutated_entities()
     except Exception:
@@ -149,6 +178,7 @@ def brain_search(query: str, k: int = 8, type: str | None = None) -> str:
 
     Returns a JSON array of {type,name,path,text,source,date,score}.
     """
+    _ensure_fresh()
     k = max(1, min(int(k), 25))
     seen: set = set()
     out: list = []
@@ -192,6 +222,7 @@ def brain_entities(query: str, k: int = 8) -> str:
 
     Returns a JSON array of {type,name,path,summary,score}.
     """
+    _ensure_fresh()
     k = max(1, min(int(k), 25))
     seen: set = set()
     out: list = []
@@ -261,6 +292,7 @@ def brain_notes(query: str, k: int = 8) -> str:
 
     Returns JSON list of {title, path, snippet, mtime}.
     """
+    _ensure_fresh()
     k = max(1, min(int(k), 25))
     semantic = _semantic()
     semantic.ensure_built()
@@ -367,6 +399,7 @@ def brain_recent(hours: int = 48, type: str | None = None, k: int = 20) -> str:
 
     Useful at session start: "what changed since I last worked?"
     """
+    _ensure_fresh()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=int(hours))).strftime("%Y-%m-%d")
     sql = """
       SELECT type, name, path, summary, last_updated
@@ -568,6 +601,7 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
 def brain_semantic(query: str, k: int = 8, type: str | None = None) -> str:
     """Pure semantic (dense-vector) fact search. Use when you want
     paraphrase recall and don't care about exact keyword matches."""
+    _ensure_fresh()
     semantic = _semantic()
     k = max(1, min(int(k), 25))
     semantic.ensure_built()
