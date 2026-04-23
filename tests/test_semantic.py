@@ -98,6 +98,11 @@ def test_search_facts_returns_results(tmp_brain_with_db):
     assert len(res) == 2
     assert {r["name"] for r in res} == {"Foo Project", "Bar Project"}
     assert all("score" in r for r in res)
+    # Each hit must carry path + date keys so hybrid_search's recency
+    # factor and path-penalty can apply to semantic-only hits. Without
+    # them, a fact found only via cosine silently skipped both adjustments.
+    assert all("path" in r and "date" in r for r in res)
+    assert any(r["path"] and r["path"].startswith("entities/projects/") for r in res)
 
 
 def test_search_facts_type_filter(tmp_brain_with_db):
@@ -124,3 +129,25 @@ def test_hybrid_search_fuses_branches(tmp_brain_with_db):
     # alpha should win because BM25 hits the literal token
     assert any("alpha" in r["text"] for r in res)
     assert "rrf" in res[0]
+
+
+def test_hybrid_preserves_cosine_for_dual_hit_facts(tmp_brain_with_db):
+    """When a fact hits BOTH BM25 and semantic, `score` gets overwritten by
+    the BM25 value (negative). The raw cosine must still be reachable via
+    `sem_score` so brain_recall's semantic-fallback check can read it —
+    otherwise any cross-branch hit silently zeroes out the fallback path.
+    """
+    semantic.build()
+    res = semantic.hybrid_search("alpha", k=5)
+    # "alpha bravo charlie" exists and is a token that BM25 can hit.
+    dual = [h for h in res
+            if h.get("semantic_rank") is not None
+            and h.get("lexical_rank") is not None]
+    assert dual, "expected at least one hit from both BM25 and semantic"
+    for h in dual:
+        assert "sem_score" in h, "cosine must be preserved under sem_score"
+        # Cosine from normalised embeddings lives in [-1, 1]. BM25's
+        # `score` column for the same hit is commonly ≪ -1 (SQLite FTS5
+        # returns values like -0.15 … -5.0). As long as sem_score stays
+        # in the cosine range, it's distinguishable from the BM25 value.
+        assert -1.0 <= h["sem_score"] <= 1.0

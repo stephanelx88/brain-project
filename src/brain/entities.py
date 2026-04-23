@@ -159,11 +159,19 @@ def append_to_entity_path(path: Path, section: str, content: str) -> Path:
             updated_lines.append(line)
     text = "\n".join(updated_lines)
 
+    # Match the header as a standalone line, not as a substring. A fact
+    # that happens to contain the literal text "## Key Facts" (rare but
+    # possible) would otherwise hijack the insertion point, splicing
+    # new facts inside the middle of a bullet list.
     section_header = f"## {section}"
-    if section_header in text:
-        idx = text.index(section_header) + len(section_header)
-        next_newline = text.index("\n", idx)
-        text = text[:next_newline] + f"\n{new_content}" + text[next_newline:]
+    lines = text.split("\n")
+    header_idx = next(
+        (i for i, ln in enumerate(lines) if ln.rstrip() == section_header),
+        -1,
+    )
+    if header_idx >= 0:
+        lines.insert(header_idx + 1, new_content)
+        text = "\n".join(lines)
     else:
         text = text.rstrip() + f"\n\n{section_header}\n{new_content}\n"
 

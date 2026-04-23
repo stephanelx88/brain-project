@@ -117,7 +117,7 @@ def build() -> dict:
         fact_rows = conn.execute(
             """
             SELECT f.id, f.text, f.source, f.entity_id,
-                   e.type, e.name, e.slug
+                   e.type, e.name, e.slug, f.fact_date, e.path
             FROM facts f
             JOIN entities e ON e.id = f.entity_id
             WHERE f.status IS NULL OR f.status != 'superseded'
@@ -140,6 +140,11 @@ def build() -> dict:
             "type": r[4],
             "name": r[5],
             "slug": r[6],
+            # date + path carried through so hybrid_search's recency factor
+            # and path-penalty apply to semantic-only hits too. Without these,
+            # a fact found only via cosine skipped both adjustments.
+            "date": r[7],
+            "path": r[8],
         }
         for r in fact_rows
     ]
@@ -447,6 +452,8 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
                 "slug": m["slug"],
                 "text": m["text"],
                 "source": m["source"],
+                "date": m.get("date"),
+                "path": m.get("path"),
                 "score": score,
             }
         )
@@ -523,10 +530,16 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
     for rank, hit in enumerate(search_facts(query, k=k * 2, type=type)):
         key = _key_fact(hit)
         existing = pool.get(key)
+        # Preserve the raw cosine under `sem_score` — `score` may
+        # already be a BM25 value (negative) from the lexical branch,
+        # and `brain_recall`'s semantic-fallback check needs the real
+        # cosine similarity, not whichever branch set `score` first.
+        sem_score = float(hit.get("score", 0.0))
         if existing is None:
-            pool[key] = {**hit, "kind": "fact", "semantic_rank": rank}
+            pool[key] = {**hit, "kind": "fact", "semantic_rank": rank, "sem_score": sem_score}
         else:
             existing["semantic_rank"] = rank
+            existing["sem_score"] = sem_score
         scores[key] += 1.0 / (K + rank)
 
     if not type:
@@ -547,10 +560,12 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
         for rank, hit in enumerate(search_notes(query, k=k * 2)):
             key = _key_note(hit)
             existing = pool.get(key)
+            sem_score = float(hit.get("score", 0.0))
             if existing is None:
-                pool[key] = {**hit, "semantic_rank": rank}
+                pool[key] = {**hit, "semantic_rank": rank, "sem_score": sem_score}
             else:
                 existing["semantic_rank"] = rank
+                existing["sem_score"] = sem_score
             scores[key] += 1.0 / (K + rank)
 
     # Re-rank step: punish low-signal-density meta files and reward short,

@@ -41,3 +41,25 @@ def test_validate_slug_rejects_uppercase():
 def test_validate_slug_rejects_empty():
     with pytest.raises(ValueError):
         validate_slug("")
+
+
+def test_slugify_vietnamese_ascii_folds():
+    # Vietnamese with tone/diacritic marks round-trips via NFKD ASCII fold.
+    assert slugify("Nguyễn Sơn") == "nguyen-son"
+    assert slugify("Việt Nam") == "viet-nam"
+
+
+def test_slugify_cjk_falls_back_to_unicode():
+    # Pure non-Latin text: ASCII fold returns "", so previously the
+    # slug was empty and validate_slug raised ValueError mid-extraction.
+    # Now it keeps Unicode word chars so the entity is findable.
+    slug = slugify("田中さん")
+    assert slug != ""
+    assert slug == slugify(slug)  # idempotent → passes validate_slug
+    validate_slug(slug)
+
+
+def test_slugify_mixed_keeps_ascii_when_available():
+    # Vietnamese (ASCII-foldable) + CJK — ASCII-fold produces a
+    # non-empty slug, so we prefer that over the Unicode form.
+    assert slugify("Sơn 田中") == "son"

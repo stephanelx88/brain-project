@@ -123,10 +123,10 @@ def brain_search(query: str, k: int = 8, type: str | None = None) -> str:
         out.append({
             "type": hit["type"],
             "name": hit["name"],
-            "path": f"entities/{hit['type']}/{hit['slug']}.md",
+            "path": hit.get("path") or f"entities/{hit['type']}/{hit['slug']}.md",
             "text": hit["text"],
             "source": hit.get("source") or "",
-            "date": None,
+            "date": hit.get("date"),
             "score": hit["score"],
         })
         if len(out) >= k:
@@ -396,8 +396,15 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     # This is the architecturally correct fix: BM25 missing on a cross-lingual
     # query is not evidence of a bad match — it's a language mismatch.
     if weak_match and results:
+        # Use `sem_score` (true cosine), not `score` — when a hit is
+        # merged across both branches, `score` holds the BM25 value from
+        # the lexical branch (often negative). That silently zeroed out
+        # the fallback for any cross-lingual query where both branches
+        # happened to touch the same fact.
         semantic_top = max(
-            (h.get("score") or 0.0 for h in results
+            (h.get("sem_score") if h.get("sem_score") is not None
+             else (h.get("score") or 0.0)
+             for h in results
              if h.get("semantic_rank") is not None),
             default=0.0,
         )

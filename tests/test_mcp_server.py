@@ -28,6 +28,36 @@ def tmp_brain_for_mcp(tmp_path, monkeypatch):
     db_path = brain_dir / ".brain.db"
     monkeypatch.setattr(db, "DB_PATH", db_path)
 
+    # Isolate the semantic index — without this, sem.ensure_built() and
+    # search_facts() read from the real ~/.brain/.vec/ and leak the user's
+    # entities into test results.
+    from brain import semantic
+    monkeypatch.setattr(semantic, "VEC_DIR", brain_dir / ".vec")
+    monkeypatch.setattr(semantic, "FACTS_NPY", brain_dir / ".vec" / "facts.npy")
+    monkeypatch.setattr(semantic, "FACTS_JSON", brain_dir / ".vec" / "facts.json")
+    monkeypatch.setattr(semantic, "ENT_NPY", brain_dir / ".vec" / "entities.npy")
+    monkeypatch.setattr(semantic, "ENT_JSON", brain_dir / ".vec" / "entities.json")
+    monkeypatch.setattr(semantic, "NOTES_NPY", brain_dir / ".vec" / "notes.npy")
+    monkeypatch.setattr(semantic, "NOTES_JSON", brain_dir / ".vec" / "notes.json")
+    monkeypatch.setattr(semantic, "META_JSON", brain_dir / ".vec" / "meta.json")
+
+    # Stub the embedder so tests don't download/load the 120 MB ST model.
+    import numpy as np
+
+    def fake_embed(texts, batch_size=64):
+        if not texts:
+            return np.zeros((0, semantic.DIM), dtype=np.float32)
+        out = []
+        for t in texts:
+            seed = abs(hash(t)) % (2**32)
+            rng = np.random.default_rng(seed)
+            v = rng.standard_normal(semantic.DIM).astype(np.float32)
+            v /= np.linalg.norm(v) + 1e-9
+            out.append(v)
+        return np.stack(out)
+
+    monkeypatch.setattr(semantic, "_embed", fake_embed)
+
     with db.connect() as conn:
         conn.execute(
             "INSERT INTO entities (path, type, slug, name, summary) VALUES (?,?,?,?,?)",

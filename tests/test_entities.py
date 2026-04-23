@@ -81,3 +81,48 @@ def test_append_to_entity_path_handles_date_prefixed_slug(tmp_brain, monkeypatch
     content = odd_file.read_text()
     assert "- merged fact (source: b)" in content
     assert "source_count: 2" in content
+
+
+def test_append_to_entity_section_header_is_line_anchored(tmp_brain, monkeypatch):
+    """Regression: the old substring match `section_header in text` would
+    pick the first place `## Key Facts` appeared — including inside a
+    fact line that *mentioned* the literal text — and splice new content
+    there, corrupting the bullet list. The line-anchored match must
+    ignore header-like strings that appear inside fact bodies.
+    """
+    monkeypatch.setattr(config, "ENTITIES_DIR", tmp_brain / "entities")
+    monkeypatch.setattr(config, "ENTITY_TYPES", {
+        k: tmp_brain / "entities" / k for k in config.ENTITY_TYPES
+    })
+    projects_dir = tmp_brain / "entities" / "projects"
+    projects_dir.mkdir(parents=True, exist_ok=True)
+    odd_file = projects_dir / "meta-project.md"
+    odd_file.write_text(
+        "---\n"
+        "type: project\n"
+        "name: Meta Project\n"
+        "status: current\n"
+        "first_seen: 2026-04-23\n"
+        "last_updated: 2026-04-23\n"
+        "source_count: 1\n"
+        "tags: []\n"
+        "---\n\n"
+        "# Meta Project\n\n"
+        "## Notes\n"
+        "- Discussed the `## Key Facts` convention in docs (source: a)\n\n"
+        "## Key Facts\n"
+        "- real fact one (source: a)\n"
+    )
+
+    append_to_entity_path(odd_file, "Key Facts", "- real fact two (source: b)")
+    content = odd_file.read_text()
+
+    # New fact must land immediately after the REAL `## Key Facts`
+    # header, not inside the Notes bullet that mentions `## Key Facts`.
+    notes_idx = content.index("## Notes")
+    real_header_idx = content.index("\n## Key Facts\n")
+    new_fact_idx = content.index("- real fact two")
+    old_fact_idx = content.index("- real fact one")
+    assert notes_idx < real_header_idx < new_fact_idx < old_fact_idx
+    # The Notes bullet must not have been corrupted.
+    assert "Discussed the `## Key Facts` convention" in content
