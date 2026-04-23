@@ -135,6 +135,12 @@ def build() -> dict:
         {
             "rowid": r[0],
             "text": r[1],
+            # `fact_hash` pins the embedded text to the exact bytes that
+            # produced its vector. `search_facts` compares this against
+            # the current DB text at query time and drops any hit whose
+            # hash drifted — closes the "stale fact confidently served"
+            # class from the 2026-04-23 Thuha-in-Cần-Thơ incident.
+            "fact_hash": db.canonical_fact_hash(r[1] or ""),
             "source": r[2],
             "entity_id": r[3],
             "type": r[4],
@@ -282,7 +288,9 @@ def incremental_update_facts_entities() -> dict:
 
     new_fact_meta = [
         {
-            "rowid": r[0], "text": r[1], "source": r[2],
+            "rowid": r[0], "text": r[1],
+            "fact_hash": db.canonical_fact_hash(r[1] or ""),
+            "source": r[2],
             "entity_id": r[3], "type": r[4], "name": r[5],
             "slug": r[6], "date": r[7], "path": r[8],
         }
@@ -607,6 +615,89 @@ def _topk(query_vec: np.ndarray, mat: np.ndarray, k: int) -> list[tuple[int, flo
     return [(int(i), float(sims[i])) for i in idx[:k]]
 
 
+def _audit_stale_snippet(
+    fact_id: int,
+    *,
+    meta_hash: str,
+    db_hash: str,
+    source_path: str | None,
+) -> None:
+    """Record a stale-embedding drop in the WS5 hash-chained ledger.
+
+    Counter-only — sha8 correlation keys, never raw fact text. Security
+    WS5 requirement: ledger rows must contain no content, only what a
+    post-hoc auditor needs to tell *which* fact was bad. `brain doctor`
+    walks `_audit_ledger.validate()` separately; this function just
+    emits the row.
+
+    Best-effort: an import failure or disk-full swallow silently so the
+    recall path is never blocked by the audit side-effect.
+    """
+    try:
+        from brain import _audit_ledger
+        _audit_ledger.append(
+            "stale_snippet_served",
+            {
+                "fact_id": int(fact_id),
+                "meta_sha8": (meta_hash or "")[:8],
+                "db_sha8": (db_hash or "")[:8],
+                "source_path": source_path or "",
+            },
+            actor="semantic.search_facts",
+        )
+    except Exception:
+        pass
+
+
+def count_stale_fact_meta() -> dict:
+    """Return `{total, stale, orphan, ratio}` comparing .vec/facts.json
+    against the current DB.
+
+    Consumer: `brain doctor`. Stale = meta hash != db hash on a live
+    row. Orphan = meta row whose rowid is absent from the facts table
+    (already handled by the existing rowid-missing drop, but doctor
+    still counts it so the admin sees the staleness budget).
+    """
+    if not FACTS_JSON.exists():
+        return {"total": 0, "stale": 0, "orphan": 0, "ratio": 0.0}
+    try:
+        meta = json.loads(FACTS_JSON.read_text())
+    except Exception:
+        return {"total": 0, "stale": 0, "orphan": 0, "ratio": 0.0}
+    if not isinstance(meta, list) or not meta:
+        return {"total": 0, "stale": 0, "orphan": 0, "ratio": 0.0}
+    rowids = [int(m.get("rowid") or 0) for m in meta]
+    try:
+        with db.connect() as conn:
+            placeholders = ",".join("?" * len(rowids))
+            rows = conn.execute(
+                f"SELECT id, text FROM facts WHERE id IN ({placeholders})",
+                rowids,
+            ).fetchall()
+    except Exception:
+        return {"total": len(meta), "stale": 0, "orphan": 0, "ratio": 0.0}
+    text_by_id = {int(r[0]): r[1] or "" for r in rows}
+    stale = orphan = 0
+    for m in meta:
+        rid = int(m.get("rowid") or 0)
+        if rid not in text_by_id:
+            orphan += 1
+            continue
+        meta_hash = m.get("fact_hash")
+        if not meta_hash:
+            continue  # pre-guard build; neither stale nor orphan
+        if db.canonical_fact_hash(text_by_id[rid]) != meta_hash:
+            stale += 1
+    bad = stale + orphan
+    ratio = (bad / len(meta)) if meta else 0.0
+    return {
+        "total": len(meta),
+        "stale": stale,
+        "orphan": orphan,
+        "ratio": round(ratio, 4),
+    }
+
+
 def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
     """Pure-semantic fact search, with a query-time supersession filter.
 
@@ -639,19 +730,28 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
     # after the note was deleted" failure we just closed.
     rowids = [int(meta[i].get("rowid") or 0) for i, _ in hits]
     status_by_id: dict[int, str | None] = {}
+    text_by_id: dict[int, str] = {}
     db_queried_ok = False
     if rowids:
         try:
             with db.connect() as conn:
                 placeholders = ",".join("?" * len(rowids))
+                # `text` pulled alongside status so we can compute the
+                # current DB hash and compare vs the hash baked into the
+                # meta entry at embed time. Stale-embedding guard (incident
+                # 2026-04-23): a fact whose text was edited in place
+                # after indexing still had its old vector cached; without
+                # this guard cosine search happily served the ghost text.
                 rows = conn.execute(
-                    f"SELECT id, status FROM facts WHERE id IN ({placeholders})",
+                    f"SELECT id, status, text FROM facts WHERE id IN ({placeholders})",
                     rowids,
                 ).fetchall()
             status_by_id = {int(r[0]): r[1] for r in rows}
+            text_by_id = {int(r[0]): r[2] or "" for r in rows}
             db_queried_ok = True
         except Exception:
             status_by_id = {}
+            text_by_id = {}
             db_queried_ok = False
 
     out: list[dict] = []
@@ -669,6 +769,23 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
                 continue
             if status_by_id[rowid] == "superseded":
                 continue
+            # Stale-text guard. `fact_hash` is attached to each meta
+            # entry at embed time (`build` / `incremental_update_...`);
+            # absent only on caches built before this guard landed —
+            # treat missing hash as "not-yet-backfilled, pass through"
+            # so first-deploy doesn't drop every hit. Full rebuild on
+            # next scheduled tick repopulates.
+            meta_hash = m.get("fact_hash")
+            if meta_hash:
+                db_hash = db.canonical_fact_hash(text_by_id.get(rowid, ""))
+                if db_hash != meta_hash:
+                    _audit_stale_snippet(
+                        rowid,
+                        meta_hash=meta_hash,
+                        db_hash=db_hash,
+                        source_path=m.get("path"),
+                    )
+                    continue
         out.append(
             {
                 "type": m["type"],
