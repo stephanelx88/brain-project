@@ -328,15 +328,39 @@ PY
 # ──────────────────────────────────────────────────────────────────────
 # 5. Register MCP server with Claude Code + Cursor (both idempotent)
 # ──────────────────────────────────────────────────────────────────────
-echo "[5/8] register MCP server + SessionStart hooks (Claude Code + Cursor)"
+echo "[5/8] register MCP servers (read + write split) + SessionStart hooks"
+# WS5 (2026-04-23): brain is now two MCP servers — brain-read (safe on
+# every host) and brain-write (primary host only). The legacy single
+# `brain` server is still registered here for one release cycle so
+# existing CLAUDE.md references keep resolving; new agents should
+# prefer the split entries. `brain doctor` warns if a host is half-wired.
+#
+# Writes are env-gated: BRAIN_WRITE=1 → brain-write exposes 9 mutation
+# tools; BRAIN_WRITE=0 → server starts with zero tools (still dial-
+# testable, but can't mutate). Primary host is the one running
+# install.sh; all wiring here sets BRAIN_WRITE=1. Remote hosts should
+# register brain-read without the write twin.
 if command -v claude >/dev/null 2>&1; then
-  # `claude mcp add` errors if name exists — remove first to be idempotent.
-  claude mcp remove brain -s user >/dev/null 2>&1 || true
+  for name in brain brain-read brain-write; do
+    claude mcp remove "$name" -s user >/dev/null 2>&1 || true
+  done
+  # 1. legacy aggregate — delete after one release cycle
   claude mcp add brain -s user \
     -e "PYTHONPATH=$PROJECT_DIR/src" \
     -e "BRAIN_DIR=$BRAIN_DIR" \
     -- "$PYTHON" -m brain.mcp_server >/dev/null
-  echo "      ✓ Claude Code registered (BRAIN_DIR=$BRAIN_DIR)"
+  # 2. read-only split — safe everywhere
+  claude mcp add brain-read -s user \
+    -e "PYTHONPATH=$PROJECT_DIR/src" \
+    -e "BRAIN_DIR=$BRAIN_DIR" \
+    -- "$PYTHON" -m brain.mcp_server_read >/dev/null
+  # 3. write split — this host is primary, flag on
+  claude mcp add brain-write -s user \
+    -e "PYTHONPATH=$PROJECT_DIR/src" \
+    -e "BRAIN_DIR=$BRAIN_DIR" \
+    -e "BRAIN_WRITE=1" \
+    -- "$PYTHON" -m brain.mcp_server_write >/dev/null
+  echo "      ✓ Claude Code registered: brain (legacy) + brain-read + brain-write (BRAIN_DIR=$BRAIN_DIR)"
 else
   echo "      - 'claude' CLI not found — Claude Code skipped."
 fi
@@ -366,21 +390,37 @@ if os.path.exists(cfg):
     shutil.copy2(cfg, f"{cfg}.bak.{time.strftime('%Y%m%d%H%M%S')}")
 
 servers = data.setdefault("mcpServers", {})
-servers["brain"] = {
+# WS5 (2026-04-23): same split pattern as Claude above.
+common_env = {
+    "PYTHONPATH": os.path.join(proj, "src"),
+    "BRAIN_DIR": brain_dir,
+}
+servers["brain"] = {          # legacy aggregate — delete after one release
     "name": "brain",
     "transport": "stdio",
     "command": py,
     "args": ["-m", "brain.mcp_server"],
-    "env": {
-        "PYTHONPATH": os.path.join(proj, "src"),
-        "BRAIN_DIR": brain_dir,
-    },
+    "env": dict(common_env),
+}
+servers["brain-read"] = {
+    "name": "brain-read",
+    "transport": "stdio",
+    "command": py,
+    "args": ["-m", "brain.mcp_server_read"],
+    "env": dict(common_env),
+}
+servers["brain-write"] = {
+    "name": "brain-write",
+    "transport": "stdio",
+    "command": py,
+    "args": ["-m", "brain.mcp_server_write"],
+    "env": {**common_env, "BRAIN_WRITE": "1"},
 }
 
 with open(cfg, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
-print(f"      ✓ Cursor registered (~/.cursor/mcp.json, BRAIN_DIR={brain_dir})")
+print(f"      ✓ Cursor registered: brain (legacy) + brain-read + brain-write (BRAIN_DIR={brain_dir})")
 PY
 
 # Render per-machine hook config files, then delegate the JSON merge
