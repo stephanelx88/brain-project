@@ -742,6 +742,100 @@ def test_brain_entities_semantic_fills_when_bm25_empty(tmp_brain_for_mcp, monkey
     assert any(r["name"] == "Nguyễn Thị Thu Hà" for r in rows)
 
 
+# ---------------------------------------------------------------------------
+# _ensure_fresh runs on every read-path tool, not just brain_recall.
+#
+# Motivating incident 2026-04-23: a user wrote `son.md` into the vault
+# root, asked about it via claude, and claude's brain call routed
+# through `brain_notes` / `brain_search` — neither of which refreshed
+# — so the just-written note never reached the index and claude
+# truthfully reported "brain has no record". The fix makes the sweep
+# uniform across read tools, throttled so back-to-back calls don't pay
+# the stat-sweep tax three times in a row.
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_fresh_throttle_skips_back_to_back_calls(monkeypatch):
+    """Second call inside the throttle window must be a no-op."""
+    from brain import mcp_server
+
+    # Allow the real sweep to run (not env-disabled). Stub the three
+    # expensive branches so the only observable effect is whether
+    # `_LAST_FRESH_TICK` advances.
+    monkeypatch.setenv("BRAIN_RECALL_ENSURE_FRESH", "1")
+    monkeypatch.setenv("BRAIN_RECALL_FRESH_THROTTLE_SEC", "10.0")
+    from brain import db as _db
+    monkeypatch.setattr(_db, "sync_mutated_entities", lambda: None)
+    monkeypatch.setattr(_db, "gc_orphaned_entities", lambda: None)
+    import sys
+    import types
+    stub_ingest = types.ModuleType("brain.ingest_notes")
+    stub_ingest.ingest_all = lambda: None
+    monkeypatch.setitem(sys.modules, "brain.ingest_notes", stub_ingest)
+    monkeypatch.setattr(mcp_server, "_semantic",
+                        lambda: types.SimpleNamespace(ensure_built=lambda: None))
+
+    mcp_server._LAST_FRESH_TICK = 0.0
+    mcp_server._ensure_fresh()
+    first = mcp_server._LAST_FRESH_TICK
+    assert first > 0.0
+
+    mcp_server._ensure_fresh()
+    # Throttle window is 10 s in this test — tick must not have moved.
+    assert mcp_server._LAST_FRESH_TICK == first
+
+
+def test_ensure_fresh_env_disable_short_circuits(monkeypatch):
+    """BRAIN_RECALL_ENSURE_FRESH=0 makes _ensure_fresh a pure no-op."""
+    from brain import mcp_server
+    monkeypatch.setenv("BRAIN_RECALL_ENSURE_FRESH", "0")
+    mcp_server._LAST_FRESH_TICK = 0.0
+    mcp_server._ensure_fresh()
+    # Env-disable must NOT update the tick (which would otherwise falsely
+    # throttle the next enabled call a millisecond later).
+    assert mcp_server._LAST_FRESH_TICK == 0.0
+
+
+def test_read_tools_all_call_ensure_fresh(tmp_brain_for_mcp, monkeypatch):
+    """brain_search / brain_entities / brain_notes / brain_recent /
+    brain_recall / brain_semantic each call `_ensure_fresh` exactly once.
+
+    Regression test for the `son.md` incident (2026-04-23): previously
+    only brain_recall refreshed, so a note-add immediately followed by
+    a brain_notes / brain_search / brain_note_get query missed the note.
+    """
+    from brain import mcp_server
+
+    calls: list[int] = []
+
+    def spy():
+        calls.append(1)
+    monkeypatch.setattr(mcp_server, "_ensure_fresh", spy)
+
+    # Stub semantic side so the tools don't call the real (slow) index.
+    from brain import semantic
+    import numpy as np
+    monkeypatch.setattr(semantic, "search_facts", lambda q, k=8, type=None: [])
+    monkeypatch.setattr(semantic, "search_entities", lambda q, k=8: [])
+    monkeypatch.setattr(semantic, "search_notes", lambda q, k=8: [])
+    monkeypatch.setattr(semantic, "ensure_built", lambda: None)
+    monkeypatch.setattr(
+        semantic, "_embed",
+        lambda texts, batch_size=64: np.zeros((len(texts), semantic.DIM), dtype=np.float32),
+    )
+
+    mcp_server.brain_search("q", k=3)
+    mcp_server.brain_entities("q", k=3)
+    mcp_server.brain_notes("q", k=3)
+    mcp_server.brain_recent(hours=1, k=3)
+    mcp_server.brain_recall("q", k=3)
+    mcp_server.brain_semantic("q", k=3)
+
+    assert len(calls) == 6, (
+        f"each of 6 read tools should call _ensure_fresh once; got {len(calls)}"
+    )
+
+
 def test_brain_entities_dedup_across_bm25_and_semantic(tmp_brain_for_mcp, monkeypatch):
     """Same entity from BM25 and semantic must appear once."""
     _stub_semantic_for_search(monkeypatch, entity_hits=[{
