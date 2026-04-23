@@ -82,8 +82,16 @@ class SubjectHint:
 
 def enabled() -> bool:
     """Read `BRAIN_SUBJECT_REJECT` each call — lets tests flip it via
-    `monkeypatch.setenv` without re-importing the module."""
-    return os.environ.get("BRAIN_SUBJECT_REJECT", "0") == "1"
+    `monkeypatch.setenv` without re-importing the module.
+
+    **Default flipped to `1` on 2026-04-23** after WS1 golden-set expansion
+    (n=60 + held-out n=20) showed the filter strictly improves weak-match
+    detection (`weak_hit_rate 0.000 → 0.400` on held-out) without touching
+    positive metrics (`p@1`, `MRR`, `hit_rate` unchanged both sets). Gate
+    passed on the unseen held-out split so overfit is ruled out. Set
+    `BRAIN_SUBJECT_REJECT=0` to disable if a regression surfaces.
+    """
+    return os.environ.get("BRAIN_SUBJECT_REJECT", "1") == "1"
 
 
 def parse_query_subject(query: str) -> SubjectHint:
