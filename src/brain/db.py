@@ -834,13 +834,30 @@ def get_entity_summaries(keys: list[tuple]) -> dict:
     return {(r[0], r[1]): r[2] for r in rows if r[2]}
 
 
-def search(query: str, k: int = 10, type: str | None = None) -> list[dict]:
-    """BM25 fact search. Returns list of dicts joined to their entity."""
+def search(
+    query: str,
+    k: int = 10,
+    type: str | None = None,
+    *,
+    include_superseded: bool = False,
+) -> list[dict]:
+    """BM25 fact search. Returns list of dicts joined to their entity.
+
+    Superseded facts (those that got contradicted by a newer
+    extraction) are filtered out by default — the semantic branch
+    already excludes them in `semantic.build()`, and leaving them in
+    the BM25 branch creates a recall-accuracy bug where an obsolete
+    fact ("Son lives in Long Xuyen") can outrank the current one
+    ("Son lives in Can Tho") on a BM25-heavy query.
+
+    Pass `include_superseded=True` only for history/audit lookups
+    where the obsolete rows are the point (e.g. `brain_history`).
+    """
     safe_q = _sanitize_fts(query)
     if not safe_q:
         return []
     sql = """
-      SELECT e.type, e.name, e.path, f.text, f.source, f.fact_date,
+      SELECT e.type, e.name, e.slug, e.path, f.text, f.source, f.fact_date, f.status,
              bm25(fts_facts) AS score
       FROM fts_facts
       JOIN facts f ON f.id = fts_facts.rowid
@@ -848,6 +865,8 @@ def search(query: str, k: int = 10, type: str | None = None) -> list[dict]:
       WHERE fts_facts MATCH ?
     """
     args: list = [safe_q]
+    if not include_superseded:
+        sql += " AND (f.status IS NULL OR f.status != 'superseded')"
     if type:
         sql += " AND e.type = ?"
         args.append(type)
@@ -855,7 +874,7 @@ def search(query: str, k: int = 10, type: str | None = None) -> list[dict]:
     args.append(k)
     with connect() as conn:
         rows = conn.execute(sql, args).fetchall()
-    cols = ["type", "name", "path", "text", "source", "date", "score"]
+    cols = ["type", "name", "slug", "path", "text", "source", "date", "status", "score"]
     return [dict(zip(cols, r)) for r in rows]
 
 

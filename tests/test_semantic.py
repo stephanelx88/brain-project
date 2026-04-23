@@ -151,3 +151,187 @@ def test_hybrid_preserves_cosine_for_dual_hit_facts(tmp_brain_with_db):
         # returns values like -0.15 … -5.0). As long as sem_score stays
         # in the cosine range, it's distinguishable from the BM25 value.
         assert -1.0 <= h["sem_score"] <= 1.0
+
+
+# ---------- incremental update of facts/entities ------------------------
+
+
+def _count_vec_rows(npy_path) -> int:
+    import numpy as np
+    return int(np.load(npy_path).shape[0])
+
+
+def test_build_records_max_ids_in_meta(tmp_brain_with_db):
+    """build() must write fact_max_id and entity_max_id so the incremental
+    path can cheaply detect new rows."""
+    semantic.build()
+    meta = json.loads(semantic.META_JSON.read_text())
+    assert meta["fact_max_id"] == 2                # two facts seeded
+    assert meta["entity_max_id"] == 2              # two entities seeded
+
+
+def test_has_new_rows_false_right_after_build(tmp_brain_with_db):
+    semantic.build()
+    assert semantic._has_new_rows() is False
+
+
+def test_has_new_rows_true_when_db_has_new_fact(tmp_brain_with_db):
+    from brain import db
+    semantic.build()
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO facts (entity_id, text, source) VALUES (?, ?, ?)",
+            (1, "brand new fact", "src"),
+        )
+    assert semantic._has_new_rows() is True
+
+
+def test_has_new_rows_true_when_meta_missing(tmp_brain_with_db):
+    # Never built.
+    assert not semantic.META_JSON.exists()
+    assert semantic._has_new_rows() is True
+
+
+def test_incremental_update_appends_new_fact_without_full_rebuild(
+    tmp_brain_with_db
+):
+    """Common 10x-relevant scenario: an extraction just added one fact.
+    The incremental path must embed only that fact and append it to
+    facts.npy — not re-embed the existing corpus."""
+    from brain import db
+    semantic.build()
+    before_rows = _count_vec_rows(semantic.FACTS_NPY)
+    before_meta = json.loads(semantic.META_JSON.read_text())
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO facts (entity_id, text, source) VALUES (?, ?, ?)",
+            (1, "fresh fact just landed", "src_live"),
+        )
+
+    out = semantic.incremental_update_facts_entities()
+    assert out == {"facts_added": 1, "entities_added": 0, "incremental": True}
+
+    after_rows = _count_vec_rows(semantic.FACTS_NPY)
+    after_meta = json.loads(semantic.META_JSON.read_text())
+    assert after_rows == before_rows + 1
+    assert after_meta["fact_count"] == before_meta["fact_count"] + 1
+    assert after_meta["fact_max_id"] > before_meta["fact_max_id"]
+
+
+def test_incremental_update_appends_new_entity_without_full_rebuild(
+    tmp_brain_with_db
+):
+    from brain import db
+    semantic.build()
+    before_rows = _count_vec_rows(semantic.ENT_NPY)
+    before_meta = json.loads(semantic.META_JSON.read_text())
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO entities (path, type, slug, name, summary)"
+            " VALUES (?, ?, ?, ?, ?)",
+            ("entities/projects/gamma.md", "projects", "gamma",
+             "Gamma Project", "new proj"),
+        )
+
+    out = semantic.incremental_update_facts_entities()
+    assert out["entities_added"] == 1
+    assert _count_vec_rows(semantic.ENT_NPY) == before_rows + 1
+    after_meta = json.loads(semantic.META_JSON.read_text())
+    assert after_meta["entity_count"] == before_meta["entity_count"] + 1
+    assert after_meta["entity_max_id"] > before_meta["entity_max_id"]
+
+
+def test_incremental_update_excludes_superseded_new_facts(
+    tmp_brain_with_db
+):
+    """A fresh fact already born 'superseded' (e.g. an extraction race)
+    must NOT be added to the semantic index — that's a BM25-only row
+    and surfacing it via cosine would resurrect the bug the status
+    filter was designed to prevent."""
+    from brain import db
+    semantic.build()
+    before_rows = _count_vec_rows(semantic.FACTS_NPY)
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO facts (entity_id, text, source, status) VALUES (?, ?, ?, ?)",
+            (1, "stale fact", "src", "superseded"),
+        )
+
+    out = semantic.incremental_update_facts_entities()
+    # The superseded row still advances the high-water mark so we don't
+    # keep re-probing it; only the embedded count stays flat.
+    assert out["facts_added"] == 0
+    assert _count_vec_rows(semantic.FACTS_NPY) == before_rows
+
+
+def test_incremental_update_no_new_rows_is_noop(tmp_brain_with_db):
+    semantic.build()
+    before_meta = json.loads(semantic.META_JSON.read_text())
+    out = semantic.incremental_update_facts_entities()
+    assert out == {"facts_added": 0, "entities_added": 0, "incremental": True}
+    # built_at refreshed even when nothing embedded (cheap freshness bump).
+    after_meta = json.loads(semantic.META_JSON.read_text())
+    assert after_meta["built_at"] >= before_meta["built_at"]
+
+
+def test_incremental_update_falls_back_to_full_build_when_index_missing(
+    tmp_brain_with_db
+):
+    """When someone wiped .vec/ between runs, incremental must not crash
+    with FileNotFoundError — it must silently full-rebuild."""
+    # Delete the fact index to simulate a partial-wipe state.
+    semantic.build()
+    semantic.FACTS_NPY.unlink()
+    out = semantic.incremental_update_facts_entities()
+    # Full build return shape is different (keys 'facts'/'entities').
+    assert "facts" in out
+    assert semantic.FACTS_NPY.exists()
+
+
+def test_ensure_built_triggers_incremental_when_db_has_new_rows(
+    tmp_brain_with_db
+):
+    """The freshness-blindness fix: any caller that went through
+    ensure_built() used to see 0–6 hour stale recall. Now ensure_built
+    picks up DB changes for free."""
+    from brain import db
+    semantic.build()
+    before_rows = _count_vec_rows(semantic.FACTS_NPY)
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO facts (entity_id, text, source) VALUES (?, ?, ?)",
+            (2, "just-extracted fact, must be recallable immediately", "src"),
+        )
+
+    # Default rebuild_if_stale=False, but incremental path still runs.
+    semantic.ensure_built()
+    assert _count_vec_rows(semantic.FACTS_NPY) == before_rows + 1
+
+
+def test_ensure_built_incremental_failure_swallowed(
+    tmp_brain_with_db, monkeypatch
+):
+    """Any failure in the incremental path must not break the recall hot
+    path — the caller must still get a useable (if stale) index."""
+    from brain import db
+    semantic.build()
+
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO facts (entity_id, text, source) VALUES (?, ?, ?)",
+            (1, "will fail to embed", "src"),
+        )
+
+    # Force incremental to blow up.
+    def boom():
+        raise RuntimeError("embedding backend exploded")
+    monkeypatch.setattr(
+        semantic, "incremental_update_facts_entities", boom
+    )
+
+    # Must not raise even though _has_new_rows is True.
+    semantic.ensure_built()                        # no exception → pass

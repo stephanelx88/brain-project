@@ -187,6 +187,12 @@ def build() -> dict:
                 "fact_count": len(fact_meta),
                 "entity_count": len(ent_meta),
                 "note_count": note_count,
+                # High-water marks so `_incremental_update_facts_entities`
+                # can cheaply detect rows added since this build and
+                # append-embed them instead of forcing a full rebuild.
+                # Indexing lag was the 0–6 hour blindness window before.
+                "fact_max_id": max((m["rowid"] for m in fact_meta), default=0),
+                "entity_max_id": max((m["id"] for m in ent_meta), default=0),
                 "build_seconds": round(time.time() - t0, 2),
             },
             indent=2,
@@ -198,6 +204,153 @@ def build() -> dict:
         "entities": len(ent_meta),
         "notes": note_count,
         "elapsed": round(time.time() - t0, 2),
+    }
+
+
+def _db_maxes() -> tuple[int, int]:
+    """(max(facts.id), max(entities.id)) — cheap freshness probe."""
+    with db.connect() as conn:
+        fm = conn.execute("SELECT COALESCE(MAX(id), 0) FROM facts").fetchone()[0]
+        em = conn.execute("SELECT COALESCE(MAX(id), 0) FROM entities").fetchone()[0]
+    return int(fm or 0), int(em or 0)
+
+
+def _has_new_rows() -> bool:
+    """True iff the DB has facts/entities with id above the last build's
+    recorded max. Returns True if metadata is missing/unparseable so
+    callers trigger a safe full rebuild."""
+    if not META_JSON.exists():
+        return True
+    try:
+        meta = json.loads(META_JSON.read_text())
+    except Exception:
+        return True
+    fact_max, ent_max = _db_maxes()
+    return (
+        fact_max > int(meta.get("fact_max_id") or 0)
+        or ent_max > int(meta.get("entity_max_id") or 0)
+    )
+
+
+def incremental_update_facts_entities() -> dict:
+    """Embed ONLY facts/entities added since the last build; append to the
+    on-disk arrays and patch META. Falls back to a full `build()` when
+    the index files are missing or the metadata is unreadable.
+
+    This is the fix for the 0–6 hour "just-extracted fact is invisible"
+    blindness: every `brain_recall` can afford a ~1 ms DB probe, and
+    when it hits, embedding a handful of new rows is ~100 ms — vs
+    ~17 s for a full rebuild that also re-does work that hasn't
+    changed.
+    """
+    if (
+        not META_JSON.exists()
+        or not FACTS_NPY.exists()
+        or not ENT_NPY.exists()
+        or not FACTS_JSON.exists()
+        or not ENT_JSON.exists()
+    ):
+        return build()
+    try:
+        meta = json.loads(META_JSON.read_text())
+    except Exception:
+        return build()
+
+    last_fact_id = int(meta.get("fact_max_id") or 0)
+    last_ent_id = int(meta.get("entity_max_id") or 0)
+
+    with db.connect() as conn:
+        fact_rows = conn.execute(
+            """
+            SELECT f.id, f.text, f.source, f.entity_id,
+                   e.type, e.name, e.slug, f.fact_date, e.path
+            FROM facts f
+            JOIN entities e ON e.id = f.entity_id
+            WHERE f.id > ?
+              AND (f.status IS NULL OR f.status != 'superseded')
+            """,
+            (last_fact_id,),
+        ).fetchall()
+        ent_rows = conn.execute(
+            """
+            SELECT id, type, name, slug, path, COALESCE(summary, '')
+            FROM entities
+            WHERE id > ?
+            """,
+            (last_ent_id,),
+        ).fetchall()
+
+    new_fact_meta = [
+        {
+            "rowid": r[0], "text": r[1], "source": r[2],
+            "entity_id": r[3], "type": r[4], "name": r[5],
+            "slug": r[6], "date": r[7], "path": r[8],
+        }
+        for r in fact_rows
+    ]
+    new_ent_meta = [
+        {
+            "id": r[0], "type": r[1], "name": r[2], "slug": r[3],
+            "path": r[4], "summary": r[5],
+        }
+        for r in ent_rows
+    ]
+
+    if not new_fact_meta and not new_ent_meta:
+        # Nothing new — refresh built_at so downstream staleness checks
+        # don't re-run this probe on every recall within the same batch.
+        meta["built_at"] = time.time()
+        atomic_write_text(META_JSON, json.dumps(meta, indent=2))
+        return {"facts_added": 0, "entities_added": 0, "incremental": True}
+
+    if new_fact_meta:
+        fact_texts = [
+            f"[{m['type']}/{m['name']}] {m['text']}" for m in new_fact_meta
+        ]
+        new_vecs = _embed(fact_texts)
+        old_vecs = np.load(FACTS_NPY)
+        old_meta = json.loads(FACTS_JSON.read_text())
+        final_vecs = (
+            np.concatenate([old_vecs, new_vecs], axis=0)
+            if old_vecs.size
+            else new_vecs
+        )
+        final_meta = old_meta + new_fact_meta
+        _atomic_save_npy(FACTS_NPY, final_vecs.astype(np.float32))
+        atomic_write_text(FACTS_JSON, json.dumps(final_meta))
+
+    if new_ent_meta:
+        ent_texts = [
+            f"{m['type']}: {m['name']}. {m['summary']}".strip()
+            for m in new_ent_meta
+        ]
+        new_vecs = _embed(ent_texts)
+        old_vecs = np.load(ENT_NPY)
+        old_meta = json.loads(ENT_JSON.read_text())
+        final_vecs = (
+            np.concatenate([old_vecs, new_vecs], axis=0)
+            if old_vecs.size
+            else new_vecs
+        )
+        final_meta = old_meta + new_ent_meta
+        _atomic_save_npy(ENT_NPY, final_vecs.astype(np.float32))
+        atomic_write_text(ENT_JSON, json.dumps(final_meta))
+
+    meta["built_at"] = time.time()
+    meta["fact_count"] = int(meta.get("fact_count") or 0) + len(new_fact_meta)
+    meta["entity_count"] = int(meta.get("entity_count") or 0) + len(new_ent_meta)
+    meta["fact_max_id"] = max(
+        last_fact_id, max((m["rowid"] for m in new_fact_meta), default=0)
+    )
+    meta["entity_max_id"] = max(
+        last_ent_id, max((m["id"] for m in new_ent_meta), default=0)
+    )
+    atomic_write_text(META_JSON, json.dumps(meta, indent=2))
+
+    return {
+        "facts_added": len(new_fact_meta),
+        "entities_added": len(new_ent_meta),
+        "incremental": True,
     }
 
 
@@ -390,8 +543,27 @@ def _is_stale(threshold_seconds: float = 6 * 3600) -> bool:
 
 
 def ensure_built(rebuild_if_stale: bool = False) -> dict | None:
-    """Build the index if missing; optionally rebuild when older than 6 h."""
-    if not META_JSON.exists() or (rebuild_if_stale and _is_stale()):
+    """Build the index if missing; run a cheap incremental embed when the
+    DB has facts/entities newer than the last indexed high-water mark;
+    optionally full-rebuild when older than 6 h.
+
+    The incremental path closes the 0–6 hour "freshly-extracted fact is
+    invisible to recall" window — the old default `ensure_built()` only
+    built when META was absent, so every new fact stayed dark until the
+    next scheduled full rebuild.
+
+    Failures in the incremental path are swallowed and fall through to
+    the old behaviour (no refresh) — the recall hot path must never be
+    broken by an indexing error.
+    """
+    if not META_JSON.exists():
+        return build()
+    try:
+        if _has_new_rows():
+            incremental_update_facts_entities()
+    except Exception:
+        pass
+    if rebuild_if_stale and _is_stale():
         return build()
     return None
 
