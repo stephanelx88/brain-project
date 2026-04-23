@@ -23,8 +23,10 @@ Public API:
 
 from __future__ import annotations
 
+import os
 import re
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
@@ -174,6 +176,101 @@ CREATE INDEX IF NOT EXISTS tombstones_entity_idx
     ON tombstones(entity_type, entity_name);
 CREATE INDEX IF NOT EXISTS tombstones_created_idx
     ON tombstones(created_at);
+
+-- Reified fact substrate (WS6, 2026-04-23). Additive — `facts` remains
+-- the legacy source of truth and the read path keeps reading it until
+-- a later PR flips the FTS5 source + swaps `facts` → VIEW over
+-- `fact_claims WHERE status IN ('current','superseded')`.
+--
+-- Populated today via:
+--   1. dual-write from `upsert_entity_from_file` when BRAIN_USE_CLAIMS=1;
+--   2. one-time `python -m brain.backfill_facts` over existing rows.
+--
+-- Columns are decomposed per ontologist spec (scratch/ontologist-ws6-schema.md):
+-- structured subject / predicate / object, orthogonal (confidence,
+-- risk_level, trust_source, salience), structured source, and
+-- lifecycle state that is independent of the legacy `facts.status`.
+--
+-- risk_level vs trust_source (WS4 + ontologist merge):
+--   risk_level   — pipeline integrity axis ('trusted'|'low'|'quarantined').
+--                  Security's WS4 scrubber bumps this to 'low' on any
+--                  flagged ingest; 'quarantined' reserved for explicit
+--                  admin revocation (never auto-set).
+--   trust_source — provenance axis ('user'|'note'|'extracted'|'correction').
+--                  Who said it: the human vs an LLM pass vs a user
+--                  correction. Orthogonal to risk_level: a user-authored
+--                  fact that tripped an injection tripwire is
+--                  trust_source='user' + risk_level='low'.
+CREATE TABLE IF NOT EXISTS fact_claims (
+    id                INTEGER PRIMARY KEY,
+
+    -- subject (resolved entity)
+    entity_id         INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    subject_slug      TEXT    NOT NULL,
+
+    -- predicate (WS8 may reparse '_unparsed' rows via LLM)
+    predicate         TEXT    NOT NULL,
+    predicate_key     TEXT    NOT NULL,
+    predicate_group   TEXT,
+
+    -- object (one of object_entity / object_text required via CHECK)
+    object_entity     INTEGER REFERENCES entities(id) ON DELETE SET NULL,
+    object_text       TEXT,
+    object_slug       TEXT,
+    object_type       TEXT    NOT NULL DEFAULT 'string',
+
+    -- surface form (preserved verbatim for FTS + markdown round-trip)
+    text              TEXT    NOT NULL,
+
+    -- time
+    fact_time         TEXT,
+    observed_at       REAL    NOT NULL,
+
+    -- provenance (WS4 scrub_tag links to sanitize ledger)
+    source_kind       TEXT    NOT NULL,
+    source_path       TEXT,
+    source_sha        TEXT,
+    scrub_tag         TEXT,
+    episode_id        TEXT,
+
+    -- epistemic
+    confidence        REAL    NOT NULL DEFAULT 0.5,
+    risk_level        TEXT    NOT NULL DEFAULT 'trusted',
+    trust_source      TEXT    NOT NULL DEFAULT 'extracted',
+    salience          REAL    NOT NULL DEFAULT 0.3,
+    last_accessed     REAL,
+
+    -- lifecycle
+    kind              TEXT    NOT NULL DEFAULT 'episodic',
+    status            TEXT    NOT NULL DEFAULT 'current',
+    superseded_by     INTEGER REFERENCES fact_claims(id) ON DELETE SET NULL,
+    superseded_at     TEXT,
+
+    -- dedup — shares namespace with tombstones.claim_key
+    claim_key         TEXT    NOT NULL,
+
+    CHECK (object_entity IS NOT NULL OR object_text IS NOT NULL)
+);
+
+-- 9 indices per spec (scratch/ontologist-ws6-schema.md §1).
+CREATE INDEX IF NOT EXISTS fact_claims_entity_idx
+    ON fact_claims(entity_id);
+CREATE INDEX IF NOT EXISTS fact_claims_entity_pred_idx
+    ON fact_claims(entity_id, predicate_key);
+CREATE INDEX IF NOT EXISTS fact_claims_claim_key_idx
+    ON fact_claims(claim_key);
+CREATE INDEX IF NOT EXISTS fact_claims_status_kind_idx
+    ON fact_claims(status, kind);
+CREATE INDEX IF NOT EXISTS fact_claims_episode_idx
+    ON fact_claims(episode_id);
+CREATE INDEX IF NOT EXISTS fact_claims_observed_idx
+    ON fact_claims(observed_at);
+CREATE INDEX IF NOT EXISTS fact_claims_salience_idx
+    ON fact_claims(salience) WHERE status='current';
+CREATE INDEX IF NOT EXISTS fact_claims_source_idx
+    ON fact_claims(source_kind, source_path);
+CREATE INDEX IF NOT EXISTS fact_claims_object_entity_idx
+    ON fact_claims(object_entity) WHERE object_entity IS NOT NULL;
 """
 
 _SOURCE_RE = re.compile(r"\(source:\s*([^,)]+?)(?:,\s*([\d-]+))?\s*\)")
@@ -417,6 +514,13 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
             (entity_id,),
         )
         cur.execute("DELETE FROM facts WHERE entity_id=?", (entity_id,))
+        # Dual-write (WS6): when BRAIN_USE_CLAIMS=1 we also rebuild the
+        # fact_claims rows for this entity. Kept symmetric with `facts`
+        # — delete-then-insert so a re-upserted entity file doesn't
+        # accumulate stale claim rows. Flag-off default: zero cost.
+        claims_on = use_claims_enabled()
+        if claims_on:
+            cur.execute("DELETE FROM fact_claims WHERE entity_id=?", (entity_id,))
         for fact_text, source, fact_date, status in _facts_from_body(body):
             cur.execute(
                 "INSERT INTO facts(entity_id, text, source, fact_date, status) "
@@ -432,6 +536,29 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
                     "INSERT INTO fts_facts(rowid, text, source) VALUES (?,?,?)",
                     (fid, fact_text, source or ""),
                 )
+            if claims_on:
+                try:
+                    _insert_fact_claim(
+                        conn,
+                        entity_id=entity_id,
+                        subject_slug=path.stem,
+                        text=fact_text,
+                        source=source,
+                        fact_date=fact_date,
+                        status=status,
+                        # Live extractions flow through WS4's sanitize
+                        # call sites before they reach the markdown,
+                        # so the dual-write path emits 'ws4' as the
+                        # scrub_tag. Backfilled rows (no ws4 scrubber
+                        # in their history) carry 'pre-ws4' instead.
+                        scrub_tag="ws4",
+                    )
+                except Exception:
+                    # Dual-write is best-effort — never take down the
+                    # primary `facts` insert because of a claims-side
+                    # bug. A missing claim row will be reconciled by
+                    # the backfill CLI if the user runs it.
+                    pass
 
         # fts_entity is contentless (content=''), so a bare
         # `DELETE FROM ... WHERE rowid=?` raises "cannot DELETE from
@@ -699,6 +826,189 @@ def search_notes(query: str, k: int = 10) -> list[dict]:
         d["snippet"] = (d["body"] or "")[:200]
         out.append(d)
     return out
+
+
+# -- fact_claims (WS6) dual-write helpers ---------------------------------
+#
+# Kept small + lazy so the flag-off path pays nothing: environment
+# check is a single `os.environ.get`, supersede is imported only when
+# we actually write a claim. supersede imports db at module load —
+# importing it eagerly at the top of db.py would form a cycle, so
+# every helper below imports it in the hot path.
+
+_SOURCE_PREFIX_NOTE = "note:"
+_SOURCE_PREFIX_SESSION = "session-"
+
+
+def _parse_source(source: str | None) -> tuple[str, str | None, str | None]:
+    """Split a legacy `source` string into (source_kind, source_path,
+    episode_id). Mirrors ontologist spec §2 step 3.
+    """
+    if not source:
+        return ("import", None, None)
+    s = source.strip()
+    if s.startswith(_SOURCE_PREFIX_NOTE):
+        path = s[len(_SOURCE_PREFIX_NOTE):]
+        return ("note", path or None, path or None)
+    if s.startswith(_SOURCE_PREFIX_SESSION):
+        return ("session", s, s)
+    if s == "user":
+        return ("user", None, None)
+    if s.startswith("correction"):
+        return ("correction", s, None)
+    return ("import", s, None)
+
+
+def _classify_predicate(text: str) -> tuple[str, str | None]:
+    """Return (canonical_predicate, predicate_group).
+
+    Falls through to `'_unparsed'` when the 3-regex classifier in
+    `supersede` doesn't hit — WS8 can later reparse those rows with
+    an LLM pass. Keeping the v1 classifier lightweight avoids an
+    LLM call on every dual-write.
+    """
+    try:
+        from brain import supersede
+    except Exception:
+        return ("_unparsed", None)
+    try:
+        group = supersede.classify_predicate(text or "")
+    except Exception:
+        group = None
+    if group == "location":
+        return ("locatedIn", "location")
+    if group == "employer":
+        return ("worksAt", "employer")
+    if group == "role":
+        return ("hasRole", "role")
+    return ("_unparsed", None)
+
+
+def _norm_predicate_key(predicate: str) -> str:
+    """Casefold + strip separators so 'locatedIn', 'located_in',
+    'LOCATED-IN' all share an index key. Mirrors
+    predicate_registry._norm with one exception: the reserved
+    sentinel `'_unparsed'` is preserved verbatim so it stays
+    distinguishable from a real predicate literally spelled
+    'unparsed'."""
+    if predicate == "_unparsed":
+        return "_unparsed"
+    return "".join(c for c in (predicate or "").lower() if c.isalnum()) or "_unparsed"
+
+
+def _claim_key(subject_slug: str, predicate_key: str,
+               object_slug: str | None, object_text: str | None) -> str:
+    """Deterministic dedup key. `object_hash` uses the canonical
+    normalisation when we don't have a resolved object entity."""
+    obj = object_slug or canonical_fact_hash(object_text or "")
+    return canonical_fact_hash(f"{subject_slug}|{predicate_key}|{obj}")
+
+
+def _extract_object_phrase(text: str, group: str | None) -> str:
+    """Cheap object-phrase extraction used during dual-write /
+    backfill. WS6 step 1-3 is explicitly additive — a perfect
+    object parser is WS8 territory."""
+    import re
+    cleaned = _SOURCE_RE.sub("", (text or "")).strip()
+    if not group:
+        return cleaned
+    # For the three known groups, strip the predicate phrase so the
+    # object_text holds just the tail (object phrase). Patterns mirror
+    # supersede._PREDICATE_GROUPS but as prefix-trimmers.
+    for pat in (
+        r"^.*?\b(currently\s+(?:in|at)|located\s+in|is\s+(?:in|at|located)|"
+        r"lives\s+in|based\s+in|đang\s+ở|hiện\s+ở|ở\s+tại)\b\s*",
+        r"^.*?\b(works\s+at|employed\s+by|is\s+employed\s+at|"
+        r"làm\s+(?:việc\s+)?(?:ở|tại|cho))\b\s*",
+        r"^.*?\b(role\s+is|title\s+is|position\s+is|is\s+a\s+|serves\s+as|"
+        r"chức\s+vụ|vị\s+trí)\b\s*",
+    ):
+        m = re.search(pat, cleaned, re.IGNORECASE)
+        if m:
+            return cleaned[m.end():].strip(" .,-:;")
+    return cleaned
+
+
+def use_claims_enabled() -> bool:
+    """Read `BRAIN_USE_CLAIMS` each call so tests can flip it with
+    `monkeypatch.setenv` without reloading the module."""
+    return os.environ.get("BRAIN_USE_CLAIMS", "0") == "1"
+
+
+def _insert_fact_claim(
+    conn: sqlite3.Connection,
+    *,
+    entity_id: int,
+    subject_slug: str,
+    text: str,
+    source: str | None,
+    fact_date: str | None,
+    status: str | None,
+    scrub_tag: str | None = None,
+) -> int | None:
+    """Dual-write one fact_claims row. Returns the new id or None on
+    skip. Caller owns the transaction + must have passed the
+    `use_claims_enabled()` gate — this helper trusts its inputs and
+    inserts unconditionally."""
+    if not text:
+        return None
+
+    predicate, predicate_group = _classify_predicate(text)
+    predicate_key = _norm_predicate_key(predicate)
+
+    object_phrase = _extract_object_phrase(text, predicate_group)
+    object_slug: str | None = None
+    object_entity: int | None = None
+    object_type = "string"
+    if object_phrase:
+        row = conn.execute(
+            "SELECT id, slug FROM entities "
+            "WHERE lower(name)=lower(?) OR slug=? LIMIT 1",
+            (object_phrase, object_phrase.lower().replace(" ", "-")),
+        ).fetchone()
+        if row:
+            object_entity, object_slug = row[0], row[1]
+            object_type = "entity"
+    object_text = object_phrase or None if object_entity is None else None
+
+    source_kind, source_path, episode_id = _parse_source(source)
+    trust_source = (
+        "user"       if source_kind == "user"       else
+        "note"       if source_kind == "note"       else
+        "correction" if source_kind == "correction" else
+        "extracted"
+    )
+
+    lifecycle_status = "superseded" if status == "superseded" else "current"
+    claim_key = _claim_key(subject_slug, predicate_key, object_slug, object_text or text)
+
+    observed_at = time.time()
+
+    conn.execute(
+        """
+        INSERT INTO fact_claims (
+            entity_id, subject_slug,
+            predicate, predicate_key, predicate_group,
+            object_entity, object_text, object_slug, object_type,
+            text,
+            fact_time, observed_at,
+            source_kind, source_path, source_sha, scrub_tag, episode_id,
+            confidence, risk_level, trust_source, salience,
+            kind, status, claim_key
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            entity_id, subject_slug,
+            predicate, predicate_key, predicate_group,
+            object_entity, object_text, object_slug, object_type,
+            text,
+            fact_date, observed_at,
+            source_kind, source_path, None, scrub_tag, episode_id,
+            0.5, "trusted", trust_source, 0.3,
+            "episodic", lifecycle_status, claim_key,
+        ),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
 def canonical_fact_hash(fact_text: str) -> str:
