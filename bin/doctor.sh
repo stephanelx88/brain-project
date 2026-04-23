@@ -16,9 +16,18 @@
 
 set -uo pipefail
 
+# Snapshot env BRAIN_DIR BEFORE .brain.conf can override it. Needed so we
+# can detect (and warn about) drift between the shell env the user thinks
+# they configured and the value silently loaded from the vault's conf file.
+_ENV_BRAIN_DIR="${BRAIN_DIR:-}"
+
 BRAIN_DIR="${BRAIN_DIR:-$HOME/.brain}"
 CONF="$BRAIN_DIR/.brain.conf"
+_CONF_BRAIN_DIR=""
 if [[ -f "$CONF" ]]; then
+  # Record the conf's view of BRAIN_DIR before sourcing so a drift warning
+  # can cite both sides.
+  _CONF_BRAIN_DIR=$(sed -n 's/^BRAIN_DIR="\?\([^"]*\)"\?/\1/p' "$CONF" | tail -1)
   # shellcheck disable=SC1090
   source "$CONF"
 fi
@@ -39,6 +48,42 @@ ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; PASS=$((PASS+1)); }
 bad()  { printf "  \033[31m✗\033[0m %s\n" "$*"; FAIL=$((FAIL+1)); }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; WARN=$((WARN+1)); }
 hdr()  { printf "\n\033[1m%s\033[0m\n" "$*"; }
+
+# ──────────────────────────────────────────────────────────────────────
+# 0. BRAIN_DIR resolution (ALWAYS first). Every downstream check assumes
+# BRAIN_DIR is a real, writable directory; if it isn't, running the rest
+# produces misleading errors (e.g. "note not searchable" when the true
+# cause is that BRAIN_DIR never existed). We surface provenance + drift
+# here so the user sees the root cause immediately.
+# ──────────────────────────────────────────────────────────────────────
+hdr "0. BRAIN_DIR resolution"
+if [[ -n "$_ENV_BRAIN_DIR" && -n "$_CONF_BRAIN_DIR" && "$_ENV_BRAIN_DIR" != "$_CONF_BRAIN_DIR" ]]; then
+  warn "env BRAIN_DIR=$_ENV_BRAIN_DIR overridden by $CONF → $_CONF_BRAIN_DIR"
+  warn "  if this is unintentional:"
+  warn "    – remove the BRAIN_DIR= line from $CONF, or"
+  warn "    – unset the env var + remove 'export BRAIN_DIR' from ~/.zshrc ~/.bashrc"
+fi
+if [[ -n "$_ENV_BRAIN_DIR" ]]; then
+  ok "BRAIN_DIR = $BRAIN_DIR (source: env)"
+elif [[ -n "$_CONF_BRAIN_DIR" ]]; then
+  ok "BRAIN_DIR = $BRAIN_DIR (source: $CONF)"
+else
+  ok "BRAIN_DIR = $BRAIN_DIR (source: default \$HOME/.brain)"
+fi
+if [[ ! -d "$BRAIN_DIR" ]]; then
+  bad "BRAIN_DIR is not an existing directory"
+  warn "  every downstream check would now fail misleadingly; bailing out."
+  warn "  fix A (use this path): cd <brain-project repo> && BRAIN_DIR='$BRAIN_DIR' bash bin/install.sh"
+  warn "  fix B (reset to default): unset BRAIN_DIR; remove any 'export BRAIN_DIR' from ~/.zshrc ~/.bashrc; re-run install"
+  printf "\n\033[1msummary\033[0m\n  %d passed, %d warnings, %d failures\n" "$PASS" "$WARN" "$FAIL"
+  exit 1
+fi
+if [[ ! -w "$BRAIN_DIR" ]]; then
+  bad "BRAIN_DIR not writable: $BRAIN_DIR"
+  warn "  ingest + auto-extract will both fail silently; bailing out."
+  printf "\n\033[1msummary\033[0m\n  %d passed, %d warnings, %d failures\n" "$PASS" "$WARN" "$FAIL"
+  exit 1
+fi
 
 hdr "1. python + package install"
 if [[ -x "$PYTHON" ]]; then
@@ -175,6 +220,7 @@ if [[ -f "$CURSOR_HOOKS" ]] && grep -q "cursor-session-start.sh" "$CURSOR_HOOKS"
   ok "Cursor sessionStart hook wired (audit + harvest)"
   if [[ ! -x "$BRAIN_DIR/bin/cursor-session-start.sh" ]]; then
     bad "  but $BRAIN_DIR/bin/cursor-session-start.sh is missing or not executable"
+    warn "  fix: cd $PROJECT_DIR && bash bin/install.sh  (re-renders + chmods the hook)"
   fi
 elif [[ -d "$HOME/.cursor" ]]; then
   warn "Cursor sessionStart hook NOT wired in $CURSOR_HOOKS"
@@ -226,17 +272,24 @@ fi
 hdr "5. ingest round-trip (write → wait → verify → cleanup)"
 TESTFILE="$BRAIN_DIR/doctor-roundtrip-$$.md"
 TESTQUERY="DOCTORTOKEN$$"
-echo "$TESTQUERY" > "$TESTFILE"
-sleep 1
-"$PYTHON" -m brain.ingest_notes >/dev/null 2>&1
-HIT=$("$PYTHON" -m brain.db notes "$TESTQUERY" 2>/dev/null | grep -c "$TESTQUERY")
-HIT=${HIT//[^0-9]/}
-rm -f "$TESTFILE"
-"$PYTHON" -m brain.ingest_notes >/dev/null 2>&1
-if [[ "${HIT:-0}" -gt 0 ]]; then
-  ok "wrote, ingested, and recalled a test note end-to-end"
+# Attribute the actual failure: if the write itself dies, previous doctor
+# versions let bash emit a cryptic "No such file or directory" and then
+# reported "note written but not searchable" — false. Check write first.
+if ! echo "$TESTQUERY" > "$TESTFILE" 2>/dev/null; then
+  bad "cannot write test note to $TESTFILE"
+  warn "  BRAIN_DIR may be read-only or missing — see step 0"
 else
-  bad "ingest round-trip failed — note written but not searchable"
+  sleep 1
+  "$PYTHON" -m brain.ingest_notes >/dev/null 2>&1
+  HIT=$("$PYTHON" -m brain.db notes "$TESTQUERY" 2>/dev/null | grep -c "$TESTQUERY")
+  HIT=${HIT//[^0-9]/}
+  rm -f "$TESTFILE"
+  "$PYTHON" -m brain.ingest_notes >/dev/null 2>&1
+  if [[ "${HIT:-0}" -gt 0 ]]; then
+    ok "wrote, ingested, and recalled a test note end-to-end"
+  else
+    bad "ingest round-trip failed — note written but not searchable"
+  fi
 fi
 
 hdr "summary"
