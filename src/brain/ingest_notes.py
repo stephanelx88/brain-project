@@ -46,6 +46,16 @@ EXCLUDE_DIR_NAMES = {
 # Filename prefixes that signal "machine-managed metadata, skip".
 EXCLUDE_FILE_PREFIXES = ("_",)  # _MOC.md, _placeholder.md, etc.
 
+# File extensions we accept as user notes. Markdown is the primary, but
+# `.txt` is deliberately included so a user who writes a plain-text note
+# (`echo 'son dang o saigon' > son.txt`) still gets indexed. That exact
+# class of silent-skip is a trust-breaking failure (2026-04-23 incident:
+# `~/.brain/son.txt` held the answer but brain claimed no record, because
+# the filter hard-required `.md`). Convention stays "prefer markdown";
+# the whitelist just prevents a silent trust break when a user forgets.
+# `.markdown` is the long-form alias a few editors emit.
+INGEST_EXTENSIONS = {".md", ".markdown", ".txt", ".text"}
+
 # Hard cap so we don't OOM on a 50 MB markdown dump someone pasted in.
 MAX_BYTES = 256 * 1024
 
@@ -55,7 +65,7 @@ def _should_skip_dir(path: Path) -> bool:
 
 
 def _should_skip_file(path: Path) -> bool:
-    if path.suffix.lower() != ".md":
+    if path.suffix.lower() not in INGEST_EXTENSIONS:
         return True
     if any(path.name.startswith(p) for p in EXCLUDE_FILE_PREFIXES):
         return True
@@ -63,7 +73,7 @@ def _should_skip_file(path: Path) -> bool:
 
 
 def _iter_note_paths(root: Path):
-    """Yield every candidate `.md` outside the excluded dirs."""
+    """Yield every candidate note file outside the excluded dirs."""
     for dirpath, dirnames, filenames in os.walk(root):
         dpath = Path(dirpath)
         # in-place prune so os.walk doesn't descend into excluded subtrees

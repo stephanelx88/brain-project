@@ -345,3 +345,57 @@ def test_no_provenance_means_no_silent_invalidation(tmp_vault):
     assert out["deleted"] == 1
     assert out["facts_invalidated"] == 0
     assert "~~" not in epath.read_text()
+
+
+# ---------------------------------------------------------------------------
+# File-type whitelist covers .txt / .markdown / .text in addition to .md
+#
+# Motivating incident 2026-04-23: user wrote `~/.brain/son.txt` containing
+# "son dang o biet thu mau xanh", queried brain → empty. Cause: filter
+# `path.suffix.lower() != ".md"` hard-skipped the file. Restricting to
+# `.md` was convention, not a technical requirement; silent-skip-on-other
+# is a trust-breaking class. The whitelist now includes the three common
+# plain-text / markdown aliases a user might reach for.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_accepts_txt_and_markdown_aliases(tmp_vault):
+    """A note written as `.txt` / `.markdown` / `.text` must be ingested,
+    not silently skipped."""
+    from brain import ingest_notes, db
+    for name, body in [
+        ("plain.txt",          "son dang o biet thu mau xanh"),
+        ("verbose.markdown",   "architect deadline moved to friday"),
+        ("unusual.text",       "meeting notes: discuss Q2 goals"),
+        # control: .md still works
+        ("normal.md",          "standard markdown note"),
+    ]:
+        (tmp_vault / name).write_text(body)
+
+    out = ingest_notes.ingest_all()
+    # ingest_all's `scanned` counts files whose content hash changed (new or
+    # edited); on first ingest of all four fresh files that's 4.
+    assert out["scanned"] == 4, f"expected all 4 extensions indexed, got {out}"
+
+    with db.connect() as c:
+        paths = {row[0] for row in c.execute("SELECT path FROM notes").fetchall()}
+    assert "plain.txt" in paths
+    assert "verbose.markdown" in paths
+    assert "unusual.text" in paths
+    assert "normal.md" in paths
+
+
+def test_ingest_rejects_unsupported_extensions(tmp_vault):
+    """Unsupported extensions remain skipped (scope protection: .log, .json
+    etc. are not user prose and should not leak into the notes index)."""
+    from brain import ingest_notes, db
+    (tmp_vault / "huge.log").write_text("lots of log lines")
+    (tmp_vault / "config.json").write_text('{"ignored": true}')
+    (tmp_vault / "kept.md").write_text("this stays")
+
+    ingest_notes.ingest_all()
+    with db.connect() as c:
+        paths = {row[0] for row in c.execute("SELECT path FROM notes").fetchall()}
+    assert "kept.md" in paths
+    assert "huge.log" not in paths
+    assert "config.json" not in paths

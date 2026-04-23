@@ -1,0 +1,73 @@
+# Held-out golden set — NEVER used for flag-default tuning.
+#
+# Separation mandated by docs/autoresearch-assessment.md:
+#   - `recall.yaml` is the **development** bench — features may be
+#     tuned against it, so its p@1 is an optimistically-biased signal.
+#   - `held-out.yaml` is the **validation** bench — only ever run at
+#     merge time to confirm a tuned feature did not overfit the dev
+#     set. No commit should reference this file by name in tuning
+#     decisions; treat it the way ML practitioners treat the test
+#     split (look once, don't look again).
+#
+# Composition (20 queries): 15 positive + 5 weak-match.
+# Queries are disjoint from `recall.yaml` by phrasing but cover the
+# same entities, so a genuinely-improved retrieval stack will lift
+# both metrics together. A stack that improves recall.yaml while
+# held-out stays flat = overfit flag, do not ship.
+
+# ---- people (3) ------------------------------------------------
+- query: "owner prefers direct concise answers no fluff"
+  expected: ["fact:people/stephane"]
+  description: "who-i-am paraphrase"
+- query: "stephane testing strategy mac ubuntu parity"
+  expected: ["fact:people/stephane"]
+- query: "knowledge ingest autonomous no manual setup"
+  expected: ["fact:people/stephane"]
+  description: "user directive paraphrase"
+
+# ---- projects (6) ----------------------------------------------
+- query: "fact_claims reified subject_slug predicate_group schema"
+  expected: ["fact:projects/brain-project"]
+- query: "WS5 read write MCP split audit ledger hash chain"
+  expected: ["fact:projects/brain-project"]
+- query: "WS6 dual-write BRAIN_USE_CLAIMS flag default off"
+  expected: ["fact:projects/brain-project"]
+- query: "canonical_fact_hash meta text mismatch drop stale"
+  expected: ["fact:projects/brain-project"]
+- query: "all feature flags OFF no user visible behavior change"
+  expected: ["fact:projects/brain-100x"]
+- query: "WS4 scrubber 22 secret regex injection tripwire"
+  expected: ["fact:projects/brain-project"]
+
+# ---- issues (2) ------------------------------------------------
+- query: "brain_recall _ensure_fresh brain_notes asymmetry son.md"
+  expected: ["fact:issues/son-md-recall-miss"]
+- query: "RRF fusion saturates 0.07 subject rejection prefilter"
+  expected: ["fact:issues/recall-weak-match-threshold-loose"]
+
+# ---- decisions + insights (4) ----------------------------------
+- query: "critical path WS1 WS6 WS8 phase 1 parallel"
+  expected: ["fact:decisions/brain-100x-workstream-plan"]
+- query: "extractor checks tombstones before promoting facts"
+  expected: ["fact:decisions/brain-project-implement-forget-primitive-for-persistent-deletion"]
+- query: "golden set 120 queries prerequisite autoresearch"
+  expected: ["fact:insights/autoresearch-fitness-for-brain"]
+- query: "session transcript authoritative re-promote extraction"
+  expected: ["fact:insights/brain-asymmetry-remember-vs-forget"]
+
+# ---- weak-match anchors (5) ------------------------------------
+- query: "stephane wedding anniversary date"
+  expected_weak_match: true
+  description: "owner subject; no anniversary fact"
+- query: "brain-project ship date public release"
+  expected_weak_match: true
+  description: "subject exists; no release-date fact"
+- query: "quicksort time complexity"
+  expected_weak_match: true
+  description: "out-of-scope knowledge"
+- query: "nơi tôi để chìa khóa xe"
+  expected_weak_match: true
+  description: "VI owner possessive; no car-keys fact"
+- query: "stephane's sister name"
+  expected_weak_match: true
+  description: "subject + relation; no sibling facts"
