@@ -1006,10 +1006,13 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
     fused.sort(key=lambda x: -x["rrf"])
 
     # WS7a subject-reject: hard filter on owner-self-reference +
-    # proper-noun queries, gated by BRAIN_SUBJECT_REJECT. When off,
-    # this is a cheap import-free no-op. When on, dropped hits leave
-    # an audit trail at ~/.brain/.audit/subject_reject.jsonl.
-    if os.environ.get("BRAIN_SUBJECT_REJECT", "0") == "1":
+    # proper-noun queries, gated by BRAIN_SUBJECT_REJECT.
+    # Default flipped to "1" on 2026-04-23 after WS1 golden-set expansion
+    # showed strict improvement (weak_hit_rate 0.000→0.400 on held-out
+    # n=20, positive metrics unchanged). Set BRAIN_SUBJECT_REJECT=0 to
+    # disable on a per-session basis. When on, dropped hits leave an
+    # audit trail at ~/.brain/.audit/subject_reject.jsonl.
+    if os.environ.get("BRAIN_SUBJECT_REJECT", "1") == "1":
         try:
             from brain import subject_reject
             hint = subject_reject.parse_query_subject(query)
