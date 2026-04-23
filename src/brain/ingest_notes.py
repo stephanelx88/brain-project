@@ -294,6 +294,16 @@ def ingest_all(verbose: bool = False) -> dict:
             text = fpath.read_text(errors="replace")
         except OSError:
             continue
+        # WS4: sanitize BEFORE sha so that rotating a secret in the
+        # source file (or re-scrubbing with a stricter rule set) shows
+        # up as a content change and triggers re-indexing. Sha is
+        # computed on the cleaned text so db.notes.body, the indexed
+        # snippet, and the embedding all see the redacted form.
+        try:
+            from brain.sanitize import sanitize
+            text = sanitize(text, source_kind="note", source_path=rel).text
+        except Exception:
+            pass
         sha = _sha(text)
         if prev and prev[1] == sha:
             # mtime touched but content unchanged — bump mtime only

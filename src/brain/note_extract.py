@@ -91,6 +91,15 @@ EXCLUDED_PATHS: tuple[str, ...] = (
 def _build_prompt(note: dict, existing_entities: str) -> str:
     template = PROMPT_FILE.read_text()
     body = note.get("body") or "(empty body — the title IS the fact)"
+    # WS4: scrub the user-authored body before it reaches the LLM.
+    # User-authored notes get the `note` policy: secrets REJECT, most
+    # injection tripwires FLAG (not REJECT), IDENTITY_CLAIM passes
+    # (user can legitimately self-describe in their own notes).
+    try:
+        from brain.sanitize import sanitize
+        body = sanitize(body, source_kind="note", source_path=note.get("path", "")).text
+    except Exception:
+        pass  # never let sanitize failure block extraction
     if len(body) > MAX_BODY_CHARS:
         body = body[:MAX_BODY_CHARS] + f"\n\n…[truncated, original {len(body)} chars]"
     date = datetime.fromtimestamp(note.get("mtime") or 0, tz=timezone.utc).strftime("%Y-%m-%d")
