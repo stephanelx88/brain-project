@@ -18,6 +18,9 @@ on-demand retrieval. Tools:
                                        → live Claude/Cursor sessions
   brain_live_tail(session_id, n)       → last N turns of one live session
   brain_audit(limit)                   → top-N items needing a human decision
+  brain_mark_reviewed(path)            → confirm a single-source entity (stamp `reviewed: today`)
+  brain_mark_contested(path)           → flag an entity as contested
+  brain_resolve_contested(path)        → clear the contested flag
   brain_failure_record(...)            → append a row to the failure ledger
   brain_failure_list(...)              → list recorded failures (newest first)
   brain_learning_gaps(...)             → repeated recall misses to surface
@@ -661,6 +664,74 @@ def brain_audit(limit: int = 3) -> str:
     limit = max(0, min(int(limit), 10))
     items = audit_mod.top_n(limit=limit)
     return audit_mod.format_for_session(items)
+
+
+def _resolve_audit_path(path: str):
+    """Resolve an audit target path, confined to BRAIN_DIR. Returns
+    (resolved_path, error_json). On success error_json is None."""
+    from pathlib import Path
+    p = Path(path)
+    if not p.is_absolute():
+        p = config.BRAIN_DIR / p
+    try:
+        p = p.resolve()
+        p.relative_to(config.BRAIN_DIR.resolve())
+    except (ValueError, OSError):
+        return None, json.dumps({"error": f"path outside vault: {path}"})
+    if not p.exists() or not p.is_file():
+        return None, json.dumps({"error": f"not found: {path}"})
+    return p, None
+
+
+@mcp.tool()
+def brain_mark_reviewed(path: str) -> str:
+    """Confirm a single-source entity surfaced by `brain_audit` — stamps
+    `reviewed: YYYY-MM-DD` into its frontmatter so audit stops nagging for
+    ~90 days. Idempotent; re-stamping today is a no-op.
+
+    `path` is the entity path from the audit item (relative to ~/.brain/,
+    e.g. `entities/people/thuha.md`). Returns `{"changed": bool, "path": ...}`.
+    """
+    from brain import audit as audit_mod
+    p, err = _resolve_audit_path(path)
+    if err is not None:
+        return err
+    changed = audit_mod.mark_reviewed(p)
+    return json.dumps({"changed": changed, "path": str(p.relative_to(config.BRAIN_DIR.resolve()))})
+
+
+@mcp.tool()
+def brain_mark_contested(path: str) -> str:
+    """Flag an entity as contested — flips `status: contested` into its
+    frontmatter so audit surfaces it at the top. Use when the user rejects
+    a single-source claim or when two sources disagree.
+
+    `path` is relative to ~/.brain/. Returns `{"changed": bool, "path": ...}`;
+    already-contested entities yield `changed: false` (no-op).
+    """
+    from brain import audit as audit_mod
+    p, err = _resolve_audit_path(path)
+    if err is not None:
+        return err
+    changed = audit_mod.mark_contested(p)
+    return json.dumps({"changed": changed, "path": str(p.relative_to(config.BRAIN_DIR.resolve()))})
+
+
+@mcp.tool()
+def brain_resolve_contested(path: str) -> str:
+    """Clear a contested flag — drops the `status: contested` line from an
+    entity's frontmatter. Use after the user resolves the underlying
+    conflict (merged, corrected, or decided the claim is fine after all).
+
+    `path` is relative to ~/.brain/. Returns `{"changed": bool, "path": ...}`;
+    entities that weren't contested yield `changed: false`.
+    """
+    from brain import audit as audit_mod
+    p, err = _resolve_audit_path(path)
+    if err is not None:
+        return err
+    changed = audit_mod.resolve_contested(p)
+    return json.dumps({"changed": changed, "path": str(p.relative_to(config.BRAIN_DIR.resolve()))})
 
 
 @mcp.tool()
