@@ -78,8 +78,17 @@ def _filter_block(lines: list[str]) -> list[str]:
     return out
 
 
-def filter_session_text(text: str) -> str:
-    """Apply the prefilter to a full session-summary markdown."""
+def filter_session_text(text: str, *, source_path: str = "") -> str:
+    """Apply the prefilter to a full session-summary markdown.
+
+    WS4: before the tool-noise strip, run the sanitize pass to redact
+    secrets, flag/reject injection payloads, and elide oversized lines.
+    The order matters — we scrub BEFORE collapsing tool blocks so the
+    injection-tripwire scope (tool_output vs user_turn) can still see
+    the `[tool: X]` markers in the text.
+    """
+    from brain.sanitize import sanitize  # lazy to avoid import cycle at cold start
+    text = sanitize(text, source_kind="session", source_path=source_path).text
     lines = text.split("\n")
     # Pass through the header (everything until first '## Conversation')
     out: list[str] = []
@@ -123,7 +132,7 @@ def filter_session_text(text: str) -> str:
 def filter_file(path: Path) -> tuple[int, int, str]:
     """Returns (orig_chars, new_chars, filtered_text)."""
     text = path.read_text(errors="replace")
-    out = filter_session_text(text)
+    out = filter_session_text(text, source_path=str(path))
     return len(text), len(out), out
 
 

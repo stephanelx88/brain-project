@@ -479,6 +479,19 @@ def brain_note_add(text: str, tags: list[str] | None = None) -> str:
     text = (text or "").strip()
     if not text:
         return json.dumps({"error": "empty text"})
+    # WS4: scrub the bullet before it lands on disk. Policy is
+    # `journal` — user-authored content, so secrets REJECT and most
+    # injection tripwires FLAG. A user who pastes an API key into
+    # brain_note_add gets a redaction stub in its place; intentional
+    # self-description passes untouched.
+    try:
+        from brain.sanitize import sanitize
+        scrub = sanitize(text, source_kind="journal", source_path="brain_note_add")
+        text = scrub.text.strip()
+        if not text:
+            return json.dumps({"error": "empty text after sanitize"})
+    except Exception:
+        pass
     # Local date — journal is for the user, not for UTC machines. A
     # journal entry written at 6 AM Vietnam time should land in today's
     # local file, not yesterday's UTC file.
