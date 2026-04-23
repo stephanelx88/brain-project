@@ -350,14 +350,26 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     # on any failure (LLM offline, disabled, empty variants). Imported
     # lazily so the disabled-default path pays zero startup cost.
     import os as _os_qr
+    # Over-fetch when reranking so the LLM has a pool larger than the
+    # final k to reshuffle. Skipped when reranking is off.
+    rerank_on = _os_qr.environ.get("BRAIN_RERANK", "0") == "1"
+    fetch_k = min(k * 4, 40) if rerank_on else k
     if _os_qr.environ.get("BRAIN_QUERY_REWRITE", "0") == "1":
         from brain import query_rewriter
         results = query_rewriter.expanded_hybrid_search(
-            query, k=k, type=type,
+            query, k=fetch_k, type=type,
             search_fn=semantic.hybrid_search,
         )
     else:
-        results = semantic.hybrid_search(query, k=k, type=type)
+        results = semantic.hybrid_search(query, k=fetch_k, type=type)
+    # LLM reranker refines the top candidates by query intent. Gated so
+    # the disabled-default path pays no cost; degrades to the original
+    # top-k slice on any failure.
+    if rerank_on and results:
+        from brain import reranker
+        results = reranker.rerank(query, results, k=k)
+    else:
+        results = results[:k]
     try:
         from brain import recall_metric
         recall_metric.log_live_recall(query)
