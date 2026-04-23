@@ -282,6 +282,31 @@ fi
 VEC="$BRAIN_DIR/.vec/meta.json"
 if [[ -f "$VEC" ]]; then
   ok "semantic index present"
+  # Stale-embedding ratio check (incident 2026-04-23): meta.fact_hash
+  # vs db.facts.text. stale = text mutated on disk after embed; orphan
+  # = rowid missing from DB. Warn at >1%, bad at >5% — tuned so a
+  # normal retract cycle doesn't noise-page the user.
+  STALE_JSON=$("$PYTHON" -c "
+import json, sys
+sys.path.insert(0, '$PROJECT_DIR/src')
+from brain import semantic
+print(json.dumps(semantic.count_stale_fact_meta()))
+" 2>/dev/null)
+  if [[ -n "$STALE_JSON" ]]; then
+    STALE_RATIO=$(echo "$STALE_JSON" | "$PYTHON" -c "import json, sys; d=json.load(sys.stdin); print(f\"{d['ratio']:.3f} {d['stale']} {d['orphan']} {d['total']}\")")
+    read -r RATIO STALE ORPHAN TOTAL <<<"$STALE_RATIO"
+    if [[ "$TOTAL" == "0" ]]; then
+      :  # empty vec; skip
+    elif awk "BEGIN{exit !($RATIO > 0.05)}"; then
+      bad ".vec stale-embedding ratio $RATIO ($STALE stale + $ORPHAN orphan / $TOTAL) > 5%"
+      warn "  fix: $PYTHON -m brain.semantic build  (full re-embed)"
+    elif awk "BEGIN{exit !($RATIO > 0.01)}"; then
+      warn ".vec stale-embedding ratio $RATIO ($STALE stale + $ORPHAN orphan / $TOTAL) — guard is catching these"
+      warn "  refresh when convenient: $PYTHON -m brain.semantic build"
+    else
+      ok ".vec freshness ratio $RATIO ($STALE stale + $ORPHAN orphan / $TOTAL)"
+    fi
+  fi
 else
   warn "semantic index missing — first brain_recall will be slow"
   warn "  fix: $PYTHON -m brain.semantic build"
