@@ -138,6 +138,44 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return init_mod.main(forward)
 
 
+def _cmd_bench(args: argparse.Namespace) -> int:
+    """`brain bench` — run the golden-set benchmark against the vault.
+
+    Text mode prints the `headline()` plus, in verbose mode, one line
+    per query with its rank (or weak_expected/weak_observed pair). JSON
+    mode is the machine-readable surface for CI comparisons + the
+    nightly report consumer (follow-up workstream).
+    """
+    from brain import benchmark
+    queries = benchmark.load_golden_yaml(args.yaml)
+    if not queries:
+        print(
+            f"no golden queries loaded from {args.yaml or benchmark.DEFAULT_GOLDEN_PATH}",
+            file=sys.stderr,
+        )
+        return 1
+    report = benchmark.run_benchmark(queries, k=args.k)
+    if args.json:
+        print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    print(report.headline())
+    if not args.verbose:
+        return 0
+    # One line per query, rank or weak-match outcome.
+    for row in report.per_query:
+        q = row.get("query", "")
+        if row.get("weak_expected"):
+            tag = "WEAK_OK" if row.get("weak_observed") else "WEAK_FAIL"
+            print(f"  [{tag}] top={row.get('top_score')} thr={row.get('threshold')}  {q!r}")
+        elif row.get("error"):
+            print(f"  [ERR]     err={row['error']!r}  {q!r}")
+        elif row.get("hit"):
+            print(f"  [hit@{row['rank']:<2}]  {q!r}  -> {row['top_identifiers'][:1]}")
+        else:
+            print(f"  [miss]    {q!r}  -> {row['top_identifiers'][:3]}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="brain", description="Personal brain CLI.")
     p.add_argument("--version", action="store_true")
@@ -226,6 +264,24 @@ def main(argv: list[str] | None = None) -> int:
         "brain.verify", fromlist=["main"]).main(
         (["--gc-only"] if a.gc_only else []) +
         (["--stale-only"] if a.stale_only else [])))
+
+    p_bench = sub.add_parser(
+        "bench",
+        help="Run the golden-set recall benchmark against the vault",
+    )
+    p_bench.add_argument(
+        "--yaml", default=None,
+        help="Path to the golden yaml (defaults to tests/golden/recall.yaml in the repo)",
+    )
+    p_bench.add_argument(
+        "-k", "--k", type=int, default=10,
+        help="Top-k cutoff for hit detection (default 10)",
+    )
+    p_bench.add_argument("--json", action="store_true",
+                         help="Emit the full report as JSON")
+    p_bench.add_argument("-v", "--verbose", action="store_true",
+                         help="Print one line per query with rank / weak outcome")
+    p_bench.set_defaults(func=_cmd_bench)
 
     args = p.parse_args(argv)
     if args.version:

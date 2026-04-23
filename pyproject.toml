@@ -50,3 +50,6 @@ brain = ["prompts/*.md", "presets/*.yaml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "bench: golden-set retrieval benchmark (slow; needs a populated ~/.brain vault)",
+]
