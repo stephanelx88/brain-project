@@ -3,16 +3,21 @@
 Replaces the "preload index.md into the system prompt" model with
 on-demand retrieval. Tools:
 
-  brain_search(query, k, type)         → hybrid fact search (BM25 + semantic fallback)
-  brain_entities(query, k)             → hybrid entity-name search (BM25 + semantic fallback)
+  brain_search(query, k, type, verbose=False, debug=False)
+                                       → hybrid fact search (BM25 + semantic fallback)
+  brain_entities(query, k, verbose=False, debug=False)
+                                       → hybrid entity-name search (BM25 + semantic fallback)
   brain_get(type, name)                → full entity card
-  brain_notes(query, k)                → user-note search (BM25 + semantic)
+  brain_notes(query, k, verbose=False, debug=False)
+                                       → user-note search (BM25 + semantic)
   brain_note_get(path)                 → full body of one vault note
   brain_note_add(text, tags)           → append knowledge bullet to today's journal file
   brain_recent(hours, type, k)         → entities updated since cutoff
   brain_identity()                     → identity + active corrections
-  brain_recall(query, k, type)         → hybrid fact + note search (RRF)
-  brain_semantic(query, k, type)       → pure semantic fact search
+  brain_recall(query, k, type, verbose=False, debug=False)
+                                       → hybrid fact + note search (RRF, compact envelope)
+  brain_semantic(query, k, type, verbose=False, debug=False)
+                                       → pure semantic fact search
   brain_history(path, limit)           → git commit history for one entity/note
   brain_live_sessions(active_within_sec, include_self)
                                        → live Claude/Cursor sessions
@@ -47,7 +52,7 @@ from datetime import datetime, timedelta, timezone
 from mcp.server.fastmcp import FastMCP
 
 import brain.config as config
-from brain import db
+from brain import _projection, db
 
 # NOTE: `brain.semantic` is intentionally NOT imported here. It pulls
 # torch + sentence-transformers (~2.8 s cold import on M-series Macs),
@@ -188,76 +193,122 @@ def _warmup() -> None:
 
 
 @mcp.tool()
-def brain_search(query: str, k: int = 8, type: str | None = None) -> str:
+def brain_search(
+    query: str,
+    k: int = 8,
+    type: str | None = None,
+    verbose: bool = False,
+    debug: bool = False,
+) -> str:
     """Hybrid fact search across the brain (BM25 + semantic fallback).
 
     BM25 handles exact-keyword queries; semantic fills the gap for
     Vietnamese / CJK / paraphrase queries where BM25 produces zero or
-    sparse results. Results are deduped; BM25 hits take priority.
+    sparse results. Results are deduped by canonical-fact-hash.
 
     Args:
       query: free-text. May be Vietnamese, Chinese, or any language.
       k: max results (default 8, capped 25)
       type: optional filter — one of people, projects, clients, domains,
             decisions, issues, insights, evolutions, meetings.
+      verbose/debug: see `brain_recall` for tier shapes.
 
-    Returns a JSON array of {type,name,path,text,source,date,score}.
+    Envelope: `{query, weak_match, guidance, hits}`. `weak_match` here
+    = "no hits returned" (this tool does not compute RRF semantics);
+    for confidence-scored recall, use `brain_recall`.
     """
+    if _projection.default_verbose() and not debug:
+        verbose = True
     _ensure_fresh()
     k = max(1, min(int(k), 25))
+    # Over-fetch so canonical-fact-hash dedup doesn't leave the response short.
+    fetch_k = min(k * 2, 25)
     seen: set = set()
-    out: list = []
+    merged: list = []
 
-    for hit in db.search(query, k=k, type=type):
+    for hit in db.search(query, k=fetch_k, type=type):
         key = (hit["type"], hit["name"], (hit["text"] or "")[:80])
         if key in seen:
             continue
         seen.add(key)
-        out.append(hit)
+        hit.setdefault("kind", "fact")
+        merged.append(hit)
 
     sem = _semantic()
     sem.ensure_built()
-    for hit in sem.search_facts(query, k=k, type=type):
+    for hit in sem.search_facts(query, k=fetch_k, type=type):
         key = (hit["type"], hit["name"], (hit["text"] or "")[:80])
         if key in seen:
             continue
         seen.add(key)
-        out.append({
+        merged.append({
+            "kind": "fact",
             "type": hit["type"],
             "name": hit["name"],
+            "slug": hit.get("slug"),
             "path": hit.get("path") or f"entities/{hit['type']}/{hit['slug']}.md",
             "text": hit["text"],
             "source": hit.get("source") or "",
             "date": hit.get("date"),
             "score": hit["score"],
         })
-        if len(out) >= k:
+        if len(merged) >= fetch_k:
             break
 
-    return json.dumps(out[:k], ensure_ascii=False, indent=2)
+    projected = _projection.project_hits(
+        merged, k=k, verbose=verbose, debug=debug,
+    )
+    weak_match = not projected
+    guidance = "The brain has no record of this." if weak_match else None
+    env = _projection.envelope(
+        query, projected,
+        weak_match=weak_match, guidance=guidance, debug=debug,
+        fetch_k=fetch_k,
+    )
+    return json.dumps(env, ensure_ascii=False)
 
 
 @mcp.tool()
-def brain_entities(query: str, k: int = 8) -> str:
+def brain_entities(
+    query: str,
+    k: int = 8,
+    verbose: bool = False,
+    debug: bool = False,
+) -> str:
     """Hybrid entity-name search (BM25 + semantic fallback).
 
     Use when you want the entity itself, not individual facts.
     BM25 handles exact-name queries; semantic fills gaps for
     Vietnamese / CJK / paraphrase names.
 
-    Returns a JSON array of {type,name,path,summary,score}.
+    Envelope: `{query, weak_match, guidance, hits}`. Default hit shape:
+    `{kind, path, text, name, entity_summary?}` where `text` is the
+    entity summary (no per-fact text for this tool).
     """
+    if _projection.default_verbose() and not debug:
+        verbose = True
     _ensure_fresh()
     k = max(1, min(int(k), 25))
     seen: set = set()
-    out: list = []
+    merged: list = []
 
     for hit in db.search_entities(query, k=k):
         key = (hit["type"], hit["name"])
         if key in seen:
             continue
         seen.add(key)
-        out.append(hit)
+        # Entity row → fact-shaped for projection so the default-tier
+        # output is uniform across tools. "text" carries the summary.
+        merged.append({
+            "kind": "fact",
+            "type": hit["type"],
+            "name": hit["name"],
+            "slug": hit.get("slug"),
+            "path": hit.get("path"),
+            "text": hit.get("summary") or "",
+            "entity_summary": hit.get("summary") or "",
+            "score": hit.get("score"),
+        })
 
     sem = _semantic()
     sem.ensure_built()
@@ -266,11 +317,29 @@ def brain_entities(query: str, k: int = 8) -> str:
         if key in seen:
             continue
         seen.add(key)
-        out.append(hit)
-        if len(out) >= k:
+        merged.append({
+            "kind": "fact",
+            "type": hit["type"],
+            "name": hit["name"],
+            "slug": hit.get("slug"),
+            "path": hit.get("path"),
+            "text": hit.get("summary") or "",
+            "entity_summary": hit.get("summary") or "",
+            "score": hit.get("score"),
+        })
+        if len(merged) >= k:
             break
 
-    return json.dumps(out[:k], ensure_ascii=False, indent=2)
+    projected = _projection.project_hits(
+        merged, k=k, verbose=verbose, debug=debug,
+    )
+    weak_match = not projected
+    guidance = "The brain has no record of this." if weak_match else None
+    env = _projection.envelope(
+        query, projected,
+        weak_match=weak_match, guidance=guidance, debug=debug,
+    )
+    return json.dumps(env, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -306,7 +375,12 @@ def brain_get(type: str, name: str) -> str:
 
 
 @mcp.tool()
-def brain_notes(query: str, k: int = 8) -> str:
+def brain_notes(
+    query: str,
+    k: int = 8,
+    verbose: bool = False,
+    debug: bool = False,
+) -> str:
     """Search user-written notes anywhere in the vault.
 
     Returns notes that the user typed directly into Obsidian (anywhere
@@ -315,39 +389,56 @@ def brain_notes(query: str, k: int = 8) -> str:
     named `son dang o long xuyen.md` is findable even when its body is
     empty.
 
-    Returns JSON list of {title, path, snippet, mtime}.
+    Envelope: `{query, weak_match, guidance, hits}`. Default hit shape:
+    `{kind="note", path, text}` where `text` is the note's snippet
+    (body[:200] by default), subject to the same snippet cap as other
+    tools. Verbose adds `{title, mtime}`.
     """
+    if _projection.default_verbose() and not debug:
+        verbose = True
     _ensure_fresh()
     k = max(1, min(int(k), 25))
     semantic = _semantic()
     semantic.ensure_built()
-    # Prefer the lexical hit when present (exact filename matches), then
-    # backfill with semantic. Caller gets the union, deduped by path.
+    # Prefer lexical (exact filename hits), then backfill with semantic.
+    # Caller gets the union, deduped by path.
     seen = set()
-    out = []
+    merged: list = []
     for hit in db.search_notes(query, k=k):
         if hit["path"] in seen:
             continue
         seen.add(hit["path"])
-        out.append({
-            "title": hit["title"],
+        merged.append({
+            "kind": "note",
+            "title": hit.get("title"),
             "path": hit["path"],
-            "snippet": hit["snippet"],
-            "mtime": hit["mtime"],
+            "text": hit.get("snippet") or "",
+            "mtime": hit.get("mtime"),
+            "score": hit.get("score"),
         })
     for hit in semantic.search_notes(query, k=k):
         if hit["path"] in seen:
             continue
         seen.add(hit["path"])
-        out.append({
-            "title": hit["title"],
+        merged.append({
+            "kind": "note",
+            "title": hit.get("title"),
             "path": hit["path"],
-            "snippet": hit["snippet"],
-            "score": hit["score"],
+            "text": hit.get("snippet") or "",
+            "score": hit.get("score"),
         })
-        if len(out) >= k:
+        if len(merged) >= k:
             break
-    return json.dumps(out[:k], ensure_ascii=False, indent=2)
+    projected = _projection.project_hits(
+        merged, k=k, verbose=verbose, debug=debug,
+    )
+    weak_match = not projected
+    guidance = "The brain has no record of this." if weak_match else None
+    env = _projection.envelope(
+        query, projected,
+        weak_match=weak_match, guidance=guidance, debug=debug,
+    )
+    return json.dumps(env, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -481,7 +572,13 @@ def brain_identity() -> str:
 
 
 @mcp.tool()
-def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
+def brain_recall(
+    query: str,
+    k: int = 8,
+    type: str | None = None,
+    verbose: bool = False,
+    debug: bool = False,
+) -> str:
     """Hybrid (BM25 + semantic) recall — RECOMMENDED DEFAULT.
 
     Searches across BOTH:
@@ -493,27 +590,43 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     Mac freeze prevention") AND exact-keyword/filename hits in one
     ranked list.
 
-    Each result has a `kind` field of "fact" or "note" so you can tell
-    where it came from. Sorted by Reciprocal-Rank Fusion score.
+    Envelope: `{query, weak_match, guidance, hits}`. Default hit shape
+    is `{kind, path, text, name?, entity_summary?}` with `text` capped
+    at `BRAIN_RECALL_SNIPPET_CHARS` (default 240, clamp [80, 2000]).
+    `entity_summary` emits only on the FIRST hit per entity;
+    canonical-fact-hash dedup runs at the envelope layer after
+    reranking, so `k` counts unique hits only.
 
-    Fact hits include `entity_summary` — a one-line description of the
-    entity the fact belongs to. Use this to understand context without
-    needing a follow-up brain_get call.
+    Args:
+      verbose: opt in to `{type, slug, source, date, status?}` + full
+               untruncated text.
+      debug: implies `verbose`; adds `{score, rrf, lexical_rank,
+             semantic_rank, sem_score}` per hit plus envelope-level
+             `{top_score, threshold, fetch_k, rerank_on,
+             query_rewriter_on}`. Tuning signals, not for agents.
+
+    Env overrides:
+      BRAIN_RECALL_SNIPPET_CHARS  — snippet cap (default 240)
+      BRAIN_MCP_DEFAULT_VERBOSE=1 — restore pre-WS2 verbose shape
+                                    (migration grace).
     """
+    if _projection.default_verbose() and not debug:
+        verbose = True
     k = max(1, min(int(k), 25))
     _ensure_fresh()
     semantic = _semantic()
     semantic.ensure_built()
-    # When BRAIN_QUERY_REWRITE=1, fan out to LLM-generated paraphrases and
-    # RRF-fuse across variants. Falls back to single-query hybrid_search
-    # on any failure (LLM offline, disabled, empty variants). Imported
-    # lazily so the disabled-default path pays zero startup cost.
     import os as _os_qr
-    # Over-fetch when reranking so the LLM has a pool larger than the
-    # final k to reshuffle. Skipped when reranking is off.
     rerank_on = _os_qr.environ.get("BRAIN_RERANK", "0") == "1"
+    query_rewriter_on = _os_qr.environ.get("BRAIN_QUERY_REWRITE", "0") == "1"
+    # Match pre-WS2 fetch_k so weak_match is computed over the same pool
+    # of candidates. Over-fetching here shifted a PM weak-anchor baseline
+    # score by changing which hits ranked top. Envelope dedup instead
+    # runs on whatever hybrid_search returns; if dupes drop it, k may
+    # come back shorter — that's the Ontologist spec §5 "return shorter"
+    # path.
     fetch_k = min(k * 4, 40) if rerank_on else k
-    if _os_qr.environ.get("BRAIN_QUERY_REWRITE", "0") == "1":
+    if query_rewriter_on:
         from brain import query_rewriter
         results = query_rewriter.expanded_hybrid_search(
             query, k=fetch_k, type=type,
@@ -521,22 +634,20 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
         )
     else:
         results = semantic.hybrid_search(query, k=fetch_k, type=type)
-    # LLM reranker refines the top candidates by query intent. Gated so
-    # the disabled-default path pays no cost; degrades to the original
-    # top-k slice on any failure.
+    # Reranker is asked for fetch_k (not k) so envelope dedup has a
+    # larger pool to select unique hits from.
     if rerank_on and results:
         from brain import reranker
-        results = reranker.rerank(query, results, k=k)
-    else:
-        results = results[:k]
+        results = reranker.rerank(query, results, k=fetch_k)
     try:
         from brain import recall_metric
         recall_metric.log_live_recall(query)
     except Exception:
         pass
 
-    # Enrich fact hits with entity_summary so agents can understand context
-    # without a follow-up brain_get call (saves one full-file load per entity).
+    # Enrich fact hits with entity_summary so agents can understand
+    # context without a follow-up brain_get call. Projection handles
+    # the first-per-entity suppression.
     fact_keys = list({
         (h["type"], h["name"])
         for h in results
@@ -550,19 +661,15 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
                 if s:
                     h["entity_summary"] = s
 
+    # --- weak-match computation (mirrors benchmark.compute_weak_match).
     import os as _os
     try:
         threshold = float(_os.environ.get("BRAIN_RECALL_WEAK_RRF", "0.035"))
     except (ValueError, TypeError):
         threshold = 0.035
-
-    # Option A — non-ASCII query adjustment.
-    # BM25 returns near-zero scores for Vietnamese/CJK queries (no token
-    # overlap with English content), cutting the max achievable RRF by ~half.
-    # Scale the threshold down proportionally so a correct semantic hit isn't
-    # silently classified as weak_match purely due to query language.
-    # Ratio 0.55 ≈ 2 semantic branches / 4 total branches, with a small
-    # buffer. Tunable via BRAIN_RECALL_NON_ASCII_SCALE (default 0.55).
+    # BM25 returns near-zero scores for non-ASCII queries; scale the
+    # threshold so a correct semantic hit isn't classed as weak purely
+    # due to query language. Tunable via BRAIN_RECALL_NON_ASCII_SCALE.
     if any(ord(c) > 127 for c in query):
         try:
             scale = float(_os.environ.get("BRAIN_RECALL_NON_ASCII_SCALE", "0.55"))
@@ -573,17 +680,10 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     top_score = max((h.get("rrf") or 0.0 for h in results), default=0.0)
     weak_match = top_score < threshold
 
-    # Option C — semantic fallback override.
-    # If RRF says weak but the embedding model found a confident cosine-sim
-    # hit (score ≥ BRAIN_RECALL_SEMANTIC_FALLBACK), trust the semantic branch.
-    # This is the architecturally correct fix: BM25 missing on a cross-lingual
-    # query is not evidence of a bad match — it's a language mismatch.
+    # Semantic-fallback rescue: low RRF but confident cosine → not weak.
+    # Uses sem_score (true cosine) not `score` — on merged hits `score`
+    # may be the BM25 branch's value (often negative).
     if weak_match and results:
-        # Use `sem_score` (true cosine), not `score` — when a hit is
-        # merged across both branches, `score` holds the BM25 value from
-        # the lexical branch (often negative). That silently zeroed out
-        # the fallback for any cross-lingual query where both branches
-        # happened to touch the same fact.
         semantic_top = max(
             (h.get("sem_score") if h.get("sem_score") is not None
              else (h.get("score") or 0.0)
@@ -611,32 +711,69 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     else:
         guidance = None
 
-    envelope = {
-        "query": query,
-        "weak_match": weak_match,
-        "top_score": top_score,
-        "threshold": threshold,
-        "guidance": guidance,
-        "hits": results,
-    }
-    return json.dumps(envelope, ensure_ascii=False, indent=2)
+    projected = _projection.project_hits(
+        results, k=k, verbose=verbose, debug=debug,
+    )
+    env = _projection.envelope(
+        query, projected,
+        weak_match=weak_match,
+        guidance=guidance,
+        debug=debug,
+        top_score=top_score,
+        threshold=threshold,
+        fetch_k=fetch_k,
+        rerank_on=rerank_on,
+        query_rewriter_on=query_rewriter_on,
+    )
+    # indent=2 is gone — every byte it cost the caller had zero signal.
+    return json.dumps(env, ensure_ascii=False)
 
 
 @mcp.tool()
-def brain_semantic(query: str, k: int = 8, type: str | None = None) -> str:
-    """Pure semantic (dense-vector) fact search. Use when you want
-    paraphrase recall and don't care about exact keyword matches."""
+def brain_semantic(
+    query: str,
+    k: int = 8,
+    type: str | None = None,
+    verbose: bool = False,
+    debug: bool = False,
+) -> str:
+    """Pure semantic (dense-vector) fact search.
+
+    Use when you want paraphrase recall and don't care about exact
+    keyword matches. For the recommended hybrid path with weak-match
+    guidance, prefer `brain_recall`.
+
+    Envelope: `{query, weak_match, guidance, hits}`. Default hit shape
+    matches the other tools — `{kind, path, text, name?,
+    entity_summary?}`.
+    """
+    if _projection.default_verbose() and not debug:
+        verbose = True
     _ensure_fresh()
     semantic = _semantic()
     k = max(1, min(int(k), 25))
     semantic.ensure_built()
-    results = semantic.search_facts(query, k=k, type=type)
+    fetch_k = min(k * 2, 25)
+    results = semantic.search_facts(query, k=fetch_k, type=type) or []
+    # Ensure kind is set for the projection layer.
+    for h in results:
+        h.setdefault("kind", "fact")
     try:
         from brain import recall_metric
         recall_metric.log_live_recall(query)
     except Exception:
         pass
-    return json.dumps(results, ensure_ascii=False, indent=2)
+    projected = _projection.project_hits(
+        results, k=k, verbose=verbose, debug=debug,
+    )
+    weak_match = not projected
+    guidance = "The brain has no record of this." if weak_match else None
+    env = _projection.envelope(
+        query, projected,
+        weak_match=weak_match, guidance=guidance, debug=debug,
+        fetch_k=fetch_k,
+    )
+    return json.dumps(env, ensure_ascii=False)
 
 
 @mcp.tool()
