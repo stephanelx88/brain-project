@@ -66,6 +66,49 @@ def _semantic():
     return semantic
 
 
+def _ensure_fresh() -> None:
+    """Bring the indexes in line with current filesystem state.
+
+    Runs three cheap sweeps before a recall answers so mutations that
+    happened since the last pipeline tick are reflected immediately:
+
+      1. `sync_mutated_entities` — reindex entity files whose on-disk
+         mtime is newer than the indexed_mtime column (direct edits
+         via Obsidian/vim/git-pull).
+      2. `ingest_notes.ingest_all` — detect created/edited/deleted
+         vault notes and cascade fact invalidations + tombstones for
+         deleted sources.
+      3. `gc_orphaned_entities` + incremental semantic update — purge
+         entity rows whose markdown is gone and embed any facts that
+         landed since the last `.vec` build.
+
+    Each sweep is idempotent and cheap on idle (stat-only pass). Set
+    `BRAIN_RECALL_ENSURE_FRESH=0` to disable if the cost ever shows up
+    in a hot-path profile — the pipeline will then fall back to its
+    scheduled ticks for consistency.
+    """
+    if os.environ.get("BRAIN_RECALL_ENSURE_FRESH", "1") == "0":
+        return
+    try:
+        db.sync_mutated_entities()
+    except Exception:
+        pass
+    try:
+        from brain import ingest_notes
+        ingest_notes.ingest_all()
+    except Exception:
+        pass
+    try:
+        db.gc_orphaned_entities()
+    except Exception:
+        pass
+    try:
+        semantic = _semantic()
+        semantic.ensure_built()
+    except Exception:
+        pass
+
+
 def _warmup() -> None:
     """Pre-load the embedding model + run one dummy encode so the first
     real `brain_recall` call doesn't pay the ~17 s cold-start (torch
@@ -400,6 +443,7 @@ def brain_recall(query: str, k: int = 8, type: str | None = None) -> str:
     needing a follow-up brain_get call.
     """
     k = max(1, min(int(k), 25))
+    _ensure_fresh()
     semantic = _semantic()
     semantic.ensure_built()
     # When BRAIN_QUERY_REWRITE=1, fan out to LLM-generated paraphrases and
@@ -887,6 +931,111 @@ def brain_correct_fact(
         return json.dumps(result, ensure_ascii=False)
     except (ValueError, RuntimeError) as e:
         return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def brain_forget(
+    text: str,
+    entity_type: str | None = None,
+    entity_name: str | None = None,
+    reason: str | None = None,
+) -> str:
+    """Record a forget-intent (tombstone) for a claim.
+
+    Use when the user says "don't remember this" / "I've decided to
+    forget X" / "never bring this up again". Symmetric counterpart of
+    `brain_note_add`: that pins a claim to memory, this pins a negation.
+
+    Behaviour: a tombstone keyed on the canonical fact hash is written
+    to the `tombstones` table. The extractor checks this table before
+    promoting any new fact, so the claim cannot be resurrected by a
+    later session mentioning it — no matter what the source. This is
+    how retract becomes *sticky* instead of one-shot.
+
+    Scope: pass `entity_type`+`entity_name` to narrow the tombstone to
+    one entity (e.g. forget "slippers in bedroom" only for Son, leave
+    intact for anyone else's claim text). Leave both None to forget
+    globally — the safer default.
+
+    Does NOT strikethrough existing facts on its own — for that, call
+    `brain_retract_fact` (which also tombstones automatically).
+    `brain_forget` is the "never re-ingest" primitive, useful when
+    there is no existing fact yet but the user wants to pre-empt one.
+
+    Returns JSON: {"tombstoned": bool, "claim": "...", "scope": ...}.
+    """
+    try:
+        written = db.add_tombstone(
+            text,
+            entity_type=entity_type,
+            entity_name=entity_name,
+            reason=reason or "user-forget",
+            created_by="user-forget",
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    scope = (
+        f"{entity_type}/{entity_name}"
+        if entity_type and entity_name
+        else "global"
+    )
+    return json.dumps(
+        {"tombstoned": written, "claim": (text or "").strip(), "scope": scope},
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+def brain_remember(
+    text: str,
+    entity_type: str | None = None,
+    entity_name: str | None = None,
+) -> str:
+    """Lift a previously-written tombstone so the claim can be re-ingested.
+
+    Use when the user says "actually that was true, start remembering it
+    again". Removes the matching tombstone row; does NOT re-add the fact
+    (the next extraction mentioning it will promote it normally). Match
+    on canonical fact hash plus scope — call with the same `entity_type`
+    / `entity_name` pair you used when forgetting.
+
+    Returns JSON: {"removed": int, "claim": "...", "scope": ...}.
+    """
+    try:
+        n = db.remove_tombstone(
+            text, entity_type=entity_type, entity_name=entity_name
+        )
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    scope = (
+        f"{entity_type}/{entity_name}"
+        if entity_type and entity_name
+        else "global"
+    )
+    return json.dumps(
+        {"removed": int(n), "claim": (text or "").strip(), "scope": scope},
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+def brain_tombstones(limit: int = 20) -> str:
+    """List the most recent tombstones (forget records) for audit.
+
+    Surfaces what the brain has been asked to forget and why. Each row
+    carries the original_text, scope (entity if any), reason, and who
+    wrote it (`retract`, `correct`, `note-delete`, `user-forget`). Use
+    this to verify a forget landed or to find a claim you want to
+    `brain_remember`.
+
+    Returns JSON list newest-first.
+    """
+    limit = max(1, min(int(limit), 200))
+    try:
+        rows = db.list_tombstones(limit=limit)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+    return json.dumps(rows, ensure_ascii=False, indent=2)
 
 
 @mcp.tool()

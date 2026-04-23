@@ -35,6 +35,11 @@ except Exception:  # pragma: no cover
     record_fact_provenance = None
 
 try:
+    from brain.db import is_forgotten as _is_forgotten
+except Exception:  # pragma: no cover
+    _is_forgotten = None
+
+try:
     from brain.supersede import recompute_for_entity as _recompute_supersede
 except Exception:  # pragma: no cover
     _recompute_supersede = None
@@ -149,6 +154,32 @@ def _apply_entity(
 
     raw_facts = [str(f).strip() for f in item.get("facts", []) if str(f).strip()]
     facts = [_strip_existing_source_suffix(f) for f in raw_facts]
+
+    # Tombstone gate — drop any claim the user has previously retracted,
+    # corrected, or whose source note was deleted. Without this, the
+    # LLM will happily re-promote "Thuha is in Cần Thơ" from the next
+    # session that mentions it, even after the user deleted the source
+    # note. The gate is a canonical-hash lookup — ~50 µs per claim.
+    had_any_facts = bool(facts)
+    if _is_forgotten is not None and facts:
+        kept: list[str] = []
+        for f in facts:
+            try:
+                blocked = _is_forgotten(
+                    f, entity_type=entity_type, entity_name=name
+                )
+            except Exception:
+                blocked = False
+            if blocked:
+                print(f"[tombstone] blocked {entity_type}/{name}: {f!r}")
+                continue
+            kept.append(f)
+        facts = kept
+    # If every proposed fact was tombstoned, don't create/update the
+    # entity at all — resurrecting a skeleton entity for a forgotten
+    # claim is the same silent-resurrection bug we just closed.
+    if had_any_facts and not facts:
+        return
     metadata = item.get("metadata") or {}
 
     fm = {}

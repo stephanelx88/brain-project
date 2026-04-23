@@ -629,8 +629,17 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
     # One status lookup for every candidate, so a fact whose status flipped
     # to 'superseded' after indexing gets dropped. The rowid in FACTS_JSON
     # mirrors facts.id in the DB, so we can lookup directly.
+    # `db_queried_ok` distinguishes "query succeeded but this rowid is
+    # absent" (→ drop; the fact was retracted and its row DELETE+INSERTed
+    # under a new id by `upsert_entity_from_file`) from "query failed
+    # entirely" (→ pass through so a transient DB hiccup never hides
+    # results). Without this split a retracted fact's *old* embedding
+    # stays in facts.npy indefinitely and leaks through cosine hits —
+    # which is exactly the "brain keeps answering 'Thuha ở Cần Thơ'
+    # after the note was deleted" failure we just closed.
     rowids = [int(meta[i].get("rowid") or 0) for i, _ in hits]
     status_by_id: dict[int, str | None] = {}
+    db_queried_ok = False
     if rowids:
         try:
             with db.connect() as conn:
@@ -640,8 +649,10 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
                     rowids,
                 ).fetchall()
             status_by_id = {int(r[0]): r[1] for r in rows}
+            db_queried_ok = True
         except Exception:
             status_by_id = {}
+            db_queried_ok = False
 
     out: list[dict] = []
     for i, score in hits:
@@ -649,10 +660,13 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
         if type and m["type"] != type:
             continue
         rowid = int(m.get("rowid") or 0)
-        # Drop rows whose status is superseded OR who no longer exist in
-        # the DB (retracted). Rows missing from the lookup (e.g. DB fault)
-        # pass through — never hide results on infrastructure errors.
-        if status_by_id and rowid in status_by_id:
+        if db_queried_ok:
+            if rowid not in status_by_id:
+                # Orphan: embedding still cached in .vec/facts.npy but the
+                # facts row is gone. Upsert DELETE+INSERT cycles retracted
+                # rows through new ids, so an absent rowid means the old
+                # claim was retracted. Drop it.
+                continue
             if status_by_id[rowid] == "superseded":
                 continue
         out.append(

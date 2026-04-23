@@ -96,12 +96,25 @@ def retract_fact(
 
     Returns the exact fact text that was retracted.
     Raises ValueError if the entity does not exist or no matching fact is found.
+
+    Also writes a global tombstone so re-extraction from a fresh session
+    cannot resurrect the claim. Without the tombstone, retract was lossy:
+    the strikethrough lived in the entity markdown only, and the next
+    LLM extraction that happened to mention the retracted claim would
+    append it back as a brand-new fact.
     """
     path = entity_path(entity_type.strip().lower(), entity_name.strip())
     if not path.exists():
         raise ValueError(f"entity not found: {entity_type}/{entity_name}")
     retracted = _retract_in_markdown(path, fact_query, retracted_by)
     db.upsert_entity_from_file(path)
+    db.add_tombstone(
+        retracted,
+        entity_type=entity_type,
+        entity_name=entity_name,
+        reason=f"retract:{retracted_by}",
+        created_by="retract",
+    )
     return retracted
 
 
@@ -129,4 +142,14 @@ def correct_fact(
     path.write_text(existing.rstrip() + fact_line + "\n")
     # Single upsert after both edits are done.
     db.upsert_entity_from_file(path)
+    # Tombstone the wrong phrasing so a later extraction can't re-create
+    # it. Scoped to this entity so unrelated entities with a coincidentally
+    # similar claim text are unaffected.
+    db.add_tombstone(
+        retracted,
+        entity_type=entity_type,
+        entity_name=entity_name,
+        reason=f"correction:{source}",
+        created_by="correct",
+    )
     return {"retracted": retracted, "appended": correct_fact_text.strip()}

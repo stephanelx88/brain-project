@@ -20,6 +20,12 @@ def tmp_brain_for_mcp(tmp_path, monkeypatch):
     (brain_dir / "identity" / "who-i-am.md").write_text("I am the test user.")
     (brain_dir / "identity" / "preferences.md").write_text("Prefer brevity.")
 
+    # Disable the read-time freshness sweep inside brain_recall for these
+    # tests. The fixture intentionally inserts SQLite rows that don't match
+    # any on-disk markdown; _ensure_fresh would "helpfully" reconcile that
+    # inconsistency and wipe the summary the tests depend on.
+    monkeypatch.setenv("BRAIN_RECALL_ENSURE_FRESH", "0")
+
     import brain.config as config
     monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
     monkeypatch.setattr(config, "IDENTITY_DIR", brain_dir / "identity")

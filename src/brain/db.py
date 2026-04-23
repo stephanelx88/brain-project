@@ -140,6 +140,40 @@ CREATE TABLE IF NOT EXISTS fact_provenance (
 );
 CREATE INDEX IF NOT EXISTS fact_provenance_note_idx
     ON fact_provenance(note_path);
+
+-- Forget primitive (2026-04-23). Symmetric counterpart of extraction:
+-- when a claim is retracted, a source note is deleted, or the user
+-- explicitly forgets something, we write a tombstone keyed on the
+-- canonical fact hash. The extractor consults this table before
+-- promoting any claim, so re-mentioning a forgotten fact in a later
+-- session does not resurrect it. Without this, retract was lossy —
+-- strikethrough was only in-place on the entity file; the next
+-- extraction from a fresh session would re-create the fact (incident
+-- 2026-04-23, "Thuha ở Cần Thơ" kept returning after the note was
+-- deleted).
+--
+-- `claim_key`: canonical_fact_hash(text) — normalised, case-folded,
+--              source-stripped. Same key used by fact_provenance so the
+--              extractor's dedupe and the tombstone check share a namespace.
+-- `entity_type` / `entity_name`: optional scoping. NULL means "forget
+--              this claim everywhere"; set means "forget only when
+--              promoted under this entity" (rare; used when the same
+--              text is valid for one entity and not another).
+CREATE TABLE IF NOT EXISTS tombstones (
+    id             INTEGER PRIMARY KEY,
+    claim_key      TEXT NOT NULL,
+    entity_type    TEXT,
+    entity_name    TEXT,
+    original_text  TEXT NOT NULL,
+    reason         TEXT,
+    created_at     REAL NOT NULL,
+    created_by     TEXT,
+    UNIQUE(claim_key, entity_type, entity_name)
+);
+CREATE INDEX IF NOT EXISTS tombstones_entity_idx
+    ON tombstones(entity_type, entity_name);
+CREATE INDEX IF NOT EXISTS tombstones_created_idx
+    ON tombstones(created_at);
 """
 
 _SOURCE_RE = re.compile(r"\(source:\s*([^,)]+?)(?:,\s*([\d-]+))?\s*\)")
@@ -184,6 +218,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # stale) or deleted (no notes row → orphaned).
     if "source_sha" not in cols("fact_provenance"):
         conn.execute("ALTER TABLE fact_provenance ADD COLUMN source_sha TEXT")
+
+    # 2026-04-23 — entity fs mtime tracking for read-time freshness.
+    # Without this, a user editing an entity file directly (Obsidian,
+    # manual vim, git pull) leaves the DB stale until some other path
+    # triggers an upsert. brain_recall's freshness sweep walks the
+    # entities dir, compares fs mtime to indexed_mtime, and reindexes
+    # only what changed — ~1 stat per file, plus full upsert for the
+    # handful that mutated.
+    if "indexed_mtime" not in cols("entities"):
+        conn.execute("ALTER TABLE entities ADD COLUMN indexed_mtime REAL")
 
 
 @contextmanager
@@ -306,6 +350,10 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
         source_count = 1
 
     rel_path = str(path.relative_to(config.BRAIN_DIR))
+    try:
+        file_mtime: float | None = path.stat().st_mtime
+    except OSError:
+        file_mtime = None
 
     with connect() as conn:
         cur = conn.cursor()
@@ -333,24 +381,25 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
             cur.execute(
                 """UPDATE entities
                    SET type=?, slug=?, name=?, status=?, summary=?,
-                       first_seen=?, last_updated=?, source_count=?, tags=?
+                       first_seen=?, last_updated=?, source_count=?, tags=?,
+                       indexed_mtime=?
                    WHERE id=?""",
                 (
                     etype, path.stem, name, fm.get("status"), summary,
                     fm.get("first_seen"), fm.get("last_updated"),
-                    source_count, fm.get("tags"), entity_id,
+                    source_count, fm.get("tags"), file_mtime, entity_id,
                 ),
             )
         else:
             cur.execute(
                 """INSERT INTO entities
                    (path, type, slug, name, status, summary,
-                    first_seen, last_updated, source_count, tags)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    first_seen, last_updated, source_count, tags, indexed_mtime)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     rel_path, etype, path.stem, name, fm.get("status"), summary,
                     fm.get("first_seen"), fm.get("last_updated"),
-                    source_count, fm.get("tags"),
+                    source_count, fm.get("tags"), file_mtime,
                 ),
             )
             entity_id = cur.lastrowid
@@ -753,6 +802,117 @@ def forget_note_provenance(note_path: str | Path) -> int:
         return cur.rowcount
 
 
+def add_tombstone(
+    fact_text: str,
+    *,
+    entity_type: str | None = None,
+    entity_name: str | None = None,
+    reason: str | None = None,
+    created_by: str = "user",
+) -> bool:
+    """Record a forget-intent for `fact_text`. Returns True if newly added.
+
+    The canonical fact hash is used as the dedupe key so repeated forget
+    calls on equivalent phrasings (mixed case, trailing source suffix,
+    whitespace noise) collapse into one row. Scope with
+    `entity_type`+`entity_name` to forget a claim only under one entity;
+    leave both None to block globally.
+    """
+    import time as _time
+
+    text = (fact_text or "").strip()
+    if not text:
+        return False
+    key = canonical_fact_hash(text)
+    # SQLite's UNIQUE treats NULL != NULL, so two global tombstones
+    # with the same claim_key but both scopes NULL would both insert.
+    # Use empty string as the "unscoped" sentinel so UNIQUE dedupes.
+    etype = (entity_type or "").strip().lower()
+    ename = (entity_name or "").strip()
+    with connect() as conn:
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO tombstones
+               (claim_key, entity_type, entity_name, original_text,
+                reason, created_at, created_by)
+               VALUES (?,?,?,?,?,?,?)""",
+            (key, etype, ename, text, reason, _time.time(), created_by),
+        )
+        return cur.rowcount > 0
+
+
+def is_forgotten(
+    fact_text: str,
+    *,
+    entity_type: str | None = None,
+    entity_name: str | None = None,
+) -> bool:
+    """Would `fact_text` be blocked by a tombstone under this entity scope?
+
+    Matches when a tombstone with the same canonical hash exists AND
+    its scope is (a) global (entity_type/name both NULL) OR
+    (b) scoped to the same entity_type+entity_name as the caller.
+    Broader scopes win: a global tombstone blocks promotion under any
+    entity; an entity-scoped tombstone only blocks its own entity.
+    """
+    text = (fact_text or "").strip()
+    if not text:
+        return False
+    key = canonical_fact_hash(text)
+    etype = (entity_type or "").strip().lower()
+    ename = (entity_name or "").strip()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT entity_type, entity_name FROM tombstones WHERE claim_key=?",
+            (key,),
+        ).fetchall()
+    for t_etype, t_ename in rows:
+        te = t_etype or ""
+        tn = t_ename or ""
+        if te == "" and tn == "":
+            return True  # global tombstone blocks any scope
+        if te == etype and tn == ename:
+            return True  # exact-scope match
+    return False
+
+
+def list_tombstones(limit: int = 50) -> list[dict]:
+    """Return tombstones newest-first for audit / admin."""
+    with connect() as conn:
+        rows = conn.execute(
+            """SELECT id, claim_key, entity_type, entity_name,
+                      original_text, reason, created_at, created_by
+               FROM tombstones ORDER BY created_at DESC LIMIT ?""",
+            (int(limit),),
+        ).fetchall()
+    cols = ["id", "claim_key", "entity_type", "entity_name",
+            "original_text", "reason", "created_at", "created_by"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def remove_tombstone(
+    fact_text: str,
+    *,
+    entity_type: str | None = None,
+    entity_name: str | None = None,
+) -> int:
+    """Lift a tombstone (user changed their mind). Returns rows deleted."""
+    text = (fact_text or "").strip()
+    if not text:
+        return 0
+    key = canonical_fact_hash(text)
+    etype = (entity_type or "").strip().lower()
+    ename = (entity_name or "").strip()
+    with connect() as conn:
+        cur = conn.execute(
+            """DELETE FROM tombstones
+               WHERE claim_key=?
+                 AND COALESCE(entity_type, '') = ?
+                 AND COALESCE(entity_name, '') = ?""",
+            (key, etype, ename),
+        )
+        return cur.rowcount
+
+
 def gc_orphaned_entities() -> list[str]:
     """Remove DB + FTS index entries for entity files deleted from disk.
 
@@ -801,6 +961,40 @@ def index_untracked_entities() -> list[str]:
                 except Exception:
                     continue
     return added
+
+
+def sync_mutated_entities() -> list[str]:
+    """Re-upsert entity files whose fs mtime is newer than `indexed_mtime`.
+
+    Read-time freshness primitive. Without this, a user editing an
+    entity markdown directly (Obsidian, vim, git pull) leaves the DB
+    stale until some other path triggers an upsert — so brain_recall
+    could return the old pre-edit text for hours. One `stat()` per
+    entity plus a full upsert for the handful that changed.
+
+    Returns vault-relative paths of the re-indexed files.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT path, indexed_mtime FROM entities"
+        ).fetchall()
+
+    changed: list[str] = []
+    for rel_path, indexed_mtime in rows:
+        abs_path = config.BRAIN_DIR / rel_path
+        try:
+            cur_mtime = abs_path.stat().st_mtime
+        except OSError:
+            # Missing file — leave to gc_orphaned_entities which runs
+            # in the same freshness pass and knows how to remove it.
+            continue
+        if indexed_mtime is None or cur_mtime > float(indexed_mtime) + 1e-3:
+            try:
+                upsert_entity_from_file(abs_path)
+                changed.append(rel_path)
+            except Exception:
+                continue
+    return changed
 
 
 def find_stale_provenance() -> list[dict]:

@@ -79,18 +79,46 @@ def _sha(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
 
 
+def _entity_type_name_from_path(entity_rel: str) -> tuple[str | None, str | None]:
+    """Parse `entities/<type>/<slug>.md` into (type, name).
+
+    Reads the entity file's frontmatter when available so the tombstone
+    records the canonical `name` rather than the slug. Falls back to the
+    slugified filename when the file is gone or has no frontmatter.
+    """
+    parts = entity_rel.split("/")
+    if len(parts) < 3 or parts[0] != "entities":
+        return None, None
+    etype = parts[1]
+    slug = parts[-1].rsplit(".", 1)[0]
+    name: str | None = slug
+    try:
+        epath = config.BRAIN_DIR / entity_rel
+        if epath.exists():
+            text = epath.read_text(errors="replace")
+            from brain.db import _parse_frontmatter
+            fm = _parse_frontmatter(text)
+            if fm.get("name"):
+                name = fm["name"]
+    except Exception:
+        pass
+    return etype, name
+
+
 def _strikethrough_fact_in_entity(
     entity_path: Path,
     target_hashes: set[str],
     note_rel: str,
     today: str,
     reason: str = "deleted",
-) -> int:
+) -> tuple[int, list[str]]:
     """Wrap matching fact lines in `~~…~~` and append an invalidation tag.
 
     A fact "matches" when `db.canonical_fact_hash` of the line's text
     (after the `- ` and minus the source suffix) is in `target_hashes`.
-    Returns the number of lines actually modified.
+    Returns `(count, texts)` — number of lines modified and the
+    canonical (source-stripped) text of each, so the caller can emit
+    tombstones for them.
 
     Lines already strikethroughed are left alone (idempotent — repeated
     note-delete events on the same provenance won't double-mark).
@@ -103,10 +131,13 @@ def _strikethrough_fact_in_entity(
     try:
         text = entity_path.read_text(errors="replace")
     except OSError:
-        return 0
+        return 0, []
 
     new_lines: list[str] = []
     changed = 0
+    texts: list[str] = []
+    import re as _re
+    _SRC_RE = _re.compile(r"\(source:[^)]*\)")
     for raw in text.split("\n"):
         line = raw
         stripped = line.lstrip()
@@ -125,26 +156,28 @@ def _strikethrough_fact_in_entity(
             continue
         # Wrap the fact text in strikethrough but keep the source suffix
         # outside the marker so the trail of provenance stays readable.
-        import re as _re
-        m = _re.search(r"\(source:[^)]*\)", body_text)
+        m = _SRC_RE.search(body_text)
         if m:
             head = body_text[: m.start()].rstrip()
             tail = body_text[m.start():]
+            canonical_text = head
             new_body = (
                 f"~~{head}~~ {tail} "
                 f"[invalidated {today}: source note `{note_rel}` {reason}]"
             )
         else:
+            canonical_text = body_text.rstrip()
             new_body = (
                 f"~~{body_text.rstrip()}~~ "
                 f"[invalidated {today}: source note `{note_rel}` {reason}]"
             )
         new_lines.append(f"{indent}- {new_body}")
         changed += 1
+        texts.append(canonical_text)
 
     if changed:
         entity_path.write_text("\n".join(new_lines))
-    return changed
+    return changed, texts
 
 
 def invalidate_facts_for_note(
@@ -173,11 +206,14 @@ def invalidate_facts_for_note(
     facts_changed = 0
     entities_touched = 0
     touched_entity_paths: list[str] = []
+    tombstones_written = 0
     for entity_rel, hashes in by_entity.items():
         epath = config.BRAIN_DIR / entity_rel
         if not epath.exists():
             continue
-        n = _strikethrough_fact_in_entity(epath, hashes, note_rel, today, reason=reason)
+        n, texts = _strikethrough_fact_in_entity(
+            epath, hashes, note_rel, today, reason=reason
+        )
         if n > 0:
             facts_changed += n
             entities_touched += 1
@@ -187,6 +223,24 @@ def invalidate_facts_for_note(
             except Exception as exc:
                 if verbose:
                     print(f"  fts refresh failed for {entity_rel}: {exc}")
+            # Tombstone on DELETE only. Edits must not tombstone, or
+            # the new extraction from the edited content would be blocked
+            # from restating a claim the user still wrote in the new body.
+            if reason == "deleted":
+                etype, ename = _entity_type_name_from_path(entity_rel)
+                for t in texts:
+                    try:
+                        if db.add_tombstone(
+                            t,
+                            entity_type=etype,
+                            entity_name=ename,
+                            reason=f"note-deleted:{note_rel}",
+                            created_by="note-delete",
+                        ):
+                            tombstones_written += 1
+                    except Exception as exc:
+                        if verbose:
+                            print(f"  tombstone failed for {t!r}: {exc}")
             if verbose:
                 print(f"  ~~ invalidated {n} fact(s) in {entity_rel}")
 
@@ -195,6 +249,7 @@ def invalidate_facts_for_note(
         "facts_invalidated": facts_changed,
         "entities_touched": entities_touched,
         "entity_paths": touched_entity_paths,
+        "tombstones_written": tombstones_written,
     }
 
 
@@ -256,7 +311,7 @@ def ingest_all(verbose: bool = False) -> dict:
     # "Son in Long Xuyen" frozen in `entities/people/son.md` forever —
     # see the 2026-04-21 postmortem in git_ops.commit's docstring.
     deleted_paths: list[str] = []
-    invalidation_summary = {"facts": 0, "entities": 0}
+    invalidation_summary = {"facts": 0, "entities": 0, "tombstones": 0}
     for rel in list(ledger.keys()):
         if rel in seen:
             continue
@@ -265,6 +320,7 @@ def ingest_all(verbose: bool = False) -> dict:
                 inv = invalidate_facts_for_note(rel, verbose=verbose)
                 invalidation_summary["facts"] += inv["facts_invalidated"]
                 invalidation_summary["entities"] += inv["entities_touched"]
+                invalidation_summary["tombstones"] += inv.get("tombstones_written", 0)
             except Exception as exc:
                 if verbose:
                     print(f"  invalidation skipped for {rel}: {exc}", flush=True)
@@ -299,6 +355,7 @@ def ingest_all(verbose: bool = False) -> dict:
         "skipped_large": skipped_large,
         "facts_invalidated": invalidation_summary["facts"],
         "entities_touched_by_invalidation": invalidation_summary["entities"],
+        "tombstones_written": invalidation_summary["tombstones"],
     }
 
 
