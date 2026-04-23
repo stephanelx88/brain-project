@@ -78,7 +78,26 @@ def _build_entity_name_cache() -> str:
 
 
 def get_existing_index() -> str:
-    """Return cached entity-name list; rebuild if stale."""
+    """Return cached entity-name list; rebuild if stale.
+
+    Guarantees the brain owner's ``people/`` anchor entity exists
+    before the cache is built — without it the extractor has nowhere
+    to attach self-facts like ``"Son ate bún riêu"``. Idempotent after
+    first run.
+    """
+    try:
+        from brain.self_entity import ensure_self_entity
+        created = ensure_self_entity()
+        if created is not None:
+            # Invalidate the cache so the new owner entity shows up in
+            # the list sent to the extractor on this very run.
+            try:
+                CACHE_FILE.unlink()
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass  # never let anchor-init failure block extraction
+
     try:
         cache_mtime = CACHE_FILE.stat().st_mtime
         index_mtime = config.INDEX_FILE.stat().st_mtime if config.INDEX_FILE.exists() else 0
