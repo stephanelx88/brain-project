@@ -341,6 +341,19 @@ def _process_single(raw_file: Path, existing: str) -> str:
 
 
 def main():
+    # GC phantom entity rows BEFORE bailing on no-work. Without this, ghost
+    # rows (e.g. from a leaked test fixture or a manual `rm` on an entity
+    # file) accumulate indefinitely between successful extractions —
+    # post_extraction_sync only runs when an extraction succeeds, so an
+    # idle scheduler never reconciles. Cheap (one SELECT path + N stat()s).
+    try:
+        from brain.db import gc_orphaned_entities
+        removed = gc_orphaned_entities()
+        if removed:
+            print(f"  gc: removed {len(removed)} phantom entity row(s)", flush=True)
+    except Exception as exc:
+        print(f"  gc skipped: {exc}", flush=True)
+
     pending = get_pending_files()
     if not pending:
         print("No pending files in ~/.brain/raw/")

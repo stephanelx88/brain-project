@@ -31,7 +31,27 @@ from typing import Iterable
 
 import brain.config as config
 
+# DB_PATH is the source-of-truth handle for the active SQLite file.
+# Two override mechanisms layer on top, both routed through `_db_path()`:
+#   1. Tests that `monkeypatch.setattr(db, "DB_PATH", ...)` swap the
+#      module attribute — `_db_path()` honours it when it differs from
+#      the import-time default.
+#   2. `rebuild()` pins to its scratch `.new` file via `DB_PATH = …`
+#      for the rebuild window, then restores.
+# Tests that only `monkeypatch.setattr(config, "BRAIN_DIR", tmp)` (without
+# also patching DB_PATH) used to leak fixture rows into ~/.brain/.brain.db
+# because the old `DB_PATH = config.BRAIN_DIR / ".brain.db"` froze the
+# prod path at import time. `_db_path()` now resolves from config at call
+# time when no explicit override is set (incident 2026-04-23).
 DB_PATH = config.BRAIN_DIR / ".brain.db"
+_IMPORT_TIME_DB_PATH = DB_PATH
+
+
+def _db_path() -> Path:
+    """Resolve the active SQLite path with the resolution order above."""
+    if DB_PATH != _IMPORT_TIME_DB_PATH:
+        return DB_PATH
+    return config.BRAIN_DIR / ".brain.db"
 
 _SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -168,8 +188,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def connect():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    db_path = _db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
     _migrate(conn)
     try:
@@ -434,7 +455,7 @@ def rebuild() -> dict:
     import os as _os
 
     global DB_PATH
-    orig_path = DB_PATH
+    orig_path = _db_path()
     new_path = orig_path.parent / (orig_path.name + ".new")
     # Remove any stale `.new` left by a previous crashed rebuild so
     # `connect()` starts from a clean slate.
@@ -443,10 +464,9 @@ def rebuild() -> dict:
 
     counts = {"entities": 0, "facts": 0}
     # Redirect every `connect()` call below at the scratch path for the
-    # duration of the rebuild. `DB_PATH` is the only module-level handle
-    # connect() reads, so swapping it is sufficient and preserves all
-    # existing call sites (`upsert_entity_from_file`, the final count
-    # query) with zero changes.
+    # duration of the rebuild. `_db_path()` honours an explicit DB_PATH
+    # override, so this swap reaches all existing call sites
+    # (`upsert_entity_from_file`, the final count query) with zero changes.
     DB_PATH = new_path
     try:
         config.ENTITY_TYPES.update(config._discover_entity_types())
