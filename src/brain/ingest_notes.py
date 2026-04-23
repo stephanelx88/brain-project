@@ -318,11 +318,26 @@ def ingest_one(path: Path | str) -> dict:
         try:
             inv = invalidate_facts_for_note(rel, verbose=False)
         except Exception:
-            inv = {"facts_invalidated": 0, "entities_touched": 0, "tombstones_written": 0}
+            inv = {"facts_invalidated": 0, "entities_touched": 0,
+                   "tombstones_written": 0, "entity_paths": []}
         db.delete_note_by_path(rel)
         try:
             from brain import semantic
             semantic.update_notes_via_worker(changed=[], deleted_paths=[rel])
+        except Exception:
+            pass
+        # WS3 follow-up: proactive `.vec` invalidation for each entity
+        # whose facts just got strikethroughed by the note delete.
+        # Belt-and-suspenders with `db.upsert_entity_from_file`'s hook
+        # (reached via `invalidate_facts_for_note`'s entity re-upsert);
+        # kept explicit so a cascade refactor can't silently re-introduce
+        # the stale-vec class.
+        try:
+            from brain import semantic
+            for entity_rel in inv.get("entity_paths", []) or []:
+                etype, _ = _entity_type_name_from_path(entity_rel)
+                if etype:
+                    semantic.invalidate_for(etype, Path(entity_rel).stem)
         except Exception:
             pass
         out.update({"status": "deleted", "deleted": True,

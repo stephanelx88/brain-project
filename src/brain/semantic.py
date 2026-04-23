@@ -861,6 +861,71 @@ def count_stale_fact_meta() -> dict:
     }
 
 
+def invalidate_for(entity_type: str, slug: str | None = None) -> dict:
+    """Pop `.vec` rows belonging to one entity (or an entire type).
+
+    Proactive invalidation hook for the WS3 watcher: when a note or
+    entity file changes, the DB rewrite may delete + re-insert facts,
+    but `.vec/{facts,entities}.{npy,json}` is append-only. The
+    stale-text guard in `search_facts` still catches the drift at
+    serve time, but each ghost hit burns one rerank round-trip + one
+    WS5 audit-ledger write. This function closes the gap by removing
+    the ghost rows on disk so the next `brain_recall` doesn't even
+    see them; incremental `ensure_built()` re-embeds the current DB
+    rows on the next tick.
+
+    `slug=None` → invalidate every row of `entity_type` (rare).
+    `slug=<x>` → invalidate rows for `(entity_type, x)` (common
+    watcher path). Missing vec files or any io error → {0, 0}; this
+    is cache hygiene, not a correctness boundary — the serve-time
+    guard remains the final authority.
+    """
+    facts_dropped = 0
+    entities_dropped = 0
+
+    try:
+        if FACTS_NPY.exists() and FACTS_JSON.exists():
+            vecs = np.load(FACTS_NPY)
+            meta = json.loads(FACTS_JSON.read_text())
+            if isinstance(meta, list) and meta:
+                keep_idx = []
+                for i, m in enumerate(meta):
+                    if m.get("type") != entity_type:
+                        keep_idx.append(i); continue
+                    if slug is not None and m.get("slug") != slug:
+                        keep_idx.append(i); continue
+                    facts_dropped += 1
+                if facts_dropped:
+                    new_meta = [meta[i] for i in keep_idx]
+                    new_vecs = (vecs[keep_idx] if vecs.size and vecs.shape[0] == len(meta) else vecs)
+                    _atomic_save_npy(FACTS_NPY, new_vecs.astype(np.float32))
+                    atomic_write_text(FACTS_JSON, json.dumps(new_meta))
+    except Exception:
+        pass
+
+    try:
+        if ENT_NPY.exists() and ENT_JSON.exists():
+            vecs = np.load(ENT_NPY)
+            meta = json.loads(ENT_JSON.read_text())
+            if isinstance(meta, list) and meta:
+                keep_idx = []
+                for i, m in enumerate(meta):
+                    if m.get("type") != entity_type:
+                        keep_idx.append(i); continue
+                    if slug is not None and m.get("slug") != slug:
+                        keep_idx.append(i); continue
+                    entities_dropped += 1
+                if entities_dropped:
+                    new_meta = [meta[i] for i in keep_idx]
+                    new_vecs = (vecs[keep_idx] if vecs.size and vecs.shape[0] == len(meta) else vecs)
+                    _atomic_save_npy(ENT_NPY, new_vecs.astype(np.float32))
+                    atomic_write_text(ENT_JSON, json.dumps(new_meta))
+    except Exception:
+        pass
+
+    return {"facts_dropped": facts_dropped, "entities_dropped": entities_dropped}
+
+
 def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
     """Pure-semantic fact search, with a query-time supersession filter.
 

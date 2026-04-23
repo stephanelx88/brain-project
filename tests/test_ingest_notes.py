@@ -399,3 +399,38 @@ def test_ingest_rejects_unsupported_extensions(tmp_vault):
     assert "kept.md" in paths
     assert "huge.log" not in paths
     assert "config.json" not in paths
+
+
+
+def test_ingest_one_delete_calls_semantic_invalidate_for_touched_entities(tmp_vault, monkeypatch):
+    from brain import ingest_notes
+    calls = []
+
+    class _FakeSem:
+        @staticmethod
+        def invalidate_for(entity_type, slug=None):
+            calls.append((entity_type, slug))
+            return {"facts_dropped": 0, "entities_dropped": 0}
+        @staticmethod
+        def update_notes_via_worker(**kw): pass
+
+    monkeypatch.setattr(ingest_notes, "invalidate_facts_for_note",
+        lambda rel, verbose=False: {
+            "facts_invalidated": 2, "entities_touched": 2, "tombstones_written": 0,
+            "entity_paths": ["entities/people/thuha.md", "entities/projects/brain.md"],
+        })
+    # Both patches needed: `from brain import semantic` does
+    # `getattr(brain, 'semantic')`, so the attribute has to be
+    # replaced too — not just the sys.modules entry.
+    import sys, brain as _brain_pkg
+    monkeypatch.setitem(sys.modules, "brain.semantic", _FakeSem)
+    monkeypatch.setattr(_brain_pkg, "semantic", _FakeSem)
+
+    note = tmp_vault / "some-note.md"
+    note.write_text("seed")
+    ingest_notes.ingest_one(note)
+    note.unlink()
+    out = ingest_notes.ingest_one(note)
+    assert out["status"] == "deleted"
+    assert ("people", "thuha") in calls
+    assert ("projects", "brain") in calls

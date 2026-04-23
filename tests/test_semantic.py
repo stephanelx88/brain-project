@@ -449,3 +449,68 @@ def test_ensure_built_incremental_failure_swallowed(
 
     # Must not raise even though _has_new_rows is True.
     semantic.ensure_built()                        # no exception → pass
+
+
+
+# ---------------------------------------------------------------------------
+# invalidate_for — proactive cache invalidation (WS3 follow-up, 2026-04-23)
+# ---------------------------------------------------------------------------
+
+def test_invalidate_for_with_slug_pops_matching_rows(tmp_brain_with_db):
+    semantic.build()
+    before_meta = json.loads(semantic.FACTS_JSON.read_text())
+    before_vecs = np.load(semantic.FACTS_NPY)
+    assert any(m["slug"] == "foo" for m in before_meta)
+    out = semantic.invalidate_for("projects", "foo")
+    assert out["facts_dropped"] == 1
+    assert out["entities_dropped"] == 1
+    after_meta = json.loads(semantic.FACTS_JSON.read_text())
+    after_vecs = np.load(semantic.FACTS_NPY)
+    assert not any(m["slug"] == "foo" for m in after_meta)
+    assert len(after_meta) == len(before_meta) - 1
+    assert after_vecs.shape[0] == before_vecs.shape[0] - 1
+    assert any(m["slug"] == "bar" for m in after_meta)
+
+
+def test_invalidate_for_type_wide_drops_all_of_type(tmp_brain_with_db):
+    semantic.build()
+    semantic.invalidate_for("projects")
+    fact_meta = json.loads(semantic.FACTS_JSON.read_text())
+    assert not any(m["type"] == "projects" for m in fact_meta)
+    ent_meta = json.loads(semantic.ENT_JSON.read_text())
+    assert not any(m["type"] == "projects" for m in ent_meta)
+
+
+def test_invalidate_for_nonexistent_is_noop(tmp_brain_with_db):
+    semantic.build()
+    before = json.loads(semantic.FACTS_JSON.read_text())
+    out = semantic.invalidate_for("projects", "does-not-exist")
+    assert out == {"facts_dropped": 0, "entities_dropped": 0}
+    after = json.loads(semantic.FACTS_JSON.read_text())
+    assert len(after) == len(before)
+
+
+def test_invalidate_for_handles_missing_vec_files(tmp_brain_with_db):
+    out = semantic.invalidate_for("projects", "foo")
+    assert out == {"facts_dropped": 0, "entities_dropped": 0}
+
+
+def test_upsert_entity_from_file_hook_calls_invalidate_for(tmp_path, monkeypatch):
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    import brain.config as config
+    monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
+    from brain import db
+    monkeypatch.setattr(db, "DB_PATH", brain_dir / ".brain.db")
+
+    calls = []
+    monkeypatch.setattr(semantic, "invalidate_for",
+        lambda t, s=None: (calls.append((t, s)), {"facts_dropped": 0, "entities_dropped": 0})[1])
+
+    entities_dir = brain_dir / "entities" / "projects"
+    entities_dir.mkdir(parents=True)
+    ef = entities_dir / "alphabetised.md"
+    ef.write_text("---\ntype: projects\nname: Alphabetised\n---\n\n"
+                  "# Alphabetised\n\n- first fact (source: seed, 2026-04-23)\n")
+    db.upsert_entity_from_file(ef)
+    assert ("projects", "alphabetised") in calls
