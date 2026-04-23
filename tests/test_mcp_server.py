@@ -94,10 +94,12 @@ def tmp_brain_for_mcp(tmp_path, monkeypatch):
 def test_brain_search_returns_json(tmp_brain_for_mcp):
     from brain import mcp_server
     out = mcp_server.brain_search("alpha", k=3)
-    rows = json.loads(out)
-    assert len(rows) == 1
-    assert rows[0]["name"] == "Foo Project"
-    assert rows[0]["text"] == "alpha bravo charlie"
+    env = json.loads(out)
+    assert "hits" in env
+    hits = env["hits"]
+    assert len(hits) == 1
+    assert hits[0]["name"] == "Foo Project"
+    assert hits[0]["text"] == "alpha bravo charlie"
 
 
 def test_brain_get_via_alias(tmp_brain_for_mcp):
@@ -337,11 +339,13 @@ def test_brain_live_sessions_include_self_returns_all(tmp_path, monkeypatch):
 # ---------- brain_recall envelope + weak_match ---------------------------
 
 def _call_brain_recall_with_stubbed_hits(monkeypatch, hits, *,
-                                         query="q", env=None):
+                                         query="q", env=None, debug=True):
     """Stub out the semantic layer so brain_recall returns `hits` verbatim.
 
     Yields the parsed JSON envelope. Avoids pulling torch / the real
-    embedding index into the unit test.
+    embedding index into the unit test. `debug=True` by default so the
+    envelope carries the `top_score`/`threshold` diagnostics these tests
+    inspect — real agent callers get the compact default.
     """
     from brain import mcp_server
 
@@ -368,17 +372,36 @@ def _call_brain_recall_with_stubbed_hits(monkeypatch, hits, *,
     )
     for key, val in (env or {}).items():
         monkeypatch.setenv(key, val)
-    return json.loads(mcp_server.brain_recall(query))
+    return json.loads(mcp_server.brain_recall(query, debug=debug))
 
 
 def test_brain_recall_envelope_has_expected_keys(monkeypatch):
+    # Default tier: compact envelope — top_score/threshold move behind debug.
     out = _call_brain_recall_with_stubbed_hits(monkeypatch, hits=[
         {"kind": "fact", "name": "Foo", "text": "alpha", "rrf": 0.08},
-    ])
-    assert set(out.keys()) == {"query", "weak_match", "top_score",
-                               "threshold", "guidance", "hits"}
+    ], debug=False)
+    assert set(out.keys()) == {"query", "weak_match", "guidance", "hits"}
     assert out["query"] == "q"
     assert isinstance(out["hits"], list)
+
+
+def test_brain_recall_debug_envelope_includes_diagnostics(monkeypatch):
+    # debug=True adds the tuning signals back in.
+    from brain import mcp_server
+
+    class _FakeSemantic:
+        @staticmethod
+        def ensure_built(): pass
+        @staticmethod
+        def hybrid_search(q, k=8, type=None):
+            return [{"kind": "fact", "name": "Foo", "text": "alpha", "rrf": 0.08}]
+
+    monkeypatch.setattr(mcp_server, "_semantic", lambda: _FakeSemantic)
+    monkeypatch.setattr("brain.recall_metric.log_live_recall",
+                        lambda q: None, raising=False)
+    out = json.loads(mcp_server.brain_recall("q", debug=True))
+    assert {"top_score", "threshold", "fetch_k",
+            "rerank_on", "query_rewriter_on"} <= set(out.keys())
 
 
 def test_brain_recall_fact_hits_include_entity_summary(tmp_brain_for_mcp, monkeypatch):
@@ -675,10 +698,10 @@ def test_brain_search_bm25_hit_no_semantic_needed(tmp_brain_for_mcp, monkeypatch
         "text": "alpha bravo charlie", "source": "src1", "score": 0.9,
     }])
     from brain import mcp_server
-    rows = json.loads(mcp_server.brain_search("alpha", k=5))
-    # BM25 and semantic both returned same fact — should appear once
-    assert len(rows) == 1
-    assert rows[0]["name"] == "Foo Project"
+    env = json.loads(mcp_server.brain_search("alpha", k=5))
+    hits = env["hits"]
+    assert len(hits) == 1
+    assert hits[0]["name"] == "Foo Project"
 
 
 def test_brain_search_semantic_fills_when_bm25_empty(tmp_brain_for_mcp, monkeypatch):
@@ -688,10 +711,10 @@ def test_brain_search_semantic_fills_when_bm25_empty(tmp_brain_for_mcp, monkeypa
         "text": "Thuha lives in Long Xuyen", "source": "note:thuha.md", "score": 0.72,
     }])
     from brain import mcp_server
-    rows = json.loads(mcp_server.brain_search("thuha ở đâu", k=5))
+    hits = json.loads(mcp_server.brain_search("thuha ở đâu", k=5))["hits"]
     # BM25 returns nothing for Vietnamese query; semantic backfills
-    assert len(rows) >= 1
-    assert any(r["name"] == "Thuha" for r in rows)
+    assert len(hits) >= 1
+    assert any(r["name"] == "Thuha" for r in hits)
 
 
 def test_brain_search_semantic_respects_k_cap(tmp_brain_for_mcp, monkeypatch):
@@ -703,8 +726,8 @@ def test_brain_search_semantic_respects_k_cap(tmp_brain_for_mcp, monkeypatch):
     ]
     _stub_semantic_for_search(monkeypatch, fact_hits=many_hits)
     from brain import mcp_server
-    rows = json.loads(mcp_server.brain_search("unmatched query", k=3))
-    assert len(rows) <= 3
+    hits = json.loads(mcp_server.brain_search("unmatched query", k=3))["hits"]
+    assert len(hits) <= 3
 
 
 def test_brain_search_dedup_across_bm25_and_semantic(tmp_brain_for_mcp, monkeypatch):
@@ -714,8 +737,8 @@ def test_brain_search_dedup_across_bm25_and_semantic(tmp_brain_for_mcp, monkeypa
         "text": "alpha bravo charlie", "source": "src1", "score": 0.8,
     }])
     from brain import mcp_server
-    rows = json.loads(mcp_server.brain_search("alpha", k=10))
-    texts = [r["text"] for r in rows]
+    hits = json.loads(mcp_server.brain_search("alpha", k=10))["hits"]
+    texts = [r["text"] for r in hits]
     assert texts.count("alpha bravo charlie") == 1
 
 
@@ -724,8 +747,8 @@ def test_brain_search_dedup_across_bm25_and_semantic(tmp_brain_for_mcp, monkeypa
 def test_brain_entities_bm25_hit_returned(tmp_brain_for_mcp, monkeypatch):
     _stub_semantic_for_search(monkeypatch, entity_hits=[])
     from brain import mcp_server
-    rows = json.loads(mcp_server.brain_entities("Foo", k=5))
-    assert any(r["name"] == "Foo Project" for r in rows)
+    hits = json.loads(mcp_server.brain_entities("Foo", k=5))["hits"]
+    assert any(r["name"] == "Foo Project" for r in hits)
 
 
 def test_brain_entities_semantic_fills_when_bm25_empty(tmp_brain_for_mcp, monkeypatch):
@@ -736,10 +759,10 @@ def test_brain_entities_semantic_fills_when_bm25_empty(tmp_brain_for_mcp, monkey
         "score": 0.81,
     }])
     from brain import mcp_server
-    rows = json.loads(mcp_server.brain_entities("thu ha", k=5))
+    hits = json.loads(mcp_server.brain_entities("thu ha", k=5))["hits"]
     # BM25 finds nothing for "thu ha" (no entity named that in fixture)
     # but semantic fills in Nguyễn Thị Thu Hà
-    assert any(r["name"] == "Nguyễn Thị Thu Hà" for r in rows)
+    assert any(r["name"] == "Nguyễn Thị Thu Hà" for r in hits)
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +867,108 @@ def test_brain_entities_dedup_across_bm25_and_semantic(tmp_brain_for_mcp, monkey
         "score": 0.7,
     }])
     from brain import mcp_server
-    rows = json.loads(mcp_server.brain_entities("Foo", k=10))
-    names = [r["name"] for r in rows]
+    hits = json.loads(mcp_server.brain_entities("Foo", k=10))["hits"]
+    names = [r["name"] for r in hits]
     assert names.count("Foo Project") == 1
+
+
+# ---------------------------------------------------------------------------
+# _ensure_fresh is called from every read-path tool (not just brain_recall)
+#
+# Motivating incident 2026-04-23: a user wrote `son.md` into the vault
+# root, asked about it via claude, and claude's brain call routed
+# through `brain_notes` / `brain_note_get` / `brain_search` — none of
+# which refreshed — so the just-written note never reached the index
+# and claude truthfully reported "brain has no record". The fix makes
+# the sweep uniform across read tools, throttled so back-to-back calls
+# don't pay the stat-sweep tax three times in a row.
+# ---------------------------------------------------------------------------
+
+
+def _count_ensure_fresh_calls(monkeypatch):
+    """Patch `_ensure_fresh` to a counter and return the counter list.
+
+    The mutation stays out of the env-gated short-circuit path so we
+    measure call *intent* from each tool regardless of whether the real
+    sweep runs. Returns a list whose len = number of calls observed.
+    """
+    from brain import mcp_server
+    calls: list[int] = []
+    orig = mcp_server._ensure_fresh
+
+    def spy():
+        calls.append(1)
+        # Do NOT delegate — tests for *which tool calls this* don't want
+        # the real sweep mutating fixture state.
+    monkeypatch.setattr(mcp_server, "_ensure_fresh", spy)
+    return calls, orig
+
+
+def test_ensure_fresh_throttle_skips_back_to_back_calls(monkeypatch):
+    """Second call inside the throttle window is a no-op."""
+    from brain import mcp_server
+
+    # Allow the real sweep to run (not env-disabled) by stubbing the
+    # three expensive branches so the only observable effect is whether
+    # `_LAST_FRESH_TICK` advances.
+    monkeypatch.setenv("BRAIN_RECALL_ENSURE_FRESH", "1")
+    monkeypatch.setenv("BRAIN_RECALL_FRESH_THROTTLE_SEC", "10.0")
+    from brain import db as _db
+    monkeypatch.setattr(_db, "sync_mutated_entities", lambda: None)
+    monkeypatch.setattr(_db, "gc_orphaned_entities", lambda: None)
+    import sys, types
+    stub_ingest = types.ModuleType("brain.ingest_notes")
+    stub_ingest.ingest_all = lambda: None
+    monkeypatch.setitem(sys.modules, "brain.ingest_notes", stub_ingest)
+    monkeypatch.setattr(mcp_server, "_semantic", lambda: types.SimpleNamespace(ensure_built=lambda: None))
+
+    mcp_server._LAST_FRESH_TICK = 0.0
+    mcp_server._ensure_fresh()
+    first = mcp_server._LAST_FRESH_TICK
+    assert first > 0.0
+
+    mcp_server._ensure_fresh()
+    # Throttle window is 10 s in this test — tick must not have moved.
+    assert mcp_server._LAST_FRESH_TICK == first
+
+
+def test_ensure_fresh_env_disable_short_circuits(monkeypatch):
+    """BRAIN_RECALL_ENSURE_FRESH=0 makes _ensure_fresh a pure no-op."""
+    from brain import mcp_server
+    monkeypatch.setenv("BRAIN_RECALL_ENSURE_FRESH", "0")
+    mcp_server._LAST_FRESH_TICK = 0.0
+    mcp_server._ensure_fresh()
+    # Env disable must NOT update the tick (which would falsely throttle
+    # the next enabled call a millisecond later).
+    assert mcp_server._LAST_FRESH_TICK == 0.0
+
+
+def test_read_tools_all_call_ensure_fresh(tmp_brain_for_mcp, monkeypatch):
+    """brain_search / brain_entities / brain_notes / brain_recent /
+    brain_recall / brain_semantic each call `_ensure_fresh` exactly once.
+
+    Regression test for the `son.md` incident (2026-04-23): previously
+    only brain_recall refreshed, so a note-add immediately followed by
+    a brain_notes / brain_search / brain_note_get query missed the note.
+    """
+    calls, _ = _count_ensure_fresh_calls(monkeypatch)
+    # Stub semantic side so the tools don't call the real (slow) index.
+    from brain import semantic
+    import numpy as np
+    monkeypatch.setattr(semantic, "search_facts", lambda q, k=8, type=None: [])
+    monkeypatch.setattr(semantic, "search_entities", lambda q, k=8: [])
+    monkeypatch.setattr(semantic, "search_notes", lambda q, k=8: [])
+    monkeypatch.setattr(semantic, "ensure_built", lambda: None)
+    monkeypatch.setattr(semantic, "_embed",
+        lambda texts, batch_size=64: np.zeros((len(texts), semantic.DIM), dtype=np.float32))
+
+    from brain import mcp_server
+    mcp_server.brain_search("q", k=3)
+    mcp_server.brain_entities("q", k=3)
+    mcp_server.brain_notes("q", k=3)
+    mcp_server.brain_recent(hours=1, k=3)
+    mcp_server.brain_recall("q", k=3)
+    mcp_server.brain_semantic("q", k=3)
+
+    assert len(calls) == 6, \
+        f"each of 6 read tools should call _ensure_fresh once; got {len(calls)}"
