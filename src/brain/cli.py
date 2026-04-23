@@ -176,6 +176,41 @@ def _cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_consolidate(args: argparse.Namespace) -> int:
+    """`brain consolidate` — one-shot WS8 promotion worker.
+
+    Scans fact_claims for episodic triples that have ≥2 independent
+    agreeing episodes + pass the scrub/trust/contested/salience
+    gates, and (with ``--apply``) promotes them to semantic. Default
+    dry-run prints a summary without touching the DB.
+    """
+    from brain import consolidation
+    summary = consolidation.promote_episodic_ready(
+        apply=args.apply,
+        max_promotions=args.max,
+    )
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    mode = "APPLY" if args.apply else "DRY-RUN"
+    status_note = summary.get("status")
+    print(
+        f"[{mode}] consolidate: "
+        f"checked={summary['checked_groups']} "
+        f"eligible={summary['eligible']} "
+        f"promoted={summary['promoted']} "
+        f"blocked(contested={summary['blocked_contested']}, "
+        f"salience={summary['blocked_salience']}, "
+        f"scrub={summary['blocked_scrub']}, "
+        f"trust={summary['blocked_trust']}, "
+        f"age={summary['blocked_age']}, "
+        f"disagree={summary['blocked_disagreement']}) "
+        f"budget={summary['budget_remaining']}"
+        + (f" status={status_note}" if status_note else "")
+    )
+    return 0
+
+
 def _cmd_watch(args: argparse.Namespace) -> int:
     """`brain watch` — fs-event watcher daemon.
 
@@ -296,6 +331,18 @@ def main(argv: list[str] | None = None) -> int:
     p_bench.add_argument("-v", "--verbose", action="store_true",
                          help="Print one line per query with rank / weak outcome")
     p_bench.set_defaults(func=_cmd_bench)
+
+    p_cons = sub.add_parser(
+        "consolidate",
+        help="One-shot WS8 episodic → semantic promotion worker",
+    )
+    p_cons.add_argument("--apply", action="store_true",
+                        help="Actually write promotions (default: dry run)")
+    p_cons.add_argument("--max", type=int, default=None,
+                        help="Upper bound on promotions this run (default: no cap)")
+    p_cons.add_argument("--json", action="store_true",
+                        help="Emit the summary as JSON")
+    p_cons.set_defaults(func=_cmd_consolidate)
 
     p_watch = sub.add_parser(
         "watch",
