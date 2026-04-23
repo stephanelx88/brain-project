@@ -42,6 +42,7 @@ Respond with ONLY valid JSON, no prose. The top-level shape is:
 
 - One entry in `results[]` per session, in input order. Use the exact `session_id` shown.
 - **Reuse names.** If an entity already exists in the brain index, keep `name` identical and set `is_new: false`; only list NEW facts.
+- **Self-facts attach to the brain owner entity.** First-person statements by the user about themselves ("son ăn bún riêu", "tôi đang ở X", "I shipped Y") emit a fact on the owner's `people/` entity — the person described as "Brain owner" in the existing list, or whichever name the user refers to themselves as. Dropping self-facts because "the speaker is the user" is a common failure mode that leaves the owner entity empty.
 - **Use only allowed types.** Type must be one of: `people`, `projects`, `domains`, `decisions`, `issues`, `insights`. Do **not** invent new types.
 - **Facts are self-contained sentences.** Do not append "(source: …)" — the pipeline does that.
 - **Empty is fine.** A session with no durable takeaways → `{"session_id": "<id>", "entities": [], "corrections": []}`. Routine coding sessions should return empty; only emit entities when real durable knowledge surfaced.
