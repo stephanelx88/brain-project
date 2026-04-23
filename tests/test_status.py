@@ -35,35 +35,46 @@ def fake_vault(tmp_path, monkeypatch):
 
 
 def _stub_launchctl_loaded(monkeypatch, pid: int | None, last_exit: int = 0):
-    """Stub launchctl to look like the job is loaded with given PID."""
-    body = "{\n"
-    if pid is not None:
-        body += '\t"PID" = ' + str(pid) + ";\n"
-    body += '\t"LastExitStatus" = ' + str(last_exit) + ";\n"
-    body += '\t"Label" = "' + status.LAUNCHD_LABEL + '";\n};\n'
-    class _CP:
-        returncode = 0
-        stdout = body
+    """Stub the scheduler backend to report a loaded job with given PID.
+
+    Shifted from patching `launchctl` subprocess calls to stubbing
+    `scheduler.get_status()` directly, now that `status.py` delegates
+    scheduler probes to `brain.scheduler`. Keeps tests platform-agnostic
+    — Linux CI no longer has to fake macOS `launchctl`.
+    """
+    from brain import scheduler
+    monkeypatch.setattr(scheduler, "get_status", lambda: {
+        "backend": "launchd",
+        "loaded": True,
+        "pid": pid,
+        "last_exit": last_exit,
+        "interval_s": None,
+        "label": scheduler.LAUNCHD_LABEL,
+    })
+    # `ps -A` still goes through subprocess — stub it to empty so the
+    # spawned-procs probe doesn't hit the real host.
     def fake_run(cmd, **kw):
-        if cmd[:2] == ["launchctl", "list"]:
-            return _CP()
         if cmd[:2] == ["ps", "-A"]:
-            class _CP2: returncode = 0; stdout = ""
-            return _CP2()
+            class _CP: returncode = 0; stdout = ""
+            return _CP()
         raise AssertionError(f"unexpected subprocess: {cmd}")
     monkeypatch.setattr(status.subprocess, "run", fake_run)
 
 
 def _stub_launchctl_not_loaded(monkeypatch):
-    class _CP:
-        returncode = 113
-        stdout = ""
+    from brain import scheduler
+    monkeypatch.setattr(scheduler, "get_status", lambda: {
+        "backend": "launchd",
+        "loaded": False,
+        "pid": None,
+        "last_exit": None,
+        "interval_s": None,
+        "label": scheduler.LAUNCHD_LABEL,
+    })
     def fake_run(cmd, **kw):
-        if cmd[:2] == ["launchctl", "list"]:
-            return _CP()
         if cmd[:2] == ["ps", "-A"]:
-            class _CP2: returncode = 0; stdout = ""
-            return _CP2()
+            class _CP: returncode = 0; stdout = ""
+            return _CP()
         raise AssertionError(f"unexpected subprocess: {cmd}")
     monkeypatch.setattr(status.subprocess, "run", fake_run)
 
@@ -71,8 +82,10 @@ def _stub_launchctl_not_loaded(monkeypatch):
 def test_launchd_not_loaded(fake_vault, monkeypatch):
     _stub_launchctl_not_loaded(monkeypatch)
     rep = status.gather()
+    assert rep.scheduler["loaded"] is False
+    assert rep.scheduler["pid"] is None
+    # Back-compat alias: old callers reading `rep.launchd` keep working.
     assert rep.launchd["loaded"] is False
-    assert rep.launchd["pid"] is None
     text = status.format_text(rep)
     assert "NOT LOADED" in text
 
@@ -80,9 +93,9 @@ def test_launchd_not_loaded(fake_vault, monkeypatch):
 def test_launchd_loaded_idle(fake_vault, monkeypatch):
     _stub_launchctl_loaded(monkeypatch, pid=None)
     rep = status.gather()
-    assert rep.launchd["loaded"] is True
-    assert rep.launchd["pid"] is None
-    assert rep.launchd["last_exit"] == 0
+    assert rep.scheduler["loaded"] is True
+    assert rep.scheduler["pid"] is None
+    assert rep.scheduler["last_exit"] == 0
 
 
 def test_in_flight_with_alive_pid(fake_vault, monkeypatch):
@@ -93,6 +106,28 @@ def test_in_flight_with_alive_pid(fake_vault, monkeypatch):
     rep = status.gather()
     assert rep.in_flight["running"] is True
     assert rep.in_flight["pid"] == os.getpid()
+
+
+def test_scheduler_backend_surface(fake_vault, monkeypatch):
+    """The new `scheduler` field carries the backend name alongside the
+    loaded/pid payload, so agents can tell launchd from systemd."""
+    from brain import scheduler
+    monkeypatch.setattr(scheduler, "get_status", lambda: {
+        "backend": "systemd",
+        "loaded": True,
+        "pid": None,
+        "last_exit": 0,
+        "interval_s": 900,
+        "label": scheduler.SYSTEMD_UNIT,
+    })
+    monkeypatch.setattr(status.subprocess, "run",
+                        lambda *a, **kw: type("C", (), {"returncode": 0, "stdout": ""}))
+    rep = status.gather()
+    assert rep.scheduler["backend"] == "systemd"
+    assert rep.scheduler["label"] == scheduler.SYSTEMD_UNIT
+    text = status.format_text(rep)
+    assert "systemd" in text                        # backend name surfaces in UI
+    assert "brain-auto-extract.timer" in text
 
 
 def test_in_flight_stale_lock(fake_vault, monkeypatch):
@@ -145,7 +180,7 @@ def test_format_text_smoke(fake_vault, monkeypatch):
     out = status.format_text(status.gather())
     # The header is the user's contract — anchor on it.
     assert out.startswith("🧠 Brain status")
-    for key in ("vault", "launchd", "last run", "next run", "in flight",
+    for key in ("vault", "scheduler", "last run", "next run", "in flight",
                 "procs", "ledgers", "coverage", "audit", "vault stats"):
         assert key in out
 
@@ -155,9 +190,14 @@ def test_to_json_roundtrip(fake_vault, monkeypatch):
     rep = status.gather()
     parsed = json.loads(status.to_json(rep))
     # Every public dataclass field should round-trip through JSON.
-    for k in ("brain_dir", "launchd", "in_flight", "last_run", "next_run",
-              "spawned_procs", "ledgers", "pending_audit", "vault", "coverage"):
+    # `launchd` is present as a back-compat alias even though the
+    # dataclass field is `scheduler`.
+    for k in ("brain_dir", "scheduler", "launchd", "in_flight", "last_run",
+              "next_run", "spawned_procs", "ledgers", "pending_audit",
+              "vault", "coverage"):
         assert k in parsed
+    # Alias points at the same dict content.
+    assert parsed["launchd"] == parsed["scheduler"]
 
 
 def test_coverage_absent_when_no_ledger(fake_vault, monkeypatch):

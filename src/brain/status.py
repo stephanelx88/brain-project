@@ -1,8 +1,8 @@
 """`brain status` — single-shot operational dashboard.
 
 Surfaces the answers to "is the brain doing anything right now?" without
-the user having to know the launchd job label, log path, lock-dir name,
-ledger format, etc.
+the user having to know the scheduler job label, log path, lock-dir
+name, ledger format, etc.
 
 Two consumers:
 
@@ -14,12 +14,14 @@ Two consumers:
 
 Design notes:
 
-- Read-only. No subprocesses spawned beyond `launchctl list` (cheap,
-  always-on system call) and an optional `ps -A` snapshot. We never
-  call into Anthropic, never mutate ledgers.
+- Read-only. Scheduler state comes from `brain.scheduler.get_status()`,
+  which dispatches between `launchctl` (macOS) and `systemctl --user`
+  (Linux) — one shell-out, always-on system call. An optional `ps -A`
+  snapshot is the only other subprocess. We never call into Anthropic,
+  never mutate ledgers.
 - Tolerant of every component being missing — fresh installs without
-  launchd loaded, vaults without logs, ledgers not yet created. Each
-  field falls back to `None` / "unknown" rather than raising.
+  any scheduler loaded, vaults without logs, ledgers not yet created.
+  Each field falls back to `None` / "unknown" rather than raising.
 - Time formatting is delta-from-now ("8s ago", "4m52s") because absolute
   UTC timestamps in a status line are noise — the user wants to know
   "is this fresh?".
@@ -36,12 +38,15 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import brain.config as config
+from brain import scheduler
 
-# Public so tests can patch them. The launchd label and lock dir are
-# wired by the install templates and rarely change; if they ever do,
-# this is the single point of update.
-LAUNCHD_LABEL = "com.son.brain-auto-extract"
-LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+# Public aliases preserved so older callers that imported these from
+# brain.status keep working. New code should reference brain.scheduler
+# directly. LAUNCHD_PLIST stays present for back-compat with any test
+# monkeypatch that redirected it — the plist read now lives in
+# scheduler._launchd_read_interval, but the symbol is still exported.
+LAUNCHD_LABEL = scheduler.LAUNCHD_LABEL
+LAUNCHD_PLIST = scheduler._LAUNCHD_PLIST
 EXTRACT_LOCK_DIR = config.BRAIN_DIR / ".extract.lock.d"
 AUTO_EXTRACT_LOG = config.BRAIN_DIR / "logs" / "auto-extract.log"
 HARVEST_LEDGER = config.BRAIN_DIR / ".harvested"
@@ -62,7 +67,7 @@ LLM_PROC_PATTERNS = [
 @dataclass
 class StatusReport:
     brain_dir: str
-    launchd: dict
+    scheduler: dict
     in_flight: dict
     last_run: dict
     next_run: dict
@@ -72,6 +77,13 @@ class StatusReport:
     vault: dict
     coverage: dict = field(default_factory=dict)
     live_coverage: dict = field(default_factory=dict)
+
+    # Back-compat alias: older clients (older MCP consumers, earlier
+    # test fixtures) read `launchd`. Field aliasing doesn't survive
+    # `asdict`, so `to_json` injects the alias explicitly.
+    @property
+    def launchd(self) -> dict:
+        return self.scheduler
 
 
 # ---------- helpers --------------------------------------------------------
@@ -115,69 +127,6 @@ def _tail(path: Path, max_bytes: int = 64_000) -> str | None:
             return f.read().decode("utf-8", errors="replace")
     except OSError:
         return None
-
-
-# ---------- launchd --------------------------------------------------------
-
-
-def _launchd_state() -> dict:
-    """Parse `launchctl list <label>`. Returns:
-
-      {"loaded": bool, "pid": int|None, "last_exit": int|None,
-       "interval_s": int|None, "label": str}
-
-    We use the per-label form (`launchctl list LABEL`) because the
-    no-arg form returns a giant table that's painful to grep reliably.
-    `launchctl print` would be richer but is much slower (200ms+) and
-    isn't needed for the dashboard."""
-    out: dict = {
-        "loaded": False,
-        "pid": None,
-        "last_exit": None,
-        "interval_s": None,
-        "label": LAUNCHD_LABEL,
-    }
-    try:
-        cp = subprocess.run(
-            ["launchctl", "list", LAUNCHD_LABEL],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return out
-    if cp.returncode != 0:
-        return out
-    out["loaded"] = True
-    # `launchctl list LABEL` emits a plist-ish text blob:
-    #   {
-    #     "PID" = 12345;        # only present while running
-    #     "LastExitStatus" = 0;
-    #     "Label" = "com.son.brain-auto-extract";
-    #   };
-    pid_m = re.search(r'"PID"\s*=\s*(\d+);', cp.stdout)
-    if pid_m:
-        out["pid"] = int(pid_m.group(1))
-    exit_m = re.search(r'"LastExitStatus"\s*=\s*(-?\d+);', cp.stdout)
-    if exit_m:
-        out["last_exit"] = int(exit_m.group(1))
-    out["interval_s"] = _read_plist_interval()
-    return out
-
-
-def _read_plist_interval() -> int | None:
-    """Pull StartInterval out of the plist with a regex.
-
-    `plistlib` would be more correct, but the plist may also use
-    StartCalendarInterval (a sequence of dicts); for the dashboard we
-    only need to know "roughly how often", and StartInterval covers the
-    current default install. Returns None if the plist uses the
-    calendar form or doesn't exist."""
-    text = _safe_read(LAUNCHD_PLIST)
-    if not text:
-        return None
-    m = re.search(r"<key>StartInterval</key>\s*<integer>(\d+)</integer>", text)
-    if m:
-        return int(m.group(1))
-    return None
 
 
 # ---------- in-flight + last run -------------------------------------------
@@ -269,10 +218,10 @@ def _last_run() -> dict:
     return out
 
 
-def _next_run(launchd: dict, last_run: dict) -> dict:
-    """Estimate time-until-next-tick. Only meaningful when launchd is
-    loaded and we know both the interval and a last-run timestamp."""
-    interval = launchd.get("interval_s")
+def _next_run(scheduler_state: dict, last_run: dict) -> dict:
+    """Estimate time-until-next-tick. Only meaningful when the scheduler
+    is loaded and we know both the interval and a last-run timestamp."""
+    interval = scheduler_state.get("interval_s")
     age = last_run.get("age_s")
     if not interval or age is None:
         return {"in_s": None, "interval_s": interval}
@@ -496,13 +445,13 @@ def _vault_counts() -> dict:
 
 
 def gather() -> StatusReport:
-    launchd = _launchd_state()
+    sched = scheduler.get_status()
     in_flight = _in_flight()
     last_run = _last_run()
-    next_run = _next_run(launchd, last_run)
+    next_run = _next_run(sched, last_run)
     return StatusReport(
         brain_dir=str(config.BRAIN_DIR),
-        launchd=launchd,
+        scheduler=sched,
         in_flight=in_flight,
         last_run=last_run,
         next_run=next_run,
@@ -516,12 +465,17 @@ def gather() -> StatusReport:
 
 
 def to_json(report: StatusReport) -> str:
-    return json.dumps(asdict(report), indent=2, ensure_ascii=False)
+    # `asdict` excludes the computed @property — inject the `launchd`
+    # alias manually so MCP consumers that haven't migrated yet keep
+    # parsing. Can drop once everything calls `scheduler` instead.
+    payload = asdict(report)
+    payload["launchd"] = payload["scheduler"]
+    return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
 def format_text(report: StatusReport) -> str:
     """Human-readable dashboard. ~12 lines, fits in one terminal screen."""
-    L = report.launchd
+    S = report.scheduler
     F = report.in_flight
     R = report.last_run
     N = report.next_run
@@ -529,13 +483,14 @@ def format_text(report: StatusReport) -> str:
     V = report.vault
     LD = report.ledgers
 
-    if L["loaded"]:
-        every = f"every {L['interval_s']}s" if L["interval_s"] else "schedule unknown"
-        launchd_line = f"loaded ({L['label']}, {every})"
-        if L.get("last_exit") not in (None, 0):
-            launchd_line += f" — last exit {L['last_exit']}"
+    backend_name = S.get("backend") or "none"
+    if S["loaded"]:
+        every = f"every {S['interval_s']}s" if S["interval_s"] else "schedule unknown"
+        scheduler_line = f"loaded ({backend_name}: {S['label']}, {every})"
+        if S.get("last_exit") not in (None, 0):
+            scheduler_line += f" — last exit {S['last_exit']}"
     else:
-        launchd_line = f"NOT LOADED ({L['label']})"
+        scheduler_line = f"NOT LOADED ({backend_name}: {S['label']})"
 
     if F["running"]:
         flight_line = f"YES (pid {F['pid']}, started {_delta_str(F['started_s_ago'])} ago)"
@@ -555,7 +510,7 @@ def format_text(report: StatusReport) -> str:
         last_line = "no run logged yet"
 
     next_line = (f"~{_delta_str(N['in_s'])}" if N["in_s"] is not None
-                 else "unknown (launchd not loaded?)")
+                 else f"unknown ({backend_name} not loaded?)")
 
     procs = report.spawned_procs
     procs_line = (f"{len(procs)} brain/LLM procs running"
@@ -596,20 +551,20 @@ def format_text(report: StatusReport) -> str:
     else:
         coverage_line = "no eval runs logged yet"
 
-    L = report.live_coverage or {}
-    if L.get("available"):
-        live_miss_pct = f"{L['miss_rate'] * 100:.1f}%"
-        live_avg = f"avg-top {L['avg_top']:.3f}"
+    LC = report.live_coverage or {}
+    if LC.get("available"):
+        live_miss_pct = f"{LC['miss_rate'] * 100:.1f}%"
+        live_avg = f"avg-top {LC['avg_top']:.3f}"
         live_line = (f"miss {live_miss_pct} · {live_avg}  "
-                     f"[{L['total_calls']} calls, "
-                     f"{L.get('queries', 0)} uniq, last {L['days']}d]")
+                     f"[{LC['total_calls']} calls, "
+                     f"{LC.get('queries', 0)} uniq, last {LC['days']}d]")
     else:
         live_line = None  # hidden until the MCP has logged real calls
 
     lines = [
         "🧠 Brain status",
         f"  vault       : {report.brain_dir}",
-        f"  launchd     : {launchd_line}",
+        f"  scheduler   : {scheduler_line}",
         f"  last run    : {last_line}",
         f"  next run    : {next_line}",
         f"  in flight   : {flight_line}",
