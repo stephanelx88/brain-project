@@ -1,0 +1,25 @@
+[Unit]
+Description=Brain — auto-extract periodic trigger (5 min cadence + boot)
+Documentation=https://github.com/stephanelx88/brain-project
+
+[Timer]
+# Match the launchd StartInterval safety-net cadence. On macOS the plist
+# also uses WatchPaths for event-driven firing; systemd's `.path` units
+# are more restrictive (directory-level only, no descendants) so the
+# Linux setup relies on the 300 s poll instead. The `auto-extract.sh`
+# pipeline is cheap enough (~50 ms idle) to poll this often.
+OnBootSec=60
+OnUnitActiveSec=300
+
+# Accuracy budget — systemd batches timers within this window to save
+# wake-ups. 30 s is well within our SLO for "just-extracted fact must
+# be recallable soon".
+AccuracyUsec=30s
+
+# Survive clock changes (laptop sleep/wake).
+Persistent=true
+
+Unit=brain-auto-extract.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=Brain — auto-extract pipeline (session harvest → LLM extraction → reconcile)
+Documentation=https://github.com/stephanelx88/brain-project
+# Don't pile up if a previous run is still going — the shell script has
+# its own flock, but systemd should avoid queueing anyway.
+ConditionPathExists=!{{BRAIN_DIR}}/.extract.lock.d
+
+[Service]
+# Short-lived invocation, same as launchd's fire-and-forget ProgramArguments.
+Type=oneshot
+ExecStart=/bin/bash {{BRAIN_DIR}}/bin/auto-extract.sh
+WorkingDirectory={{BRAIN_DIR}}
+
+# Inject BRAIN_DIR so brain.config picks up the user's chosen vault —
+# user-level systemd units don't source .bashrc/.zshrc.
+Environment="BRAIN_DIR={{BRAIN_DIR}}"
+Environment="PATH={{HOME}}/.local/bin:{{HOME}}/.pyenv/shims:/usr/local/bin:/usr/bin:/bin"
+
+# Journal captures stdout/stderr by default; access via
+# `journalctl --user -u brain-auto-extract.service`. A dedicated log file
+# also stays under {{BRAIN_DIR}}/logs/auto-extract.log (written by the
+# script itself) so `brain status` can tail it the same way on both OSes.
+StandardOutput=append:{{BRAIN_DIR}}/logs/systemd-stdout.log
+StandardError=append:{{BRAIN_DIR}}/logs/systemd-stderr.log
+
+# Run at low priority — extraction is background work; interactive
+# MCP queries should always win CPU.
+Nice=10
+IOSchedulingClass=idle

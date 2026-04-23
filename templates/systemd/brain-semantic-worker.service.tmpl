@@ -1,0 +1,39 @@
+[Unit]
+Description=Brain — persistent semantic (sentence-transformers) worker
+Documentation=https://github.com/stephanelx88/brain-project
+# Start only after the user's graphical/console session is live — the
+# worker reads BRAIN_DIR from the environment and writes under the user's
+# home. Not strictly needed for the Python daemon itself but keeps
+# startup ordering predictable across reboots.
+After=default.target
+
+[Service]
+# Long-running daemon — same role as launchd KeepAlive=true.
+Type=simple
+ExecStart={{PYTHON}} -m brain.semantic_worker
+WorkingDirectory={{BRAIN_DIR}}
+
+Environment="BRAIN_DIR={{BRAIN_DIR}}"
+Environment="PYTHONPATH={{PROJECT_DIR}}/src"
+Environment="PATH={{HOME}}/.local/bin:{{HOME}}/.pyenv/shims:/usr/local/bin:/usr/bin:/bin"
+
+# Restart on crash with bounded backoff — mirrors launchd's
+# "one launch / 10 s" throttle. If the model blows up at import time
+# we don't want to hammer it forever.
+Restart=on-failure
+RestartSec=10s
+StartLimitBurst=5
+StartLimitIntervalSec=120
+
+# Low priority — the worker exists so interactive recalls don't pay
+# the cold-embed cost; it must never steal CPU from MCP queries.
+Nice=10
+IOSchedulingClass=idle
+
+StandardOutput=append:{{BRAIN_DIR}}/logs/semantic-worker.log
+StandardError=append:{{BRAIN_DIR}}/logs/semantic-worker.log
+
+[Install]
+# `systemctl --user enable` — worker survives reboots as part of the
+# user's default target (rough equivalent of launchd's RunAtLoad=true).
+WantedBy=default.target
