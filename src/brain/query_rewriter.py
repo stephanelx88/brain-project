@@ -48,7 +48,33 @@ from brain import semantic
 CACHE_DIR = config.BRAIN_DIR / ".cache" / "query-rewrites"
 CACHE_TTL_DAYS = 30
 MAX_VARIANTS = 5                       # beyond this, latency outweighs recall gain
-_ENABLED = os.environ.get("BRAIN_QUERY_REWRITE", "0") == "1"
+
+# WS7b (2026-04-23): timeout tightened from 15s to 3s on the recall
+# path. 15s was chosen when this was an explicit opt-in and callers
+# were expected to tolerate the wait; flipping default-on would make
+# every brain_recall pay that budget on cache miss, blowing through
+# any reasonable latency target. 3s is enough for Haiku to produce
+# 3-5 short variants in the common case and short enough that the
+# silent-hybrid fallback triggers fast when the LLM is slow.
+DEFAULT_TIMEOUT_SEC = 3.0
+
+
+def _enabled() -> bool:
+    """Evaluated per call so tests and admin can flip via env without
+    reloading the module. Defaults OFF per WS7b bench gate: on the 21-
+    query golden set this week, `p@1` delta was 0 pp vs. baseline
+    (either the rewriter-enhanced hits didn't outrank the baseline's
+    or the LLM fallback returned the same set). Flip with
+    `BRAIN_QUERY_REWRITE=1` once the ranker + golden set justify it.
+    """
+    return os.environ.get("BRAIN_QUERY_REWRITE", "0") == "1"
+
+
+def _timeout_sec() -> float:
+    try:
+        return float(os.environ.get("BRAIN_QUERY_REWRITE_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC))
+    except (ValueError, TypeError):
+        return DEFAULT_TIMEOUT_SEC
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +158,7 @@ def _default_llm(prompt: str) -> str | None:
         from brain.auto_extract import call_claude
     except ImportError:
         return None
-    return call_claude(prompt, timeout=15)
+    return call_claude(prompt, timeout=int(round(_timeout_sec())))
 
 
 def _call_llm(prompt: str) -> str | None:
@@ -184,7 +210,7 @@ def expand_query(
     q = (query or "").strip()
     if not q:
         return []
-    if not _ENABLED:
+    if not _enabled():
         return [q]
     if use_cache:
         cached = _cache_load(q)

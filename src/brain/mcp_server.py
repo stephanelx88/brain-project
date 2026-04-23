@@ -657,9 +657,14 @@ def brain_recall(
     _ensure_fresh()
     semantic = _semantic()
     semantic.ensure_built()
-    import os as _os_qr
-    rerank_on = _os_qr.environ.get("BRAIN_RERANK", "0") == "1"
-    query_rewriter_on = _os_qr.environ.get("BRAIN_QUERY_REWRITE", "0") == "1"
+    # Flags resolved per-call via the rewriter/reranker modules so a
+    # test or admin env-flip takes effect without a server restart.
+    # Defaults OFF per WS7b bench gate — see module docstrings for the
+    # measurement outcome.
+    from brain import query_rewriter as _qr
+    from brain import reranker as _rr
+    query_rewriter_on = _qr._enabled()
+    rerank_on = _rr._enabled()
     # Match pre-WS2 fetch_k so weak_match is computed over the same pool
     # of candidates. Over-fetching here shifted a PM weak-anchor baseline
     # score by changing which hits ranked top. Envelope dedup instead
