@@ -557,15 +557,26 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
     # specific notes. Without this the auto-generated `index.md`, every
     # `_MOC.md`, and the always-touched `identity/*.md` files dominate any
     # query that mentions Son or a known entity, burying the real answer.
-    META_PENALTY_PATHS = {"index.md", "log.md"}
+    #
+    # `cursor-user-rules.md` specifically is a 12 KB rendered rules template
+    # that semantically matches almost every brain-meta query (because it
+    # *describes* brain). Empirically it took top-hit on 7 of 13 near-miss
+    # queries in the last 14 days — strong enough to fight through the
+    # default 1.0 weight and bury entity facts. Penalise it like index.md.
+    META_PENALTY_PATHS = {"index.md", "log.md", "cursor-user-rules.md"}
     def _path_penalty(path: str) -> float:
         if not path:
             return 1.0
         if path in META_PENALTY_PATHS:
-            return 0.4               # the catch-all index/log files
+            return 0.4               # the catch-all index/log/rules files
         name = path.rsplit("/", 1)[-1]
         if name.startswith("_") and name.endswith("_MOC.md"):
             return 0.5               # auto-generated maps-of-content
+        # Rendered rule/template files live in the root (`*-rules.md`,
+        # `*-tmpl.md`) — same failure mode as cursor-user-rules.md but
+        # for future templates a user might drop in.
+        if name.endswith("-rules.md") or name.endswith(".tmpl.md"):
+            return 0.4
         if path.startswith("identity/"):
             return 0.7               # useful but answers a different question
         return 1.0
