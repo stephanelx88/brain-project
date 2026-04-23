@@ -86,10 +86,16 @@ case "$OS" in
 esac
 
 # ──────────────────────────────────────────────────────────────────────
-# Pick python — prefer pyenv if present, else system python3.11+
+# Pick python — prefer existing brain venv, then pyenv, then system 3.11+
+#
+# Why the brain-venv is first: on re-installs we always want the same
+# interpreter the MCP server is already registered against. Also avoids
+# PEP 668 and missing-pip issues (see python_ensure_installable below).
 # ──────────────────────────────────────────────────────────────────────
+BRAIN_VENV="$HOME_DIR/.brain-venv"
 PYTHON=""
 for candidate in \
+    "$BRAIN_VENV/bin/python3" \
     "$HOME_DIR/.pyenv/versions/3.12.12/bin/python3" \
     "$HOME_DIR/.pyenv/shims/python3" \
     "$(command -v python3.12 || true)" \
@@ -101,10 +107,90 @@ for candidate in \
   fi
 done
 if [[ -z "$PYTHON" ]]; then
-  echo "✗ No Python ≥ 3.11 found. Install pyenv or python3.11+ first."
+  echo "✗ No Python ≥ 3.11 found."
+  echo "  Install one of:"
+  echo "    - Debian/Ubuntu: sudo apt install python3.12 python3.12-venv"
+  echo "    - macOS:         brew install python@3.12"
+  echo "    - Anywhere:      curl -LsSf https://astral.sh/uv/install.sh | sh  (then 'uv python install 3.12')"
   exit 1
 fi
 PYVER="$("$PYTHON" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
+
+# ──────────────────────────────────────────────────────────────────────
+# Bootstrap pip + sidestep PEP 668
+#
+# Common failure modes this handles:
+#   - Debian/Ubuntu system python3 ships without pip/ensurepip (apt
+#     splits it into python3-pip). "No module named pip" on step [1].
+#   - Debian 12+, Ubuntu 23.04+, Homebrew python mark the interpreter
+#     EXTERNALLY-MANAGED (PEP 668). pip install -e . refuses with
+#     "error: externally-managed-environment" unless you use a venv
+#     or --break-system-packages (which we won't — it pollutes the OS
+#     python the distro relies on).
+#
+# Strategy: if the chosen python can't pip-install editable, create a
+# dedicated venv at ~/.brain-venv and repoint PYTHON at it. Try
+# `python -m venv` first (stdlib, works when python3-venv is installed),
+# fall back to `uv venv` if available, and finally emit a distro-
+# specific suggestion if both paths fail.
+# ──────────────────────────────────────────────────────────────────────
+
+# Install pip into $1 (a python executable). Prints nothing on success.
+python_ensure_pip() {
+  local py="$1"
+  if "$py" -m pip --version >/dev/null 2>&1; then return 0; fi
+  # ensurepip is the stdlib bootstrap — absent on Debian/Ubuntu system python
+  # unless python3-venv is installed.
+  if "$py" -m ensurepip --default-pip >/dev/null 2>&1; then return 0; fi
+  # uv can install pip into any interpreter without needing pip itself.
+  if command -v uv >/dev/null 2>&1; then
+    if uv pip install --quiet --python "$py" pip >/dev/null 2>&1; then return 0; fi
+  fi
+  return 1
+}
+
+# Return 0 if $1 (a python executable) can do `pip install` without PEP 668
+# blocking. Detection is probe-based: install a harmless no-op package with
+# --dry-run and grep for the marker.
+python_can_pip_install() {
+  local py="$1"
+  local out
+  out=$("$py" -m pip install --dry-run --quiet pip 2>&1 || true)
+  if echo "$out" | grep -qi "externally-managed"; then return 1; fi
+  return 0
+}
+
+# Create (or reuse) $BRAIN_VENV, repoint PYTHON at it. On failure, exit.
+python_create_brain_venv() {
+  if [[ -x "$BRAIN_VENV/bin/python3" ]] && \
+     "$BRAIN_VENV/bin/python3" -c 'import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)' 2>/dev/null; then
+    :  # reuse
+  elif "$PYTHON" -m venv "$BRAIN_VENV" >/dev/null 2>&1; then
+    :  # stdlib venv worked
+  elif command -v uv >/dev/null 2>&1 && uv venv --quiet --python ">=3.11" "$BRAIN_VENV" >/dev/null 2>&1; then
+    :  # uv venv worked
+  else
+    echo "✗ Could not create a Python venv at $BRAIN_VENV."
+    echo "  Install one of:"
+    echo "    - Debian/Ubuntu: sudo apt install python3-venv  (or python3.12-venv)"
+    echo "    - macOS:         brew install python@3.12"
+    echo "    - Anywhere:      curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exit 1
+  fi
+  PYTHON="$BRAIN_VENV/bin/python3"
+}
+
+# If $PYTHON can't pip-install editable, switch to a dedicated venv.
+if ! python_ensure_pip "$PYTHON" || ! python_can_pip_install "$PYTHON"; then
+  echo "  ! $PYTHON can't pip-install here (missing pip or PEP 668-managed)"
+  echo "  ! creating dedicated venv at $BRAIN_VENV"
+  python_create_brain_venv
+  python_ensure_pip "$PYTHON" || {
+    echo "✗ Failed to install pip into $BRAIN_VENV."
+    exit 1
+  }
+  PYVER="$("$PYTHON" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))')"
+fi
 
 # ──────────────────────────────────────────────────────────────────────
 # Pre-flight: on macOS, project must NOT live under
@@ -323,6 +409,28 @@ source "$SCRIPT_DIR/_scheduler.sh"
 scheduler_render_and_install \
   "$PROJECT_DIR" "$HOME_DIR" "$USERNAME" "$BRAIN_DIR" "$PYTHON" "$TODAY"
 scheduler_verify "$USERNAME"
+
+# ──────────────────────────────────────────────────────────────────────
+# 7b. Export BRAIN_DIR into the user's shell rc (idempotent).
+#
+# The brain CLI and any script run outside Claude Code / Cursor looks up
+# BRAIN_DIR from the env. Without this, users have to type `BRAIN_DIR=…
+# brain …` forever. We touch zsh/bash/fish only if their rc file exists
+# (so we don't create shells the user doesn't use) and we use a marker
+# comment so re-runs don't duplicate the line.
+# ──────────────────────────────────────────────────────────────────────
+append_brain_dir_export() {
+  local rc="$1" line="$2"
+  [[ -f "$rc" ]] || return 0
+  if grep -q "# brain: BRAIN_DIR" "$rc" 2>/dev/null; then
+    return 0  # already present
+  fi
+  printf '\n# brain: BRAIN_DIR (managed by brain install.sh)\n%s\n' "$line" >> "$rc"
+  echo "      + appended BRAIN_DIR export to $rc"
+}
+append_brain_dir_export "$HOME_DIR/.zshrc"  "export BRAIN_DIR=\"$BRAIN_DIR\""
+append_brain_dir_export "$HOME_DIR/.bashrc" "export BRAIN_DIR=\"$BRAIN_DIR\""
+append_brain_dir_export "$HOME_DIR/.config/fish/config.fish" "set -gx BRAIN_DIR \"$BRAIN_DIR\""
 
 # ──────────────────────────────────────────────────────────────────────
 # 8. Doctor — verify everything green
