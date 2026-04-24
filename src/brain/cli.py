@@ -177,14 +177,43 @@ def _cmd_bench(args: argparse.Namespace) -> int:
 
 
 def _cmd_consolidate(args: argparse.Namespace) -> int:
-    """`brain consolidate` — one-shot WS8 promotion worker.
+    """`brain consolidate` — one-shot WS8 worker.
 
-    Scans fact_claims for episodic triples that have ≥2 independent
-    agreeing episodes + pass the scrub/trust/contested/salience
-    gates, and (with ``--apply``) promotes them to semantic. Default
-    dry-run prints a summary without touching the DB.
+    Default mode = Part A (episodic → semantic promotion). With
+    ``--aliases``, runs Part B (LLM-judged alias canonicalisation
+    over unresolved ``object_text`` phrases). Default dry-run prints
+    a summary; ``--apply`` writes to DB + vault-root
+    ``disambiguations.jsonl``.
     """
     from brain import consolidation
+    if getattr(args, "aliases", False):
+        summary = consolidation.consolidate_aliases(
+            apply=args.apply,
+            max_pairs=args.max,
+        )
+        if args.json:
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+            return 0
+        mode = "APPLY" if args.apply else "DRY-RUN"
+        status_note = summary.get("status")
+        print(
+            f"[{mode}] consolidate --aliases: "
+            f"checked={summary['checked']} "
+            f"judged={summary['judged']} "
+            f"merged={summary['merged']} "
+            f"kept_distinct={summary['kept_distinct']} "
+            f"needs_user={summary['needs_user']} "
+            f"judge_failed={summary['judge_failed']} "
+            f"skipped(disambig={summary['skipped_disambig']}, "
+            f"correction={summary['skipped_correction']}, "
+            f"budget={summary['skipped_budget']}) "
+            f"rewritten_rows={summary['rewritten_rows']} "
+            f"tokens={summary['tokens_spent']} "
+            f"budget={summary['budget_remaining']}"
+            + (f" status={status_note}" if status_note != "ok" else "")
+        )
+        return 0
+
     summary = consolidation.promote_episodic_ready(
         apply=args.apply,
         max_promotions=args.max,
@@ -334,12 +363,15 @@ def main(argv: list[str] | None = None) -> int:
 
     p_cons = sub.add_parser(
         "consolidate",
-        help="One-shot WS8 episodic → semantic promotion worker",
+        help="One-shot WS8 worker (promotion by default, aliases with --aliases)",
     )
     p_cons.add_argument("--apply", action="store_true",
-                        help="Actually write promotions (default: dry run)")
+                        help="Actually write changes (default: dry run)")
     p_cons.add_argument("--max", type=int, default=None,
-                        help="Upper bound on promotions this run (default: no cap)")
+                        help="Upper bound on promotions/pairs this run (default: no cap)")
+    p_cons.add_argument("--aliases", action="store_true",
+                        help="Run Part B: alias canonicalisation with LLM pair-judge "
+                             "instead of promotion")
     p_cons.add_argument("--json", action="store_true",
                         help="Emit the summary as JSON")
     p_cons.set_defaults(func=_cmd_consolidate)
