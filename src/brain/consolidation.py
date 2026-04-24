@@ -38,6 +38,10 @@ from __future__ import annotations
 import json
 import math
 import os
+import platform
+import shutil
+import subprocess
+import sys
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -577,3 +581,375 @@ def _audit_promotion(*,
             }, ensure_ascii=False) + "\n")
     except OSError:
         pass
+
+
+def _audit_rollback(*,
+                    promoted_id: int,
+                    restored: int,
+                    subject_slug: str | None,
+                    predicate_key: str | None,
+                    reason: str) -> None:
+    """Append one counter-only JSONL line per rollback action. Paired
+    with a `_audit_promotion` row for the same `promoted_id` so an
+    auditor can reconstruct the before/after without reading the DB.
+
+    WS5 hash-chained ledger entry (`consolidation_rollback`) also
+    fires so the rollback is tamper-evident."""
+    p = _audit_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "action": "rollback",
+                "promoted_id": promoted_id,
+                "restored": int(restored),
+                "subject_slug": subject_slug or "",
+                "predicate_key": predicate_key or "",
+                "reason": reason,
+            }, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    # WS5 hash-chain mirror (best-effort).
+    try:
+        from brain import _audit_ledger
+        _audit_ledger.append(
+            "consolidation_rollback",
+            {
+                "promoted_id": int(promoted_id),
+                "restored": int(restored),
+                "subject_slug": subject_slug or "",
+                "predicate_key": predicate_key or "",
+                "reason": reason,
+            },
+            actor="brain.consolidation.rollback",
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# List + rollback (public API)
+# ---------------------------------------------------------------------------
+
+
+def _iter_audit_rows():
+    """Yield parsed rows from consolidation.jsonl, skipping junk."""
+    p = _audit_path()
+    if not p.exists():
+        return
+    try:
+        with p.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        return
+
+
+def _parse_ts(ts: str | None) -> float:
+    """Parse an ISO-8601 audit timestamp to epoch seconds. Returns 0
+    on anything unparseable (ancient rows sort oldest-first by
+    default, which is what callers want)."""
+    if not ts:
+        return 0.0
+    try:
+        # The audit writer uses `isoformat(timespec='seconds')`, which
+        # emits `2026-04-24T13:05:00+00:00`. `datetime.fromisoformat`
+        # handles both naive and aware forms.
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def list_actions(*,
+                 since: str | None = None,
+                 action_id: int | None = None,
+                 action: str | None = None,
+                 limit: int | None = None) -> list[dict]:
+    """Return audit rows, newest-first, optionally filtered.
+
+    Args:
+        since: ISO-8601 timestamp OR ``YYYY-MM-DD`` — only rows with
+               ``ts >= since`` are returned. A bare date is treated
+               as midnight UTC.
+        action_id: promoted_id (int). Matches promotion rows where
+               ``promoted_id == action_id`` AND rollback rows with
+               the same id — so the caller sees both sides of the
+               lifecycle.
+        action: filter by ``action`` column (``'promote'`` /
+               ``'rollback'``). None = no filter.
+        limit: cap after filtering. None = unbounded.
+
+    Returns a list of dicts (parsed JSONL rows), sorted by ts DESC.
+    """
+    rows = list(_iter_audit_rows())
+
+    if since is not None:
+        since_epoch = _parse_ts(
+            since if "T" in since else f"{since}T00:00:00+00:00"
+        )
+        rows = [r for r in rows if _parse_ts(r.get("ts")) >= since_epoch]
+
+    if action_id is not None:
+        target = int(action_id)
+        rows = [r for r in rows if int(r.get("promoted_id") or 0) == target]
+
+    if action:
+        rows = [r for r in rows if r.get("action") == action]
+
+    rows.sort(key=lambda r: _parse_ts(r.get("ts")), reverse=True)
+
+    if limit is not None:
+        rows = rows[: max(0, int(limit))]
+
+    return rows
+
+
+def rollback(promoted_id: int, *, reason: str = "manual") -> dict:
+    """Undo one promotion. Idempotent — calling twice on the same id
+    (or on an id that was never promoted) is a no-op.
+
+    Restores every `fact_claims` row that was `superseded_by =
+    promoted_id` back to `status='current'`, clears its
+    `superseded_by / superseded_at` pointers, and re-flags it as
+    episodic (the only kind a consolidation worker would have
+    superseded). The semantic row itself is deleted — not
+    soft-deleted — because it was a pure derivative with no
+    independent provenance. An `_audit_rollback` row is appended to
+    `consolidation.jsonl` AND a `consolidation_rollback` op hits the
+    WS5 hash-chain so the reversal is tamper-evident.
+
+    Returns::
+
+        {
+          "promoted_id": int,
+          "restored": int,      # number of contributors flipped back
+          "semantic_deleted": bool,
+          "already_rolled_back": bool,   # True → call was a no-op
+        }
+    """
+    result = {
+        "promoted_id": int(promoted_id),
+        "restored": 0,
+        "semantic_deleted": False,
+        "already_rolled_back": False,
+    }
+
+    with db.connect() as conn:
+        # Fetch the semantic row so we know what to audit even if the
+        # lookup beats us to the contributors.
+        sem_row = conn.execute(
+            "SELECT subject_slug, predicate_key, kind, source_kind "
+            "FROM fact_claims WHERE id = ?",
+            (int(promoted_id),),
+        ).fetchone()
+
+        subject_slug = sem_row[0] if sem_row else None
+        predicate_key = sem_row[1] if sem_row else None
+
+        # Find contributors that were superseded BY this promotion.
+        contribs = conn.execute(
+            "SELECT id FROM fact_claims WHERE superseded_by = ?",
+            (int(promoted_id),),
+        ).fetchall()
+
+        if not contribs and not sem_row:
+            # Nothing points at this id and no semantic row exists:
+            # the id was never promoted, or was already rolled back.
+            result["already_rolled_back"] = True
+            _audit_rollback(
+                promoted_id=int(promoted_id),
+                restored=0,
+                subject_slug=subject_slug,
+                predicate_key=predicate_key,
+                reason=f"{reason}:noop",
+            )
+            return result
+
+        for (cid,) in contribs:
+            conn.execute(
+                "UPDATE fact_claims "
+                "SET status='current', kind='episodic', "
+                "    superseded_by=NULL, superseded_at=NULL "
+                "WHERE id=?",
+                (int(cid),),
+            )
+        result["restored"] = len(contribs)
+
+        # Delete the semantic derivative. Safety check: only delete a
+        # row produced by the consolidation worker — never an
+        # arbitrary fact_claims id. The source_kind discriminator is
+        # `_promote_group`'s own write ("consolidation"), so anything
+        # else is a caller bug and we refuse.
+        if sem_row and sem_row[3] == "consolidation":
+            conn.execute("DELETE FROM fact_claims WHERE id=?", (int(promoted_id),))
+            result["semantic_deleted"] = True
+
+    _audit_rollback(
+        promoted_id=int(promoted_id),
+        restored=result["restored"],
+        subject_slug=subject_slug,
+        predicate_key=predicate_key,
+        reason=reason,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Scheduler installer (systemd user units + launchd plist)
+# ---------------------------------------------------------------------------
+
+
+def _repo_templates_dir() -> Path | None:
+    """Locate the templates dir next to the source tree (dev + editable
+    installs) or the system-install location."""
+    here = Path(__file__).resolve()
+    for candidate in (
+        here.parent.parent.parent / "templates",
+        Path("/usr/local/share/brain/templates"),
+    ):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _brain_cmd() -> str:
+    """Resolve a usable `brain` CLI invocation string.
+
+    Prefer a `brain` on PATH so users get the shortest command in the
+    generated unit. Fall back to the current interpreter + module
+    path, which works in a venv / editable install without further
+    wiring.
+    """
+    found = shutil.which("brain")
+    if found:
+        return found
+    return f"{sys.executable} -m brain.cli"
+
+
+def _render(tmpl: str) -> str:
+    brain_cmd = _brain_cmd()
+    return (
+        tmpl
+        .replace("{{BRAIN_DIR}}", str(config.BRAIN_DIR))
+        .replace("{{HOME}}", str(Path.home()))
+        .replace("{{BRAIN_CMD}}", brain_cmd)
+        .replace("{{BRAIN_CMD_BIN}}", shutil.which("brain") or sys.executable)
+        .replace("{{USERNAME}}", os.environ.get("USER") or os.environ.get("USERNAME") or "user")
+    )
+
+
+def _systemd_user_dir() -> Path:
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "systemd" / "user"
+
+
+def _launchd_user_dir() -> Path:
+    return Path.home() / "Library" / "LaunchAgents"
+
+
+def install_scheduler(*, enable: bool = True) -> dict:
+    """Install the consolidation scheduler for the current platform.
+
+    * Linux  → `brain-consolidate.service` + `.timer` under the user's
+      systemd unit directory, `systemctl --user daemon-reload` +
+      `enable --now brain-consolidate.timer` when `enable=True`.
+    * macOS  → `~/Library/LaunchAgents/com.<USER>.brain-consolidate.plist`,
+      `launchctl load` when `enable=True`.
+    * Other  → returns `{"platform": "unsupported"}` without error.
+
+    Returns a dict describing the paths written and the enablement
+    outcome. Callers can print/serialise directly.
+    """
+    templates = _repo_templates_dir()
+    if templates is None:
+        return {
+            "error": "templates_not_found",
+            "searched": [
+                "<repo>/templates",
+                "/usr/local/share/brain/templates",
+            ],
+        }
+
+    system = platform.system()
+    if system == "Linux":
+        svc_tmpl = templates / "systemd" / "brain-consolidate.service.tmpl"
+        tim_tmpl = templates / "systemd" / "brain-consolidate.timer.tmpl"
+        if not svc_tmpl.exists() or not tim_tmpl.exists():
+            return {"error": "template_missing",
+                    "expected": [str(svc_tmpl), str(tim_tmpl)]}
+        unit_dir = _systemd_user_dir()
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        svc_path = unit_dir / "brain-consolidate.service"
+        tim_path = unit_dir / "brain-consolidate.timer"
+        svc_path.write_text(_render(svc_tmpl.read_text()))
+        tim_path.write_text(_render(tim_tmpl.read_text()))
+
+        enabled = False
+        if enable:
+            for args in (
+                ["systemctl", "--user", "daemon-reload"],
+                ["systemctl", "--user", "enable", "--now",
+                 "brain-consolidate.timer"],
+            ):
+                try:
+                    subprocess.run(args, check=False)
+                except FileNotFoundError:
+                    return {
+                        "platform": "linux",
+                        "service": str(svc_path),
+                        "timer": str(tim_path),
+                        "enabled": False,
+                        "note": "systemctl not found; units written, "
+                                "start manually when systemd is available",
+                    }
+            enabled = True
+        return {
+            "platform": "linux",
+            "service": str(svc_path),
+            "timer": str(tim_path),
+            "enabled": enabled,
+        }
+
+    if system == "Darwin":
+        plist_tmpl = templates / "launchd" / "brain-consolidate.plist.tmpl"
+        if not plist_tmpl.exists():
+            return {"error": "template_missing", "expected": [str(plist_tmpl)]}
+        agents_dir = _launchd_user_dir()
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        username = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+        plist_path = agents_dir / f"com.{username}.brain-consolidate.plist"
+        plist_path.write_text(_render(plist_tmpl.read_text()))
+
+        enabled = False
+        if enable:
+            try:
+                subprocess.run(
+                    ["launchctl", "load", "-w", str(plist_path)], check=False,
+                )
+                enabled = True
+            except FileNotFoundError:
+                return {
+                    "platform": "darwin",
+                    "plist": str(plist_path),
+                    "enabled": False,
+                    "note": "launchctl not found; plist written, "
+                            "load manually when launchd is available",
+                }
+        return {
+            "platform": "darwin",
+            "plist": str(plist_path),
+            "enabled": enabled,
+        }
+
+    return {"platform": "unsupported", "system": system}
