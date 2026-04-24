@@ -183,7 +183,33 @@ def _cmd_consolidate(args: argparse.Namespace) -> int:
     agreeing episodes + pass the scrub/trust/contested/salience
     gates, and (with ``--apply``) promotes them to semantic. Default
     dry-run prints a summary without touching the DB.
+
+    Resource-guard gate (scheduler-friendly): when ``--respect-guard``
+    is set (scheduler invocation default) the worker refuses to run
+    unless ``resource_guard.clearance_level() >= args.min_level``.
+    This keeps the 30-min systemd timer from stealing CPU while the
+    user is harvesting/extracting.
     """
+    if getattr(args, "respect_guard", False):
+        from brain import resource_guard
+        level = resource_guard.clearance_level()
+        min_level = int(getattr(args, "min_level", 2) or 2)
+        if level < min_level:
+            msg = {
+                "skipped": True,
+                "reason": "resource_guard",
+                "clearance_level": level,
+                "min_level": min_level,
+            }
+            if args.json:
+                print(json.dumps(msg, ensure_ascii=False, indent=2))
+            else:
+                print(
+                    f"[SKIP] consolidate: clearance={level} < "
+                    f"min={min_level} (harvest/extract active or system busy)"
+                )
+            return 0
+
     from brain import consolidation
     summary = consolidation.promote_episodic_ready(
         apply=args.apply,
@@ -207,6 +233,105 @@ def _cmd_consolidate(args: argparse.Namespace) -> int:
         f"disagree={summary['blocked_disagreement']}) "
         f"budget={summary['budget_remaining']}"
         + (f" status={status_note}" if status_note else "")
+    )
+    return 0
+
+
+def _cmd_consolidation_list(args: argparse.Namespace) -> int:
+    """`brain consolidation list` — print audit rows, newest first."""
+    from brain import consolidation
+    rows = consolidation.list_actions(
+        since=args.since,
+        action_id=args.id,
+        action=args.action,
+        limit=args.limit,
+    )
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no matching actions)")
+        return 0
+    for r in rows:
+        if r.get("action") == "promote":
+            print(
+                f"{r.get('ts')}  [promote]  id={r.get('promoted_id')}  "
+                f"subject={r.get('subject_slug')!r}  "
+                f"predicate={r.get('predicate')!r}  "
+                f"n={r.get('n_contributors')}  "
+                f"salience={r.get('aggregate_salience')}"
+            )
+        elif r.get("action") == "rollback":
+            print(
+                f"{r.get('ts')}  [rollback] id={r.get('promoted_id')}  "
+                f"subject={r.get('subject_slug')!r}  "
+                f"restored={r.get('restored')}  "
+                f"reason={r.get('reason')!r}"
+            )
+        else:
+            print(f"{r.get('ts')}  [?] {r}")
+    return 0
+
+
+def _cmd_consolidation_install(args: argparse.Namespace) -> int:
+    """`brain consolidation install-scheduler` — render + enable the
+    30-min consolidation timer.
+
+    Linux: systemd user service+timer.  macOS: launchd LaunchAgent.
+    Other platforms: reports `unsupported` and exits 0.
+    """
+    from brain import consolidation
+    result = consolidation.install_scheduler(enable=not args.no_enable)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if result.get("error"):
+        print(
+            f"[ERROR] {result['error']}: "
+            f"{result.get('expected') or result.get('searched')}"
+        )
+        return 2
+    if result.get("platform") == "unsupported":
+        print(f"[SKIP] unsupported platform: {result.get('system')}")
+        return 0
+    if result.get("platform") == "linux":
+        print(
+            f"wrote {result['service']}\n"
+            f"wrote {result['timer']}\n"
+            f"enabled={result['enabled']}"
+        )
+        if result.get("note"):
+            print(result["note"])
+        return 0
+    if result.get("platform") == "darwin":
+        print(
+            f"wrote {result['plist']}\n"
+            f"enabled={result['enabled']}"
+        )
+        if result.get("note"):
+            print(result["note"])
+        return 0
+    return 0
+
+
+def _cmd_consolidation_rollback(args: argparse.Namespace) -> int:
+    """`brain consolidation rollback --id=<N>` — undo one promotion.
+
+    Idempotent — calling twice on the same id reports
+    ``already_rolled_back``.
+    """
+    from brain import consolidation
+    result = consolidation.rollback(args.id, reason=args.reason or "manual")
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if result.get("already_rolled_back"):
+        print(f"[NO-OP] id={args.id} — no contributors and no semantic row "
+              f"(already rolled back or never promoted)")
+        return 0
+    print(
+        f"[ROLLBACK] id={args.id} restored={result['restored']} "
+        f"semantic_deleted={result['semantic_deleted']}"
     )
     return 0
 
@@ -342,7 +467,63 @@ def main(argv: list[str] | None = None) -> int:
                         help="Upper bound on promotions this run (default: no cap)")
     p_cons.add_argument("--json", action="store_true",
                         help="Emit the summary as JSON")
+    # Scheduler invocation: --respect-guard turns on the
+    # resource_guard check. Manual use (bench, debugging) keeps the
+    # old unconditional behaviour so a human poking at the worker
+    # isn't silently no-op'd by a busy system.
+    p_cons.add_argument("--respect-guard", action="store_true",
+                        dest="respect_guard",
+                        help="Skip when resource_guard.clearance_level() "
+                             "< --min-level. Used by the systemd/launchd "
+                             "scheduler to stand down during harvest/extract.")
+    p_cons.add_argument("--min-level", type=int, default=2,
+                        dest="min_level",
+                        help="Minimum clearance level required when "
+                             "--respect-guard is set (default 2, per spec).")
     p_cons.set_defaults(func=_cmd_consolidate)
+
+    # `brain consolidation {list,rollback}` — audit walk + reversal.
+    p_cons_audit = sub.add_parser(
+        "consolidation",
+        help="WS8 audit trail — list past promotions + rollback",
+    )
+    cons_sub = p_cons_audit.add_subparsers(dest="consolidation_cmd")
+    p_cons_audit.set_defaults(
+        func=lambda _a: (p_cons_audit.print_help() or 0)
+    )
+
+    p_cl = cons_sub.add_parser("list", help="Print audit rows (newest first)")
+    p_cl.add_argument("--since", default=None,
+                      help="Filter: ts >= YYYY-MM-DD or full ISO-8601")
+    p_cl.add_argument("--id", type=int, default=None,
+                      help="Filter: only actions touching this promoted_id")
+    p_cl.add_argument("--action", choices=("promote", "rollback"),
+                      default=None, help="Filter by action type")
+    p_cl.add_argument("-n", "--limit", type=int, default=50,
+                      help="Max rows to return (default 50)")
+    p_cl.add_argument("--json", action="store_true",
+                      help="Emit JSON instead of text")
+    p_cl.set_defaults(func=_cmd_consolidation_list)
+
+    p_cr = cons_sub.add_parser("rollback", help="Undo a promotion by id")
+    p_cr.add_argument("--id", type=int, required=True,
+                      help="promoted_id from `brain consolidation list`")
+    p_cr.add_argument("--reason", default=None,
+                      help="Free-text reason recorded in the audit trail")
+    p_cr.add_argument("--json", action="store_true",
+                      help="Emit JSON instead of text")
+    p_cr.set_defaults(func=_cmd_consolidation_rollback)
+
+    p_ci = cons_sub.add_parser(
+        "install-scheduler",
+        help="Install the 30-min consolidation timer "
+             "(Linux: systemd user, macOS: launchd LaunchAgent)",
+    )
+    p_ci.add_argument("--no-enable", action="store_true",
+                      help="Write unit file(s) but don't enable/load")
+    p_ci.add_argument("--json", action="store_true",
+                      help="Emit JSON instead of text")
+    p_ci.set_defaults(func=_cmd_consolidation_install)
 
     p_watch = sub.add_parser(
         "watch",

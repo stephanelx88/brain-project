@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.{{USERNAME}}.brain-consolidate</string>
+
+    <!-- WS8 consolidation worker. --respect-guard self-skips when
+         the system is busy so the 30 min cadence never collides
+         with active harvest/extract ticks. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{BRAIN_CMD_BIN}}</string>
+        <string>consolidate</string>
+        <string>--apply</string>
+        <string>--respect-guard</string>
+        <string>--min-level</string>
+        <string>2</string>
+    </array>
+
+    <!-- 30 min cadence, matching the systemd timer on Linux. Spec
+         §"Scheduler integration". -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>{{BRAIN_DIR}}/logs/launchd-consolidate-stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>{{BRAIN_DIR}}/logs/launchd-consolidate-stderr.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>{{BRAIN_DIR}}</string>
+
+    <!-- Low priority — consolidation is background-only work. -->
+    <key>Nice</key>
+    <integer>15</integer>
+
+    <!-- Inject BRAIN_DIR so brain.config resolves to the user's
+         chosen vault; launchd doesn't source shell rc files. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BRAIN_DIR</key>
+        <string>{{BRAIN_DIR}}</string>
+    </dict>
+</dict>
+</plist>
