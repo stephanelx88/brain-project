@@ -327,3 +327,42 @@ def test_delta_str_formats():
     assert status._delta_str(5) == "5s"
     assert status._delta_str(125) == "2m05s"
     assert status._delta_str(3725) == "1h02m"
+
+
+# ─── Inbox runtime health ─────────────────────────────────────────
+
+
+def test_inbox_health_reports_runtime_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RUNTIME_DIR", str(tmp_path))
+    out = status.inbox_health()
+    assert "inbox" in out["section"].lower()
+    assert out["runtime_dir"] == str(tmp_path)
+    assert out["runtime_dir_writable"] is True
+    assert out["pending_total"] == 0
+
+
+def test_inbox_health_counts_pending(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RUNTIME_DIR", str(tmp_path))
+    from brain.runtime import inbox as _inbox
+    _inbox.send("u1", "snd", "a", "b", "hello")
+    _inbox.send("u1", "snd", "a", "b", "world")
+    _inbox.send("u2", "snd", "a", "b", "hi")
+    out = status.inbox_health()
+    assert out["pending_total"] == 3
+
+
+def test_inbox_health_detects_hook_wired(tmp_path, monkeypatch):
+    import json as _json
+    monkeypatch.setenv("BRAIN_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    settings = tmp_path / ".claude" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(_json.dumps({
+        "hooks": {
+            "UserPromptSubmit": [{"hooks": [
+                {"type": "command", "command": "/abs/inbox-surface-hook.sh"}
+            ]}]
+        }
+    }))
+    out = status.inbox_health()
+    assert out["user_prompt_submit_hook_wired"] is True

@@ -444,6 +444,53 @@ def _vault_counts() -> dict:
 # ---------- public surface -------------------------------------------------
 
 
+def inbox_health() -> dict:
+    """Doctor check for the runtime inbox subsystem (transport layer).
+
+    Reports whether the runtime root exists and is writable, how many
+    pending messages are queued across all sessions, and whether the
+    UserPromptSubmit hook for inbox surface is wired in Claude Code.
+    Independent of the vault — works even when BRAIN_DIR is missing.
+    """
+    import os
+    from brain.runtime import paths as _rt_paths
+
+    rt = _rt_paths.runtime_root()
+    rt.mkdir(parents=True, exist_ok=True)
+    writable = os.access(rt, os.W_OK)
+
+    inbox_dir = rt / "inbox"
+    pending_total = 0
+    if inbox_dir.exists():
+        for sid_dir in inbox_dir.iterdir():
+            pending_dir = sid_dir / "pending"
+            if pending_dir.is_dir():
+                pending_total += sum(
+                    1 for p in pending_dir.iterdir() if p.suffix == ".json"
+                )
+
+    settings = Path.home() / ".claude" / "settings.json"
+    hook_wired = False
+    if settings.exists():
+        try:
+            data = json.loads(settings.read_text())
+            for grp in (data.get("hooks") or {}).get("UserPromptSubmit") or []:
+                for h in grp.get("hooks") or []:
+                    if "inbox-surface-hook" in (h.get("command") or ""):
+                        hook_wired = True
+                        break
+        except Exception:  # noqa: BLE001 — best-effort doctor read
+            pass
+
+    return {
+        "section": "Inbox (runtime transport)",
+        "runtime_dir": str(rt),
+        "runtime_dir_writable": writable,
+        "pending_total": pending_total,
+        "user_prompt_submit_hook_wired": hook_wired,
+    }
+
+
 def gather() -> StatusReport:
     sched = scheduler.get_status()
     in_flight = _in_flight()
