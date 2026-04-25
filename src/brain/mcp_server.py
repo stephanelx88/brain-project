@@ -238,7 +238,20 @@ def brain_search(
     Envelope: `{query, weak_match, guidance, hits}`. `weak_match` here
     = "no hits returned" (this tool does not compute RRF semantics);
     for confidence-scored recall, use `brain_recall`.
+
+    Strict-claim mode (BRAIN_USE_CLAIMS=1 + BRAIN_STRICT_CLAIMS=1):
+    delegates to `_recall_strict_claims` so this tool returns the
+    same claim-only hit shape as `brain_recall`. The `type` filter
+    is ignored in strict mode (claims aren't typed by entity-type
+    yet).
     """
+    if _strict_claims_misconfigured():
+        return json.dumps({
+            "error": "configuration_error",
+            "detail": "BRAIN_STRICT_CLAIMS=1 requires BRAIN_USE_CLAIMS=1",
+        }, ensure_ascii=False, indent=2)
+    if _strict_claims_enabled():
+        return _recall_strict_claims(query, max(1, min(int(k), 25)), verbose)
     if _projection.default_verbose() and not debug:
         verbose = True
     _ensure_fresh()
@@ -871,7 +884,31 @@ def brain_semantic(
     Envelope: `{query, weak_match, guidance, hits}`. Default hit shape
     matches the other tools — `{kind, path, text, name?,
     entity_summary?}`.
+
+    Strict-claim mode (BRAIN_USE_CLAIMS=1 + BRAIN_STRICT_CLAIMS=1):
+    semantic search over entity .md files is NOT the claim store.
+    Returns `strict_unsupported` error pointing the agent to
+    `brain_recall` (which does lexical claim search). Claim-store
+    semantic embeddings are deferred until claim count grows past
+    10k.
     """
+    if _strict_claims_misconfigured():
+        return json.dumps({
+            "error": "configuration_error",
+            "detail": "BRAIN_STRICT_CLAIMS=1 requires BRAIN_USE_CLAIMS=1",
+        }, ensure_ascii=False, indent=2)
+    if _strict_claims_enabled():
+        return json.dumps({
+            "error": "strict_unsupported",
+            "detail": (
+                "brain_semantic embeds entity .md files (the projection "
+                "layer), not the claim store. In strict mode, fact-intent "
+                "queries should use brain_recall (lexical claim search). "
+                "Claim-store semantic search is on the roadmap for >10k "
+                "claims."
+            ),
+            "fallback_tool": "brain_recall",
+        }, ensure_ascii=False, indent=2)
     if _projection.default_verbose() and not debug:
         verbose = True
     _ensure_fresh()
