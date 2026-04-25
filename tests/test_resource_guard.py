@@ -25,10 +25,12 @@ class TestClearanceLevel:
         assert _level(cpu=10, idle=0) == 1
 
     def test_level_2_needs_idle(self):
+        # threshold lowered from 60s to 20s on 2026-04-25
         assert _level(cpu=35, idle=60) == 2
 
     def test_level_2_insufficient_idle(self):
-        assert _level(cpu=35, idle=59) == 1
+        # threshold = 20s; idle=19 must NOT clear L2
+        assert _level(cpu=35, idle=19) == 1
 
     def test_level_2_cpu_too_high(self):
         assert _level(cpu=41, idle=120) == 1
@@ -206,3 +208,19 @@ class TestCrossPlatformProbes:
         from brain import resource_guard as rg
         monkeypatch.setattr(rg, "_SYSTEM", "Windows")
         assert rg._on_ac_power() is True
+
+
+class TestLevel2IdleThreshold:
+    """The Level 2 idle threshold dropped from 60s to 20s on 2026-04-25
+    to reduce note→claim extraction lag for strict-mode claim store."""
+
+    def test_default_threshold_is_20(self):
+        from brain import resource_guard
+        assert resource_guard._IDLE_L2 == 20.0
+
+    def test_level_2_clears_at_20s_idle(self):
+        assert _level(cpu=35, idle=20) == 2
+
+    def test_level_2_blocked_below_threshold(self):
+        # 19s idle is just below the new 20s threshold
+        assert _level(cpu=35, idle=19) == 1
