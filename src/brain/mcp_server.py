@@ -612,6 +612,75 @@ def brain_identity() -> str:
     return "\n\n---\n\n".join(out) if out else "(no identity files)"
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Strict claim-mode recall — see docs/claim-lattice-strict-design.md
+#
+# When BRAIN_USE_CLAIMS=1 + BRAIN_STRICT_CLAIMS=1, brain_recall queries
+# fact_claims directly and skips the entity/note RRF path entirely.
+# Knowledge layer (claims) is the single source of truth for fact
+# intent; notes layer remains queryable via brain_notes for content
+# intent.
+# ─────────────────────────────────────────────────────────────────────────
+def _strict_claims_enabled() -> bool:
+    use = os.environ.get("BRAIN_USE_CLAIMS", "0") == "1"
+    strict = os.environ.get("BRAIN_STRICT_CLAIMS", "0") == "1"
+    return use and strict
+
+
+def _strict_claims_misconfigured() -> bool:
+    use = os.environ.get("BRAIN_USE_CLAIMS", "0") == "1"
+    strict = os.environ.get("BRAIN_STRICT_CLAIMS", "0") == "1"
+    return strict and not use
+
+
+def _claim_miss_threshold() -> float:
+    try:
+        return float(os.environ.get("BRAIN_CLAIM_MISS_THRESHOLD", "0.5"))
+    except (ValueError, TypeError):
+        return 0.5
+
+
+def _recall_strict_claims(query: str, k: int, verbose: bool) -> str:
+    """Query claim store only. No entity-file or note fallback."""
+    from brain.claims import read as _claim_read
+    hits = _claim_read.search_text(query, k=k)
+    threshold = _claim_miss_threshold()
+    weak = (not hits) or (hits[0].score < threshold)
+    if not hits:
+        guidance = (
+            "the brain has no current claim matching this query in the "
+            "strict claim store. Notes layer is not consulted in strict "
+            "mode — call `brain_notes(query)` to search free-form note text."
+        )
+    elif weak:
+        guidance = (
+            "weak match in claim store; top score below threshold. "
+            "Treat hits as topical hints, not authoritative answers."
+        )
+    else:
+        guidance = None
+
+    formatted_hits = []
+    for h in hits:
+        item: dict = {
+            "kind": h.kind,
+            "path": h.path,
+            "text": h.text if verbose else (h.text or "")[:240],
+            "name": h.name,
+            "claim_id": h.claim_id,
+        }
+        if verbose:
+            item["score"] = h.score
+        formatted_hits.append(item)
+
+    return json.dumps({
+        "query": query,
+        "weak_match": weak,
+        "guidance": guidance,
+        "hits": formatted_hits,
+    }, ensure_ascii=False, indent=2)
+
+
 @mcp.tool()
 def brain_recall(
     query: str,
@@ -650,7 +719,17 @@ def brain_recall(
       BRAIN_RECALL_SNIPPET_CHARS  — snippet cap (default 240)
       BRAIN_MCP_DEFAULT_VERBOSE=1 — restore pre-WS2 verbose shape
                                     (migration grace).
+      BRAIN_USE_CLAIMS=1 + BRAIN_STRICT_CLAIMS=1 — strict claim-store-only
+                                    recall (skips entity/note RRF path).
     """
+    if _strict_claims_misconfigured():
+        return json.dumps({
+            "error": "configuration_error",
+            "detail": "BRAIN_STRICT_CLAIMS=1 requires BRAIN_USE_CLAIMS=1; "
+                      "set both flags or unset both.",
+        }, ensure_ascii=False, indent=2)
+    if _strict_claims_enabled():
+        return _recall_strict_claims(query, max(1, min(int(k), 25)), verbose)
     if _projection.default_verbose() and not debug:
         verbose = True
     k = max(1, min(int(k), 25))
