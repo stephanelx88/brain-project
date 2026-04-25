@@ -51,3 +51,19 @@ def test_short_id_from_uuid_for_cursor():
         "ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2", source="cursor"
     )
     assert out == "ab2b1fa6"
+
+
+def test_ppid_lookup_reads_sessionId_camelCase(monkeypatch, tmp_path):
+    """Claude Code writes sessionId (camelCase) — verified against
+    real ~/.claude/sessions/<pid>.json content on 2026-04-25."""
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    sessions_dir = tmp_path / ".claude" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    (sessions_dir / "30044.json").write_text(json.dumps({
+        "pid": 30044,
+        "sessionId": "e02cc7d5-d558-4dd5-8bb0-a8c7957a6f73",
+        "cwd": "/Users/son/code/brain-project",
+    }))
+    monkeypatch.setattr(session_id, "_claude_sessions_dir", lambda: sessions_dir)
+    monkeypatch.setattr(session_id, "_get_ppid", lambda: 30044)
+    assert session_id.detect_own_uuid() == "e02cc7d5-d558-4dd5-8bb0-a8c7957a6f73"

@@ -48,7 +48,14 @@ def detect_own_uuid() -> Optional[str]:
                 data = json.loads(cand.read_text())
             except (OSError, json.JSONDecodeError):
                 return None
-            sid = (data.get("session_id") or "").strip()
+            # Claude Code writes the key as `sessionId` (camelCase) in
+            # ~/.claude/sessions/<pid>.json — verified against real
+            # files on 2026-04-26 + matches brain.harvest_session
+            # convention. The legacy `session_id` snake_case is kept as
+            # fallback for tests + forward-compat if Claude renames.
+            sid = (data.get("sessionId")
+                   or data.get("session_id")
+                   or "").strip()
             if _is_uuid(sid):
                 return sid
 
