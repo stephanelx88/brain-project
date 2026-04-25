@@ -307,3 +307,81 @@ class TestCli:
     def test_unknown_action_returns_2(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HOME", str(tmp_path))
         assert ih.main(["frobnicate"]) == 2
+
+
+# ─── UserPromptSubmit hook (inbox surface) ──────────────────────────
+
+
+def test_install_user_prompt_submit_writes_entry(tmp_path):
+    from brain import install_hooks
+    import json
+    home = tmp_path
+    (home / ".claude").mkdir()
+    block = {
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "/abs/path/inbox-surface-hook.sh",
+                }]
+            }]
+        }
+    }
+    res = install_hooks.install_claude_user_prompt_submit(home, block)
+    written = json.loads((home / ".claude" / "settings.json").read_text())
+    assert "UserPromptSubmit" in written["hooks"]
+    assert any(
+        "inbox-surface-hook" in h["command"]
+        for grp in written["hooks"]["UserPromptSubmit"]
+        for h in grp["hooks"]
+    )
+    assert res == str(home / ".claude" / "settings.json")
+
+
+def test_install_user_prompt_submit_preserves_session_start(tmp_path):
+    from brain import install_hooks
+    import json
+    home = tmp_path
+    (home / ".claude").mkdir()
+    settings = home / ".claude" / "settings.json"
+    settings.write_text(json.dumps({
+        "hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": "x brain.audit"}]}]
+        }
+    }))
+    block = {
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [{"type": "command", "command": "/abs/inbox-surface-hook.sh"}]
+            }]
+        }
+    }
+    install_hooks.install_claude_user_prompt_submit(home, block)
+    written = json.loads(settings.read_text())
+    assert "SessionStart" in written["hooks"]
+    assert "UserPromptSubmit" in written["hooks"]
+
+
+def test_remove_user_prompt_submit_drops_only_brain_entry(tmp_path):
+    from brain import install_hooks
+    import json
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "UserPromptSubmit": [{
+                "hooks": [
+                    {"type": "command", "command": "/abs/inbox-surface-hook.sh"},
+                    {"type": "command", "command": "/some/other/user-hook.sh"},
+                ]
+            }]
+        }
+    }))
+    install_hooks.remove_claude_user_prompt_submit(home)
+    written = json.loads((home / ".claude" / "settings.json").read_text())
+    surviving = [
+        h for grp in written["hooks"].get("UserPromptSubmit", [])
+        for h in grp["hooks"]
+    ]
+    assert len(surviving) == 1
+    assert "inbox-surface-hook" not in surviving[0]["command"]

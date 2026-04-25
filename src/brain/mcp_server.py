@@ -1391,6 +1391,174 @@ def identity_resource() -> str:
     return brain_identity()
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Realtime named-session messaging — see docs/realtime-named-sessions-design.md
+#
+# Three tools backed by brain.runtime/. Storage lives outside BRAIN_DIR;
+# extraction of inter-session content happens via the existing harvest
+# pipeline reading session transcript jsonl, not via a parallel path.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _caller_cwd() -> str:
+    """The cwd this MCP server was launched in. Overridden in tests."""
+    return os.getcwd()
+
+
+def _caller_project_for_uuid(uuid: str) -> str:
+    """Map a session UUID to its project label.
+
+    Reuses brain.live_sessions' project derivation so the answer matches
+    what other brain tools see. Falls back to the basename of cwd.
+    """
+    from brain import live_sessions as _ls
+    for row in _ls.list_live_sessions(include_self=True):
+        if row.get("session_id") == uuid:
+            return row.get("project") or os.path.basename(_caller_cwd())
+    return os.path.basename(_caller_cwd())
+
+
+def _live_uuids() -> set[str]:
+    from brain import live_sessions as _ls
+    return {row["session_id"] for row in _ls.list_live_sessions(include_self=True)}
+
+
+def _ensure_self_registered(uuid: str) -> None:
+    """Lazy-create a default-name registry entry for `uuid` on first use."""
+    from brain.runtime import names as _names
+    from brain.runtime import session_id as _sid
+    if _names.get(uuid):
+        return
+    project = _caller_project_for_uuid(uuid)
+    short = _sid.short_id_for_default_name(uuid, source="claude")
+    _names.register(
+        uuid=uuid,
+        name=_names.default_name(project, short),
+        project=project,
+        cwd=_caller_cwd(),
+        pid=int(short) if short.isdigit() else None,
+    )
+
+
+@mcp.tool()
+def brain_set_name(name: str) -> str:
+    """Set this session's human-readable name (per-project alias).
+
+    Validation: lowercase, [a-z0-9-], 1-64 chars, not in
+    {peer,self,all,me}, not already taken by another session in the
+    same project.
+
+    Returns JSON: {ok, uuid, name, project} on success;
+    {ok: false, error, detail} on failure (codes: lowercase, length,
+    chars, reserved, name_taken, no_session).
+    """
+    from brain.runtime import names as _names
+    from brain.runtime import session_id as _sid
+    uuid = _sid.detect_own_uuid()
+    if not uuid:
+        return json.dumps({"ok": False, "error": "no_session",
+                           "detail": "could not detect own session UUID"})
+    _ensure_self_registered(uuid)
+    err = _names.set_name(uuid, name)
+    if err:
+        return json.dumps({"ok": False, "error": err})
+    entry = _names.get(uuid) or {}
+    return json.dumps({
+        "ok": True,
+        "uuid": uuid,
+        "name": entry.get("name"),
+        "project": entry.get("project"),
+    })
+
+
+@mcp.tool()
+def brain_send(to: str, body: str) -> str:
+    """Send a message to another live session by name or UUID.
+
+    Resolution rules:
+      1. UUIDv4 pattern → fire-and-forget (no liveness check).
+      2. cursor:<UUIDv4> → MVP: rejected (deferred to v2).
+      3. <project>/<name> → resolve `name` in that project's namespace.
+      4. <name> → resolve in sender's own project.
+
+    Error codes: name_not_found, ambiguous_name, recipient_dead,
+    cursor_recipient_unsupported, invalid_recipient, body_too_large,
+    no_session.
+    """
+    from brain.runtime import inbox as _inbox
+    from brain.runtime import names as _names
+    from brain.runtime import resolve as _resolve
+    from brain.runtime import session_id as _sid
+
+    sender_uuid = _sid.detect_own_uuid()
+    if not sender_uuid:
+        return json.dumps({"ok": False, "error": "no_session"})
+    _ensure_self_registered(sender_uuid)
+
+    sender_project = _caller_project_for_uuid(sender_uuid)
+    decision = _resolve.resolve_recipient(
+        to=to,
+        sender_project=sender_project,
+        live_uuids=_live_uuids(),
+    )
+    if not decision.ok:
+        return json.dumps({
+            "ok": False, "error": decision.error, "detail": decision.detail,
+        })
+
+    sender_entry = _names.get(sender_uuid) or {}
+    try:
+        env = _inbox.send(
+            to_uuid=decision.uuid,
+            from_uuid=sender_uuid,
+            from_name_at_send=sender_entry.get("name") or sender_uuid[:8],
+            to_name_at_send=decision.name_at_send,
+            body=body,
+        )
+    except _inbox.BodyTooLarge as e:
+        return json.dumps({"ok": False, "error": "body_too_large",
+                           "detail": str(e)})
+
+    return json.dumps({
+        "ok": True,
+        "message_id": env["id"],
+        "to_uuid": env["to_uuid"],
+        "to_name_at_send": env["to_name_at_send"],
+    })
+
+
+@mcp.tool()
+def brain_inbox(unread_only: bool = True, limit: int = 50,
+                mark_read: bool = False) -> str:
+    """List own session's inbox.
+
+    Default = peek (non-destructive). Pass mark_read=True to move
+    listed messages from pending/ to delivered/. The
+    UserPromptSubmit hook is the normal mark-read path; manual calls
+    default to peek so user can inspect without consuming.
+    """
+    from brain.runtime import inbox as _inbox
+    from brain.runtime import session_id as _sid
+    own = _sid.detect_own_uuid()
+    if not own:
+        return json.dumps({"ok": False, "error": "no_session"})
+
+    pending = _inbox.list_pending(own)
+    delivered = _inbox.list_delivered(own)
+    listed = pending if unread_only else pending + delivered
+    listed = listed[: max(1, min(int(limit), 500))]
+
+    if mark_read and pending:
+        _inbox.mark_delivered(own, [m["id"] for m in pending])
+
+    return json.dumps({
+        "ok": True,
+        "messages": listed,
+        "pending_count": len(pending),
+        "delivered_count": len(delivered),
+    })
+
+
 def main():
     # Kick warmup off in a daemon thread BEFORE mcp.run() so the
     # embedding model loads in the background while the MCP stdio

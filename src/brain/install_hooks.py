@@ -180,6 +180,63 @@ def remove_cursor(home: Path) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Claude Code (~/.claude/settings.json) — UserPromptSubmit (inbox surface)
+# ─────────────────────────────────────────────────────────────────────────
+INBOX_HOOK_MARKER = "inbox-surface-hook"
+
+
+def install_claude_user_prompt_submit(
+    home: Path, brain_block: dict[str, Any]
+) -> str | None:
+    """Merge `brain_block`'s UserPromptSubmit entry into Claude settings.
+
+    Preserves any existing SessionStart wiring (and any sibling
+    UserPromptSubmit groups the user has installed). Replaces the
+    UserPromptSubmit array as a whole — symmetric with how
+    `install_claude` handles SessionStart.
+    """
+    if not (home / ".claude").is_dir():
+        return None
+    target = _claude_settings_path(home)
+    existing = _load_json(target)
+    if existing is None:
+        return None
+    hooks = existing.setdefault("hooks", {})
+    hooks["UserPromptSubmit"] = brain_block["hooks"]["UserPromptSubmit"]
+    _save_json(target, existing)
+    return str(target)
+
+
+def _is_brain_inbox_hook(entry: dict[str, Any]) -> bool:
+    cmd = entry.get("command") or ""
+    return INBOX_HOOK_MARKER in cmd
+
+
+def remove_claude_user_prompt_submit(home: Path) -> str | None:
+    target = _claude_settings_path(home)
+    existing = _load_json(target)
+    if not existing:
+        return None
+    bag = existing.get("hooks") or {}
+    starters = bag.get("UserPromptSubmit") or []
+    cleaned: list[dict[str, Any]] = []
+    for group in starters:
+        inner = [h for h in (group.get("hooks") or []) if not _is_brain_inbox_hook(h)]
+        if inner:
+            cleaned.append({**group, "hooks": inner})
+    if cleaned == starters:
+        return None
+    if cleaned:
+        bag["UserPromptSubmit"] = cleaned
+    else:
+        bag.pop("UserPromptSubmit", None)
+    if not bag:
+        existing.pop("hooks", None)
+    _save_json(target, existing)
+    return str(target)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────
 def main(argv: list[str] | None = None) -> int:
@@ -193,10 +250,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if action == "install":
         if len(argv) < 3:
-            print("usage: install <settings_src> <hooks_src>", file=sys.stderr)
+            print("usage: install <settings_src> <hooks_src> [<inbox_hook_src>]",
+                  file=sys.stderr)
             return 2
         settings_block = json.loads(Path(argv[1]).read_text())
         hooks_block = json.loads(Path(argv[2]).read_text())
+        inbox_block = None
+        if len(argv) >= 4 and argv[3] != "--no-inbox-hook":
+            inbox_block = json.loads(Path(argv[3]).read_text())
         for label, fn, payload in (
             ("Claude SessionStart hook installed",  install_claude, settings_block),
             ("Cursor sessionStart hook installed",  install_cursor, hooks_block),
@@ -211,11 +272,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"      - ~/{dot} not found — {kind} hook skipped.")
                 else:
                     print(f"      ! {kind} config malformed — {kind} hook skipped (fix manually).")
+        if inbox_block is not None:
+            res = install_claude_user_prompt_submit(home, inbox_block)
+            if res:
+                print(f"      ✓ Claude UserPromptSubmit (inbox surface) installed ({res})")
+            elif (home / ".claude").is_dir():
+                print("      ! Claude UserPromptSubmit install failed — inbox-hook skipped.")
         return 0
 
     if action == "remove":
         for label, fn in (
             ("Claude SessionStart hook removed", remove_claude),
+            ("Claude UserPromptSubmit hook removed", remove_claude_user_prompt_submit),
             ("Cursor sessionStart hook removed", remove_cursor),
         ):
             res = fn(home)

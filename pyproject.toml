@@ -52,6 +52,8 @@ brain = ["prompts/*.md", "presets/*.yaml"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = "-m 'not integration'"
 markers = [
     "bench: golden-set retrieval benchmark (slow; needs a populated ~/.brain vault)",
+    "integration: long-running end-to-end tests; not run by default",
 ]
