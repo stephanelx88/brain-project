@@ -1,0 +1,21 @@
+#!/bin/bash
+# Wired into Claude Code as UserPromptSubmit hook by `brain install`.
+# Runs once per user prompt, BEFORE the assistant turn begins.
+#
+# Empty-inbox fast path — exit before starting Python when there is
+# nothing to surface. Sub-millisecond when the receiver has no
+# pending messages, which is the common case.
+set -u
+
+RUNTIME_DIR="${BRAIN_RUNTIME_DIR:-$HOME/.brain-runtime}"
+SID="${CLAUDE_SESSION_ID:-}"
+
+if [ -n "$SID" ]; then
+    PENDING_DIR="$RUNTIME_DIR/inbox/$SID/pending"
+    [ -d "$PENDING_DIR" ] || exit 0
+    # `compgen -G` is a builtin glob check — no fork. If empty, exit.
+    compgen -G "$PENDING_DIR/*.json" >/dev/null || exit 0
+fi
+
+mkdir -p "$RUNTIME_DIR/log"
+exec "{{BRAIN_PYTHON}}" -m brain.runtime.hook 2>>"$RUNTIME_DIR/log/inbox-hook.log"
