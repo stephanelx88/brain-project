@@ -430,7 +430,37 @@ SETTINGS_RENDERED="$BRAIN_DIR/.claude-settings.brain.json"
 HOOKS_RENDERED="$BRAIN_DIR/.cursor-hooks.brain.json"
 render "$PROJECT_DIR/templates/claude/settings.json.tmpl" "$SETTINGS_RENDERED"
 render "$PROJECT_DIR/templates/cursor/hooks.json.tmpl"   "$HOOKS_RENDERED"
-"$PYTHON" -m brain.install_hooks install "$SETTINGS_RENDERED" "$HOOKS_RENDERED"
+
+# Render the inbox-surface hook + matching UserPromptSubmit JSON block.
+# Honors BRAIN_NO_INBOX_HOOK=1 to skip the hook entirely (users who
+# don't want per-prompt overhead).
+INBOX_HOOK_TARGET="$BRAIN_DIR/bin/inbox-surface-hook.sh"
+mkdir -p "$BRAIN_DIR/bin"
+sed "s|{{BRAIN_PYTHON}}|$PYTHON|g" \
+    "$PROJECT_DIR/bin/inbox-surface-hook.sh.template" \
+    > "$INBOX_HOOK_TARGET"
+chmod +x "$INBOX_HOOK_TARGET"
+
+INBOX_BLOCK_RENDERED="$BRAIN_DIR/.claude-userpromptsubmit.brain.json"
+cat > "$INBOX_BLOCK_RENDERED" <<EOF
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "$INBOX_HOOK_TARGET"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
+if [ "${BRAIN_NO_INBOX_HOOK:-0}" = "1" ]; then
+    "$PYTHON" -m brain.install_hooks install "$SETTINGS_RENDERED" "$HOOKS_RENDERED" --no-inbox-hook
+else
+    "$PYTHON" -m brain.install_hooks install "$SETTINGS_RENDERED" "$HOOKS_RENDERED" "$INBOX_BLOCK_RENDERED"
+fi
 
 # ──────────────────────────────────────────────────────────────────────
 # 6. Build the search index (so first query is instant)
