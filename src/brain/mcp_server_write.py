@@ -41,6 +41,8 @@ WRITE_TOOLS: tuple[str, ...] = (
     "brain_mark_contested",
     "brain_resolve_contested",
     "brain_failure_record",
+    "brain_send",
+    "brain_set_name",
 )
 
 
