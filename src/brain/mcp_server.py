@@ -1465,6 +1465,19 @@ def brain_graph_neighbors(
                       ensure_ascii=False, indent=2)
 
 
+@mcp.tool()
+def brain_progress() -> str:
+    """Extraction pipeline progress: notes pending/done, last-hour throughput,
+    backlog, currently-extracting indicator, GREEN/YELLOW/RED health.
+
+    Returns JSON envelope from `brain.claims.progress.extraction_progress()`.
+    Use this to answer "is brain keeping up with my notes?".
+    """
+    from brain.claims import progress as _progress
+    return json.dumps(_progress.extraction_progress(),
+                      ensure_ascii=False, indent=2)
+
+
 @mcp.resource("brain://identity")
 def identity_resource() -> str:
     return brain_identity()
