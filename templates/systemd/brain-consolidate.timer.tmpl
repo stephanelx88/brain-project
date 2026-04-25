@@ -1,0 +1,23 @@
+[Unit]
+Description=Brain — consolidation timer (30 min cadence when idle)
+Documentation=https://github.com/stephanelx88/brain-project
+
+[Timer]
+# Spec "Scheduler integration": 30 min cadence when idle. The service
+# itself gates on resource_guard, so a busy system turns this into a
+# cheap no-op.
+OnBootSec=5min
+OnUnitActiveSec=30min
+
+# Accuracy budget — systemd batches timers within this window to save
+# wake-ups. 5 min is well within the "episodic-fact should consolidate
+# within a few ticks" SLO.
+AccuracyUsec=5min
+
+# Survive clock changes (laptop sleep/wake).
+Persistent=true
+
+Unit=brain-consolidate.service
+
+[Install]
+WantedBy=timers.target

@@ -94,6 +94,99 @@ def _ensure_dir():
     VEC_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _current_scrub_tag() -> str:
+    """Return the active sanitize ruleset version string.
+
+    Lazy import so a stripped environment (tests without sanitize
+    wired, or a future scrubber-less subset of the codebase) falls
+    back to a sentinel rather than crashing the builder. Sentinel
+    cannot match `sanitize.VERSION` so it would force a rebuild on
+    the next tick if the scrubber is re-enabled — safer than assuming
+    "no scrubber == scrubbed".
+    """
+    try:
+        from brain.sanitize import VERSION as _v
+        return _v
+    except Exception:
+        return "no-scrubber"
+
+
+def _meta_scrub_tag() -> str | None:
+    """Return the scrub_tag recorded in `.vec/meta.json`, or None."""
+    if not META_JSON.exists():
+        return None
+    try:
+        meta = json.loads(META_JSON.read_text())
+    except Exception:
+        return None
+    tag = meta.get("scrub_tag")
+    return tag if isinstance(tag, str) else None
+
+
+def _stamp_scrub_tag_in_place(tag: str) -> None:
+    """Write `scrub_tag = tag` into an existing `.vec/meta.json`
+    without rebuilding the index. Used for the one-shot migration
+    when the bundle predates this field — we don't know whether the
+    embedded content is actually older than the current scrubber, so
+    we adopt the current tag rather than force rebuild.
+    """
+    if not META_JSON.exists():
+        return
+    try:
+        meta = json.loads(META_JSON.read_text())
+    except Exception:
+        return
+    meta["scrub_tag"] = tag
+    atomic_write_text(META_JSON, json.dumps(meta, indent=2))
+
+
+def _audit_scrub_version_init(*, new_tag: str) -> None:
+    """Record the one-shot migration that stamps an existing `.vec`
+    bundle with its first scrub_tag. Distinct op from
+    `scrub_version_bump_reingest` because no re-embedding happened —
+    an incident responder looking at the ledger needs to tell
+    "migrated unknown" apart from "redid because ruleset bumped".
+    """
+    try:
+        from brain import _audit_ledger
+        _audit_ledger.append(
+            "scrub_version_init",
+            {"new_scrub_tag": new_tag},
+            actor="semantic.ensure_built",
+        )
+    except Exception:
+        pass
+
+
+def _audit_scrub_version_bump(
+    *, old_tag: str | None, new_tag: str, reingested: int
+) -> None:
+    """Record a scrub-version forced re-ingest in the WS5 ledger.
+
+    Fired exactly once per detected bump (never on every tick). Payload:
+    * `old_scrub_tag` — what the `.vec` bundle was stamped with (may
+      be null if the bundle predates the field).
+    * `new_scrub_tag` — `sanitize.VERSION` at the moment of rebuild.
+    * `reingested` — count of fact rows re-embedded.
+
+    Counter-only, no raw content. Best-effort: import/disk failures
+    are swallowed so the rebuild path is never blocked by audit.
+    """
+    try:
+        from brain import _audit_ledger
+        _audit_ledger.append(
+            "scrub_version_bump_reingest",
+            {
+                "old_scrub_tag": old_tag or "",
+                "new_scrub_tag": new_tag,
+                "reingested": int(reingested),
+            },
+            actor="semantic.ensure_built",
+        )
+    except Exception:
+        pass
+
+
 def _atomic_save_npy(path: Path, arr: np.ndarray) -> None:
     """Atomic `np.save` equivalent.
 
@@ -135,6 +228,12 @@ def build() -> dict:
         {
             "rowid": r[0],
             "text": r[1],
+            # `fact_hash` pins the embedded text to the exact bytes that
+            # produced its vector. `search_facts` compares this against
+            # the current DB text at query time and drops any hit whose
+            # hash drifted — closes the "stale fact confidently served"
+            # class from the 2026-04-23 Thuha-in-Cần-Thơ incident.
+            "fact_hash": db.canonical_fact_hash(r[1] or ""),
             "source": r[2],
             "entity_id": r[3],
             "type": r[4],
@@ -194,6 +293,12 @@ def build() -> dict:
                 "fact_max_id": max((m["rowid"] for m in fact_meta), default=0),
                 "entity_max_id": max((m["id"] for m in ent_meta), default=0),
                 "build_seconds": round(time.time() - t0, 2),
+                # WS4 scrub-version cross-reference. The embedded text
+                # was produced by this ruleset; `ensure_built()`
+                # compares against `sanitize.VERSION` at read time and
+                # forces a full re-embed on mismatch so a scrubber
+                # upgrade can't leave pre-upgrade content in the index.
+                "scrub_tag": _current_scrub_tag(),
             },
             indent=2,
         ),
@@ -282,7 +387,9 @@ def incremental_update_facts_entities() -> dict:
 
     new_fact_meta = [
         {
-            "rowid": r[0], "text": r[1], "source": r[2],
+            "rowid": r[0], "text": r[1],
+            "fact_hash": db.canonical_fact_hash(r[1] or ""),
+            "source": r[2],
             "entity_id": r[3], "type": r[4], "name": r[5],
             "slug": r[6], "date": r[7], "path": r[8],
         }
@@ -552,12 +659,76 @@ def ensure_built(rebuild_if_stale: bool = False) -> dict | None:
     built when META was absent, so every new fact stayed dark until the
     next scheduled full rebuild.
 
+    **Scrub-version cross-reference (WS4 follow-up)**: when the `.vec`
+    bundle's `scrub_tag` disagrees with the active `sanitize.VERSION`,
+    force a full rebuild. Rationale: a newer scrubber may redact or
+    reject content the older one kept. Without this check, the
+    embeddings + on-disk meta keep surfacing pre-upgrade text
+    (including flagged-but-not-rejected injection strings) until the
+    next 6 h stale-rebuild — same "v1 → v2 prompt-injection window"
+    Security flagged in the 18:24 stale-fact post. Fires a WS5
+    `scrub_version_bump_reingest` audit entry exactly once per bump.
+
     Failures in the incremental path are swallowed and fall through to
     the old behaviour (no refresh) — the recall hot path must never be
     broken by an indexing error.
     """
     if not META_JSON.exists():
         return build()
+
+    # Scrub-version cross-reference — runs BEFORE the incremental
+    # path so a bump triggers a full rebuild, not an append of new
+    # rows on top of a stale old-version bundle.
+    #
+    # Three states:
+    #   stored is None           → bundle predates this field entirely
+    #                              (pre-WS4-cross-ref vault). Stamp the
+    #                              current tag in-place, DON'T rebuild.
+    #                              This is a one-shot migration — we
+    #                              don't know the bundle is actually
+    #                              stale w.r.t. the scrubber, and
+    #                              forcing a full rebuild on every
+    #                              legacy vault penalises correct
+    #                              behaviour. Emit `scrub_version_init`
+    #                              for audit visibility but don't touch
+    #                              the index.
+    #   stored == current        → no-op (hot-path common case).
+    #   stored != current (both non-null)
+    #                            → real version bump. Force full
+    #                              rebuild + `scrub_version_bump_reingest`
+    #                              audit. The existing bundle may hold
+    #                              content the new ruleset would have
+    #                              redacted/rejected.
+    stored = _meta_scrub_tag()
+    current = _current_scrub_tag()
+    if stored is None:
+        try:
+            _stamp_scrub_tag_in_place(current)
+            _audit_scrub_version_init(new_tag=current)
+        except Exception:
+            pass  # never block the read path
+    elif stored != current:
+        try:
+            # Peek fact count *before* rebuild so the audit ledger
+            # records how many rows were forcibly re-embedded. This
+            # is what a downstream incident-response tool wants to
+            # know ("the bump touched N facts").
+            try:
+                pre_count = len(json.loads(FACTS_JSON.read_text()))
+            except Exception:
+                pre_count = 0
+            result = build()
+            _audit_scrub_version_bump(
+                old_tag=stored,
+                new_tag=current,
+                reingested=pre_count,
+            )
+            return result
+        except Exception:
+            # Rebuild failed — fall through rather than leave the
+            # read path broken. The next tick retries.
+            pass
+
     try:
         if _has_new_rows():
             incremental_update_facts_entities()
@@ -607,6 +778,154 @@ def _topk(query_vec: np.ndarray, mat: np.ndarray, k: int) -> list[tuple[int, flo
     return [(int(i), float(sims[i])) for i in idx[:k]]
 
 
+def _audit_stale_snippet(
+    fact_id: int,
+    *,
+    meta_hash: str,
+    db_hash: str,
+    source_path: str | None,
+) -> None:
+    """Record a stale-embedding drop in the WS5 hash-chained ledger.
+
+    Counter-only — sha8 correlation keys, never raw fact text. Security
+    WS5 requirement: ledger rows must contain no content, only what a
+    post-hoc auditor needs to tell *which* fact was bad. `brain doctor`
+    walks `_audit_ledger.validate()` separately; this function just
+    emits the row.
+
+    Best-effort: an import failure or disk-full swallow silently so the
+    recall path is never blocked by the audit side-effect.
+    """
+    try:
+        from brain import _audit_ledger
+        _audit_ledger.append(
+            "stale_snippet_served",
+            {
+                "fact_id": int(fact_id),
+                "meta_sha8": (meta_hash or "")[:8],
+                "db_sha8": (db_hash or "")[:8],
+                "source_path": source_path or "",
+            },
+            actor="semantic.search_facts",
+        )
+    except Exception:
+        pass
+
+
+def count_stale_fact_meta() -> dict:
+    """Return `{total, stale, orphan, ratio}` comparing .vec/facts.json
+    against the current DB.
+
+    Consumer: `brain doctor`. Stale = meta hash != db hash on a live
+    row. Orphan = meta row whose rowid is absent from the facts table
+    (already handled by the existing rowid-missing drop, but doctor
+    still counts it so the admin sees the staleness budget).
+    """
+    if not FACTS_JSON.exists():
+        return {"total": 0, "stale": 0, "orphan": 0, "ratio": 0.0}
+    try:
+        meta = json.loads(FACTS_JSON.read_text())
+    except Exception:
+        return {"total": 0, "stale": 0, "orphan": 0, "ratio": 0.0}
+    if not isinstance(meta, list) or not meta:
+        return {"total": 0, "stale": 0, "orphan": 0, "ratio": 0.0}
+    rowids = [int(m.get("rowid") or 0) for m in meta]
+    try:
+        with db.connect() as conn:
+            placeholders = ",".join("?" * len(rowids))
+            rows = conn.execute(
+                f"SELECT id, text FROM facts WHERE id IN ({placeholders})",
+                rowids,
+            ).fetchall()
+    except Exception:
+        return {"total": len(meta), "stale": 0, "orphan": 0, "ratio": 0.0}
+    text_by_id = {int(r[0]): r[1] or "" for r in rows}
+    stale = orphan = 0
+    for m in meta:
+        rid = int(m.get("rowid") or 0)
+        if rid not in text_by_id:
+            orphan += 1
+            continue
+        meta_hash = m.get("fact_hash")
+        if not meta_hash:
+            continue  # pre-guard build; neither stale nor orphan
+        if db.canonical_fact_hash(text_by_id[rid]) != meta_hash:
+            stale += 1
+    bad = stale + orphan
+    ratio = (bad / len(meta)) if meta else 0.0
+    return {
+        "total": len(meta),
+        "stale": stale,
+        "orphan": orphan,
+        "ratio": round(ratio, 4),
+    }
+
+
+def invalidate_for(entity_type: str, slug: str | None = None) -> dict:
+    """Pop `.vec` rows belonging to one entity (or an entire type).
+
+    Proactive invalidation hook for the WS3 watcher: when a note or
+    entity file changes, the DB rewrite may delete + re-insert facts,
+    but `.vec/{facts,entities}.{npy,json}` is append-only. The
+    stale-text guard in `search_facts` still catches the drift at
+    serve time, but each ghost hit burns one rerank round-trip + one
+    WS5 audit-ledger write. This function closes the gap by removing
+    the ghost rows on disk so the next `brain_recall` doesn't even
+    see them; incremental `ensure_built()` re-embeds the current DB
+    rows on the next tick.
+
+    `slug=None` → invalidate every row of `entity_type` (rare).
+    `slug=<x>` → invalidate rows for `(entity_type, x)` (common
+    watcher path). Missing vec files or any io error → {0, 0}; this
+    is cache hygiene, not a correctness boundary — the serve-time
+    guard remains the final authority.
+    """
+    facts_dropped = 0
+    entities_dropped = 0
+
+    try:
+        if FACTS_NPY.exists() and FACTS_JSON.exists():
+            vecs = np.load(FACTS_NPY)
+            meta = json.loads(FACTS_JSON.read_text())
+            if isinstance(meta, list) and meta:
+                keep_idx = []
+                for i, m in enumerate(meta):
+                    if m.get("type") != entity_type:
+                        keep_idx.append(i); continue
+                    if slug is not None and m.get("slug") != slug:
+                        keep_idx.append(i); continue
+                    facts_dropped += 1
+                if facts_dropped:
+                    new_meta = [meta[i] for i in keep_idx]
+                    new_vecs = (vecs[keep_idx] if vecs.size and vecs.shape[0] == len(meta) else vecs)
+                    _atomic_save_npy(FACTS_NPY, new_vecs.astype(np.float32))
+                    atomic_write_text(FACTS_JSON, json.dumps(new_meta))
+    except Exception:
+        pass
+
+    try:
+        if ENT_NPY.exists() and ENT_JSON.exists():
+            vecs = np.load(ENT_NPY)
+            meta = json.loads(ENT_JSON.read_text())
+            if isinstance(meta, list) and meta:
+                keep_idx = []
+                for i, m in enumerate(meta):
+                    if m.get("type") != entity_type:
+                        keep_idx.append(i); continue
+                    if slug is not None and m.get("slug") != slug:
+                        keep_idx.append(i); continue
+                    entities_dropped += 1
+                if entities_dropped:
+                    new_meta = [meta[i] for i in keep_idx]
+                    new_vecs = (vecs[keep_idx] if vecs.size and vecs.shape[0] == len(meta) else vecs)
+                    _atomic_save_npy(ENT_NPY, new_vecs.astype(np.float32))
+                    atomic_write_text(ENT_JSON, json.dumps(new_meta))
+    except Exception:
+        pass
+
+    return {"facts_dropped": facts_dropped, "entities_dropped": entities_dropped}
+
+
 def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
     """Pure-semantic fact search, with a query-time supersession filter.
 
@@ -639,19 +958,28 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
     # after the note was deleted" failure we just closed.
     rowids = [int(meta[i].get("rowid") or 0) for i, _ in hits]
     status_by_id: dict[int, str | None] = {}
+    text_by_id: dict[int, str] = {}
     db_queried_ok = False
     if rowids:
         try:
             with db.connect() as conn:
                 placeholders = ",".join("?" * len(rowids))
+                # `text` pulled alongside status so we can compute the
+                # current DB hash and compare vs the hash baked into the
+                # meta entry at embed time. Stale-embedding guard (incident
+                # 2026-04-23): a fact whose text was edited in place
+                # after indexing still had its old vector cached; without
+                # this guard cosine search happily served the ghost text.
                 rows = conn.execute(
-                    f"SELECT id, status FROM facts WHERE id IN ({placeholders})",
+                    f"SELECT id, status, text FROM facts WHERE id IN ({placeholders})",
                     rowids,
                 ).fetchall()
             status_by_id = {int(r[0]): r[1] for r in rows}
+            text_by_id = {int(r[0]): r[2] or "" for r in rows}
             db_queried_ok = True
         except Exception:
             status_by_id = {}
+            text_by_id = {}
             db_queried_ok = False
 
     out: list[dict] = []
@@ -669,6 +997,23 @@ def search_facts(query: str, k: int = 8, type: str | None = None) -> list[dict]:
                 continue
             if status_by_id[rowid] == "superseded":
                 continue
+            # Stale-text guard. `fact_hash` is attached to each meta
+            # entry at embed time (`build` / `incremental_update_...`);
+            # absent only on caches built before this guard landed —
+            # treat missing hash as "not-yet-backfilled, pass through"
+            # so first-deploy doesn't drop every hit. Full rebuild on
+            # next scheduled tick repopulates.
+            meta_hash = m.get("fact_hash")
+            if meta_hash:
+                db_hash = db.canonical_fact_hash(text_by_id.get(rowid, ""))
+                if db_hash != meta_hash:
+                    _audit_stale_snippet(
+                        rowid,
+                        meta_hash=meta_hash,
+                        db_hash=db_hash,
+                        source_path=m.get("path"),
+                    )
+                    continue
         out.append(
             {
                 "type": m["type"],
@@ -889,10 +1234,13 @@ def hybrid_search(query: str, k: int = 8, type: str | None = None) -> list[dict]
     fused.sort(key=lambda x: -x["rrf"])
 
     # WS7a subject-reject: hard filter on owner-self-reference +
-    # proper-noun queries, gated by BRAIN_SUBJECT_REJECT. When off,
-    # this is a cheap import-free no-op. When on, dropped hits leave
-    # an audit trail at ~/.brain/.audit/subject_reject.jsonl.
-    if os.environ.get("BRAIN_SUBJECT_REJECT", "0") == "1":
+    # proper-noun queries, gated by BRAIN_SUBJECT_REJECT.
+    # Default flipped to "1" on 2026-04-23 after WS1 golden-set expansion
+    # showed strict improvement (weak_hit_rate 0.000→0.400 on held-out
+    # n=20, positive metrics unchanged). Set BRAIN_SUBJECT_REJECT=0 to
+    # disable on a per-session basis. When on, dropped hits leave an
+    # audit trail at ~/.brain/.audit/subject_reject.jsonl.
+    if os.environ.get("BRAIN_SUBJECT_REJECT", "1") == "1":
         try:
             from brain import subject_reject
             hint = subject_reject.parse_query_subject(query)

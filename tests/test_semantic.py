@@ -312,6 +312,84 @@ def test_ensure_built_triggers_incremental_when_db_has_new_rows(
     assert _count_vec_rows(semantic.FACTS_NPY) == before_rows + 1
 
 
+def test_search_facts_drops_stale_text_at_query_time(
+    tmp_brain_with_db, monkeypatch
+):
+    """Stale-embedding guard (incident 2026-04-23 `Thuha ở Cần Thơ`):
+    a fact's text is mutated in the DB after embedding; the `.npy`
+    row still holds the old vector + meta. Without the fact_hash
+    guard, cosine happily serves the ghost text with high confidence
+    — exactly the "brain confidently returned wrong answer" failure."""
+    from brain import db
+    semantic.build()
+    # Mutate fact 1's text in the DB AFTER indexing. The embedding +
+    # meta for fact 1 still carry the original "alpha bravo charlie";
+    # the DB now says something completely different.
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE facts SET text='completely rewritten fact' WHERE id=1"
+        )
+
+    # Isolate the WS5 ledger to the test vault.
+    from brain import _audit_ledger
+    ledger_rows_before = 0
+    if _audit_ledger.ledger_path().exists():
+        ledger_rows_before = len(
+            _audit_ledger.ledger_path().read_text().splitlines()
+        )
+
+    results = semantic.search_facts("alpha bravo", k=8)
+    # Fact 1 must be dropped — its meta's fact_hash no longer matches
+    # db.canonical_fact_hash(current_text).
+    assert all(h["name"] != "Foo Project" for h in results), (
+        "stale-text fact resurfaced via cosine — guard failed"
+    )
+
+    # And the WS5 audit ledger gained at least one `stale_snippet_served` row.
+    lines = _audit_ledger.ledger_path().read_text().splitlines()
+    new_rows = [json.loads(l) for l in lines[ledger_rows_before:]]
+    assert any(
+        r.get("op") == "stale_snippet_served" and r.get("target", {}).get("fact_id") == 1
+        for r in new_rows
+    ), f"no stale_snippet_served audit row for fact 1: {new_rows}"
+
+
+def test_search_facts_preserves_hit_when_text_unchanged(tmp_brain_with_db):
+    """Sanity flip of the guard: fact text stays in sync with DB,
+    hit survives. Prevents an over-eager guard from regressing the
+    happy path."""
+    semantic.build()
+    results = semantic.search_facts("alpha bravo", k=8)
+    names = [h["name"] for h in results]
+    assert "Foo Project" in names
+
+
+def test_build_writes_fact_hash_to_meta(tmp_brain_with_db):
+    """build() must attach canonical_fact_hash to every fact meta —
+    without it, search_facts can't compare and the guard silently
+    passes every hit."""
+    from brain import db
+    semantic.build()
+    meta = json.loads(semantic.FACTS_JSON.read_text())
+    assert meta, "empty fact meta"
+    for m in meta:
+        assert "fact_hash" in m, f"fact_hash missing on {m}"
+        assert m["fact_hash"] == db.canonical_fact_hash(m["text"])
+
+
+def test_count_stale_fact_meta_reports_stale(tmp_brain_with_db):
+    """`brain doctor` consumer. After a DB-side text mutation, the
+    doctor's stale-ratio check must surface the drift."""
+    from brain import db
+    semantic.build()
+    with db.connect() as conn:
+        conn.execute("UPDATE facts SET text='edited in place' WHERE id=2")
+    report = semantic.count_stale_fact_meta()
+    assert report["total"] == 2
+    assert report["stale"] == 1
+    assert report["ratio"] > 0
+
+
 def test_search_facts_drops_superseded_at_query_time(tmp_brain_with_db):
     """Race condition: a fact indexed as active gets marked superseded
     between rebuilds. Without query-time filtering, cosine search keeps
@@ -371,3 +449,68 @@ def test_ensure_built_incremental_failure_swallowed(
 
     # Must not raise even though _has_new_rows is True.
     semantic.ensure_built()                        # no exception → pass
+
+
+
+# ---------------------------------------------------------------------------
+# invalidate_for — proactive cache invalidation (WS3 follow-up, 2026-04-23)
+# ---------------------------------------------------------------------------
+
+def test_invalidate_for_with_slug_pops_matching_rows(tmp_brain_with_db):
+    semantic.build()
+    before_meta = json.loads(semantic.FACTS_JSON.read_text())
+    before_vecs = np.load(semantic.FACTS_NPY)
+    assert any(m["slug"] == "foo" for m in before_meta)
+    out = semantic.invalidate_for("projects", "foo")
+    assert out["facts_dropped"] == 1
+    assert out["entities_dropped"] == 1
+    after_meta = json.loads(semantic.FACTS_JSON.read_text())
+    after_vecs = np.load(semantic.FACTS_NPY)
+    assert not any(m["slug"] == "foo" for m in after_meta)
+    assert len(after_meta) == len(before_meta) - 1
+    assert after_vecs.shape[0] == before_vecs.shape[0] - 1
+    assert any(m["slug"] == "bar" for m in after_meta)
+
+
+def test_invalidate_for_type_wide_drops_all_of_type(tmp_brain_with_db):
+    semantic.build()
+    semantic.invalidate_for("projects")
+    fact_meta = json.loads(semantic.FACTS_JSON.read_text())
+    assert not any(m["type"] == "projects" for m in fact_meta)
+    ent_meta = json.loads(semantic.ENT_JSON.read_text())
+    assert not any(m["type"] == "projects" for m in ent_meta)
+
+
+def test_invalidate_for_nonexistent_is_noop(tmp_brain_with_db):
+    semantic.build()
+    before = json.loads(semantic.FACTS_JSON.read_text())
+    out = semantic.invalidate_for("projects", "does-not-exist")
+    assert out == {"facts_dropped": 0, "entities_dropped": 0}
+    after = json.loads(semantic.FACTS_JSON.read_text())
+    assert len(after) == len(before)
+
+
+def test_invalidate_for_handles_missing_vec_files(tmp_brain_with_db):
+    out = semantic.invalidate_for("projects", "foo")
+    assert out == {"facts_dropped": 0, "entities_dropped": 0}
+
+
+def test_upsert_entity_from_file_hook_calls_invalidate_for(tmp_path, monkeypatch):
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    import brain.config as config
+    monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
+    from brain import db
+    monkeypatch.setattr(db, "DB_PATH", brain_dir / ".brain.db")
+
+    calls = []
+    monkeypatch.setattr(semantic, "invalidate_for",
+        lambda t, s=None: (calls.append((t, s)), {"facts_dropped": 0, "entities_dropped": 0})[1])
+
+    entities_dir = brain_dir / "entities" / "projects"
+    entities_dir.mkdir(parents=True)
+    ef = entities_dir / "alphabetised.md"
+    ef.write_text("---\ntype: projects\nname: Alphabetised\n---\n\n"
+                  "# Alphabetised\n\n- first fact (source: seed, 2026-04-23)\n")
+    db.upsert_entity_from_file(ef)
+    assert ("projects", "alphabetised") in calls

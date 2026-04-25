@@ -578,6 +578,19 @@ def upsert_entity_from_file(path: Path | str) -> int | None:
             "INSERT INTO fts_entity(rowid, name, aliases, summary) VALUES (?,?,?,?)",
             (entity_id, name, " ".join(aliases), summary or ""),
         )
+
+    # Proactive `.vec` invalidation (WS3 follow-up, 2026-04-23). The
+    # DB rewrite above deleted + re-inserted every fact for this
+    # entity; old facts.id values are gone but their embeddings still
+    # live in `.vec/facts.{npy,json}`. Proactive pop removes them now
+    # so the next `ensure_built()` re-embeds from the current DB rows.
+    # Best-effort: any failure stays a no-op — the serve-time guard
+    # in `semantic.search_facts` is the correctness authority.
+    try:
+        from brain import semantic
+        semantic.invalidate_for(etype, path.stem)
+    except Exception:
+        pass
     return entity_id
 
 

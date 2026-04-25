@@ -1,0 +1,25 @@
+[Unit]
+Description=Brain — WS8 consolidation worker (episodic → semantic promotion)
+Documentation=https://github.com/stephanelx88/brain-project
+After=default.target
+
+[Service]
+# One-shot worker. The accompanying .timer fires this every 30 min
+# when idle. `--respect-guard --min-level 2` makes the worker
+# self-skip when harvest / auto-extract is active — no point racing
+# the hot path.
+Type=oneshot
+ExecStart={{BRAIN_CMD}} consolidate --apply --respect-guard --min-level 2
+WorkingDirectory={{BRAIN_DIR}}
+
+# Inject BRAIN_DIR so brain.config picks up the user's chosen vault.
+# User-level systemd units don't source .bashrc/.zshrc.
+Environment="BRAIN_DIR={{BRAIN_DIR}}"
+Environment="PATH={{HOME}}/.local/bin:{{HOME}}/.pyenv/shims:/usr/local/bin:/usr/bin:/bin"
+
+StandardOutput=journal
+StandardError=journal
+
+# Consolidation is discretionary; yield to everything else.
+Nice=15
+IOSchedulingClass=idle

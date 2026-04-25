@@ -345,3 +345,92 @@ def test_no_provenance_means_no_silent_invalidation(tmp_vault):
     assert out["deleted"] == 1
     assert out["facts_invalidated"] == 0
     assert "~~" not in epath.read_text()
+
+
+# ---------------------------------------------------------------------------
+# File-type whitelist covers .txt / .markdown / .text in addition to .md
+#
+# Motivating incident 2026-04-23: user wrote `~/.brain/son.txt` containing
+# "son dang o biet thu mau xanh", queried brain → empty. Cause: filter
+# `path.suffix.lower() != ".md"` hard-skipped the file. Restricting to
+# `.md` was convention, not a technical requirement; silent-skip-on-other
+# is a trust-breaking class. The whitelist now includes the three common
+# plain-text / markdown aliases a user might reach for.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_accepts_txt_and_markdown_aliases(tmp_vault):
+    """A note written as `.txt` / `.markdown` / `.text` must be ingested,
+    not silently skipped."""
+    from brain import ingest_notes, db
+    for name, body in [
+        ("plain.txt",          "son dang o biet thu mau xanh"),
+        ("verbose.markdown",   "architect deadline moved to friday"),
+        ("unusual.text",       "meeting notes: discuss Q2 goals"),
+        # control: .md still works
+        ("normal.md",          "standard markdown note"),
+    ]:
+        (tmp_vault / name).write_text(body)
+
+    out = ingest_notes.ingest_all()
+    # ingest_all's `scanned` counts files whose content hash changed (new or
+    # edited); on first ingest of all four fresh files that's 4.
+    assert out["scanned"] == 4, f"expected all 4 extensions indexed, got {out}"
+
+    with db.connect() as c:
+        paths = {row[0] for row in c.execute("SELECT path FROM notes").fetchall()}
+    assert "plain.txt" in paths
+    assert "verbose.markdown" in paths
+    assert "unusual.text" in paths
+    assert "normal.md" in paths
+
+
+def test_ingest_rejects_unsupported_extensions(tmp_vault):
+    """Unsupported extensions remain skipped (scope protection: .log, .json
+    etc. are not user prose and should not leak into the notes index)."""
+    from brain import ingest_notes, db
+    (tmp_vault / "huge.log").write_text("lots of log lines")
+    (tmp_vault / "config.json").write_text('{"ignored": true}')
+    (tmp_vault / "kept.md").write_text("this stays")
+
+    ingest_notes.ingest_all()
+    with db.connect() as c:
+        paths = {row[0] for row in c.execute("SELECT path FROM notes").fetchall()}
+    assert "kept.md" in paths
+    assert "huge.log" not in paths
+    assert "config.json" not in paths
+
+
+
+def test_ingest_one_delete_calls_semantic_invalidate_for_touched_entities(tmp_vault, monkeypatch):
+    from brain import ingest_notes
+    calls = []
+
+    class _FakeSem:
+        @staticmethod
+        def invalidate_for(entity_type, slug=None):
+            calls.append((entity_type, slug))
+            return {"facts_dropped": 0, "entities_dropped": 0}
+        @staticmethod
+        def update_notes_via_worker(**kw): pass
+
+    monkeypatch.setattr(ingest_notes, "invalidate_facts_for_note",
+        lambda rel, verbose=False: {
+            "facts_invalidated": 2, "entities_touched": 2, "tombstones_written": 0,
+            "entity_paths": ["entities/people/thuha.md", "entities/projects/brain.md"],
+        })
+    # Both patches needed: `from brain import semantic` does
+    # `getattr(brain, 'semantic')`, so the attribute has to be
+    # replaced too — not just the sys.modules entry.
+    import sys, brain as _brain_pkg
+    monkeypatch.setitem(sys.modules, "brain.semantic", _FakeSem)
+    monkeypatch.setattr(_brain_pkg, "semantic", _FakeSem)
+
+    note = tmp_vault / "some-note.md"
+    note.write_text("seed")
+    ingest_notes.ingest_one(note)
+    note.unlink()
+    out = ingest_notes.ingest_one(note)
+    assert out["status"] == "deleted"
+    assert ("people", "thuha") in calls
+    assert ("projects", "brain") in calls
