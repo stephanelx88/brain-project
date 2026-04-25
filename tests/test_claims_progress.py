@@ -119,3 +119,22 @@ def test_progress_format_text_shows_pending_note(progress_brain):
     p = progress.extraction_progress()
     out = progress.format_text(p)
     assert "journal/2026-04-25.md" in out
+
+
+def test_brain_progress_mcp_default_returns_text_with_bar(progress_brain):
+    from brain import mcp_server
+    _seed_note(progress_brain, "a.md", sha="aaa", extracted_sha=None)
+    out = mcp_server.brain_progress()
+    assert "Extracting knowledge" in out
+    assert "[" in out and "]" in out  # progress bar brackets
+    assert "throughput" in out.lower()
+
+
+def test_brain_progress_mcp_json_format(progress_brain):
+    import json as _json
+    from brain import mcp_server
+    _seed_note(progress_brain, "a.md", sha="aaa", extracted_sha=None)
+    out = mcp_server.brain_progress(format="json")
+    parsed = _json.loads(out)
+    assert parsed["section"] == "Extraction progress"
+    assert "notes_progress_percent" in parsed

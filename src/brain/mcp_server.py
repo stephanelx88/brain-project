@@ -1503,16 +1503,23 @@ def brain_graph_neighbors(
 
 
 @mcp.tool()
-def brain_progress() -> str:
-    """Extraction pipeline progress: notes pending/done, last-hour throughput,
+def brain_progress(format: str = "text") -> str:
+    """Extraction pipeline progress: notes-progress bar, last-hour throughput,
     backlog, currently-extracting indicator, GREEN/YELLOW/RED health.
 
-    Returns JSON envelope from `brain.claims.progress.extraction_progress()`.
+    Args:
+      format: "text" (default) — return the human-readable block with
+              the ASCII progress bar; agent should print verbatim
+              without summarising. "json" — return the raw dict for
+              programmatic consumption.
+
     Use this to answer "is brain keeping up with my notes?".
     """
     from brain.claims import progress as _progress
-    return json.dumps(_progress.extraction_progress(),
-                      ensure_ascii=False, indent=2)
+    p = _progress.extraction_progress()
+    if (format or "").lower() == "json":
+        return json.dumps(p, ensure_ascii=False, indent=2)
+    return _progress.format_text(p)
 
 
 @mcp.resource("brain://identity")
