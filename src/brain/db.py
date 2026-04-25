@@ -763,6 +763,30 @@ def list_note_ledger() -> dict[str, tuple[float, str]]:
     return {p: (m, s) for p, m, s in rows}
 
 
+def _note_exclusion_clauses(
+    exclude_prefixes: tuple[str, ...],
+    exclude_paths: tuple[str, ...],
+) -> tuple[list[str], list]:
+    """Build WHERE fragments for notes the extractor will not touch.
+
+    Single source of truth for the exclusion filter: any caller that
+    asks "what notes count as extractable?" — the extractor's queue
+    AND the progress reporter — must agree. Drift between the two
+    surfaces a permanently-stuck progress bar (incident 2026-04-25:
+    `log.md`, `identity/*.md` excluded by extractor but counted
+    pending by `_notes_progress`).
+    """
+    where: list[str] = []
+    params: list = []
+    for prefix in exclude_prefixes:
+        where.append("path NOT LIKE ?")
+        params.append(prefix.rstrip("/") + "/%")
+    for p in exclude_paths:
+        where.append("path != ?")
+        params.append(p)
+    return where, params
+
+
 def pending_note_extractions(
     limit: int = 50,
     min_body_chars: int = 0,
@@ -781,14 +805,9 @@ def pending_note_extractions(
     to the extractor (playground/, timeline/, log.md, etc.). Filtered
     in SQL so we never read those bodies into Python.
     """
-    where = ["(extracted_sha IS NULL OR extracted_sha != sha)"]
-    params: list = []
-    for prefix in exclude_prefixes:
-        where.append("path NOT LIKE ?")
-        params.append(prefix.rstrip("/") + "/%")
-    for p in exclude_paths:
-        where.append("path != ?")
-        params.append(p)
+    excl_where, excl_params = _note_exclusion_clauses(exclude_prefixes, exclude_paths)
+    where = ["(extracted_sha IS NULL OR extracted_sha != sha)", *excl_where]
+    params: list = list(excl_params)
     sql = (
         "SELECT path, title, body, sha, mtime, extracted_sha FROM notes "
         f"WHERE {' AND '.join(where)} "
@@ -807,6 +826,46 @@ def pending_note_extractions(
             "extracted_sha": prev_sha,  # None = first extraction; non-None = edit
         })
     return out
+
+
+def note_extraction_counts(
+    exclude_prefixes: tuple[str, ...] = (),
+    exclude_paths: tuple[str, ...] = (),
+) -> tuple[int, int, int, str | None]:
+    """Counts for `brain_progress` that match the extractor's queue.
+
+    Returns (total, extracted, pending, newest_pending_path). Applies
+    the SAME exclusion filter as `pending_note_extractions`, so a
+    file the extractor refuses to touch (auto-managed, identity/, …)
+    is not counted as "pending" — otherwise the progress bar can
+    never reach 100%.
+    """
+    excl_where, excl_params = _note_exclusion_clauses(exclude_prefixes, exclude_paths)
+    where_sql = (" WHERE " + " AND ".join(excl_where)) if excl_where else ""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN extracted_sha = sha THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN extracted_sha IS NULL OR extracted_sha != sha "
+            "         THEN 1 ELSE 0 END) "
+            f"FROM notes{where_sql}",
+            excl_params,
+        ).fetchone()
+        total = (row[0] or 0) if row else 0
+        extracted = (row[1] or 0) if row else 0
+        pending = (row[2] or 0) if row else 0
+        newest_pending: str | None = None
+        if pending:
+            pending_where = ["(extracted_sha IS NULL OR extracted_sha != sha)", *excl_where]
+            pr = conn.execute(
+                "SELECT path FROM notes "
+                f"WHERE {' AND '.join(pending_where)} "
+                "ORDER BY mtime DESC LIMIT 1",
+                excl_params,
+            ).fetchone()
+            if pr:
+                newest_pending = pr[0]
+        return total, extracted, pending, newest_pending
 
 
 def mark_note_extracted(rel_path: str, sha: str) -> None:

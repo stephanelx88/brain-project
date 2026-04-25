@@ -58,33 +58,13 @@ LLM_TIMEOUT_SEC = 120
 
 # Note extraction targets *user-authored* notes only. The brain itself
 # writes into playground/, timeline/, identity/corrections.md, log.md,
-# research-log.md — those are derivatives, never sources. Sending them
-# back through extraction would produce echo facts and hide the actual
-# user signal. Keep this list tight; new auto-managed dirs go here.
-EXCLUDED_DIR_PREFIXES: tuple[str, ...] = (
-    "playground",
-    "timeline",
-    "identity",
-    "chats",
-    "logs",
-    "_archive",
-)
-EXCLUDED_PATHS: tuple[str, ...] = (
-    "log.md",
-    "index.md",
-    "research-log.md",
-    "recall-ledger.jsonl",
-    "README.md",
-    # System-managed files rendered by bin/install.sh into the vault root.
-    # These are documentation/config, NOT user-typed facts. Sending them
-    # to the LLM produces hallucinated facts: e.g. cursor-user-rules.md
-    # contains the example "đôi dép tôi đâu?" → the LLM extracted that as
-    # a real fact "Son's slippers are in the bedroom" (incident 2026-04-21).
-    # If install.sh starts rendering more files into the vault root, add
-    # them here — the rule is "if a script writes it, exclude it".
-    "cursor-user-rules.md",
-    "program.md",
-    "eval-queries.md",
+# research-log.md — those are derivatives, never sources. The actual
+# lists live in brain.config so the progress reporter can apply the
+# same filter without importing from this module (claims layer must
+# not depend on extractor layer). Re-exported here for back-compat.
+from brain.config import (
+    NOTE_EXTRACT_EXCLUDED_DIR_PREFIXES as EXCLUDED_DIR_PREFIXES,
+    NOTE_EXTRACT_EXCLUDED_PATHS as EXCLUDED_PATHS,
 )
 
 

@@ -79,6 +79,33 @@ def test_progress_counts_notes(progress_brain):
     assert p["notes_progress_percent"] == 50.0
 
 
+def test_progress_excludes_extractor_skipped_paths(progress_brain):
+    """Files the extractor refuses to touch must not be counted as pending.
+
+    Regression: `_notes_progress` used to query `notes` directly without
+    applying the same EXCLUDED_DIR_PREFIXES / EXCLUDED_PATHS filter that
+    `pending_note_extractions` uses → the progress bar got stuck below
+    100% with `log.md`, `identity/*.md`, etc. permanently in the
+    "pending" bucket (incident 2026-04-25).
+    """
+    # 1 real pending user note
+    _seed_note(progress_brain, "real-pending.md", sha="r1", extracted_sha=None)
+    # Files the extractor will never process — must not inflate the count
+    _seed_note(progress_brain, "log.md", sha="l1", extracted_sha=None)
+    _seed_note(progress_brain, "index.md", sha="i1", extracted_sha=None)
+    _seed_note(progress_brain, "cursor-user-rules.md", sha="c1", extracted_sha=None)
+    _seed_note(progress_brain, "identity/who-i-am.md", sha="w1", extracted_sha=None)
+    _seed_note(progress_brain, "identity/preferences.md", sha="p1", extracted_sha=None)
+    _seed_note(progress_brain, "playground/scratch.md", sha="s1", extracted_sha=None)
+    _seed_note(progress_brain, "timeline/2026-04-25.md", sha="t1", extracted_sha=None)
+
+    p = progress.extraction_progress()
+    assert p["notes_total"] == 1
+    assert p["notes_pending"] == 1
+    assert p["notes_extracted"] == 0
+    assert p["backlog"]["last_pending_note"] == "real-pending.md"
+
+
 def test_progress_throughput_window(progress_brain):
     _seed_entity_and_claim("recent claim", observed_offset=-100.0)  # 100s ago
     _seed_entity_and_claim("older claim", observed_offset=-7200.0)  # 2h ago

@@ -77,29 +77,18 @@ def extraction_progress() -> dict:
 
 
 def _notes_progress() -> tuple[int, int, int, Optional[str]]:
-    """Return (total, extracted, pending, newest_pending_path)."""
+    """Return (total, extracted, pending, newest_pending_path).
+
+    Mirrors the extractor's own exclusion list — if a file is in
+    `EXCLUDED_DIR_PREFIXES` / `EXCLUDED_PATHS` it will never be
+    processed, so it must not show up as "pending" in the progress
+    bar (otherwise the bar can never reach 100%).
+    """
     try:
-        with db.connect() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*), "
-                "SUM(CASE WHEN extracted_sha = sha THEN 1 ELSE 0 END), "
-                "SUM(CASE WHEN extracted_sha IS NULL OR extracted_sha != sha "
-                "         THEN 1 ELSE 0 END) "
-                "FROM notes"
-            ).fetchone()
-            total = (row[0] or 0) if row else 0
-            extracted = (row[1] or 0) if row else 0
-            pending = (row[2] or 0) if row else 0
-            newest_pending = None
-            if pending:
-                pr = conn.execute(
-                    "SELECT path FROM notes "
-                    "WHERE extracted_sha IS NULL OR extracted_sha != sha "
-                    "ORDER BY mtime DESC LIMIT 1"
-                ).fetchone()
-                if pr:
-                    newest_pending = pr[0]
-            return total, extracted, pending, newest_pending
+        return db.note_extraction_counts(
+            exclude_prefixes=config.NOTE_EXTRACT_EXCLUDED_DIR_PREFIXES,
+            exclude_paths=config.NOTE_EXTRACT_EXCLUDED_PATHS,
+        )
     except Exception:  # noqa: BLE001
         return 0, 0, 0, None
 
