@@ -57,6 +57,8 @@ READ_TOOLS: tuple[str, ...] = (
     "brain_learning_gaps",
     "brain_failure_list",
     "brain_tombstones",
+    "brain_inbox",
+    "brain_progress",
 )
 
 

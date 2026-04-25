@@ -491,6 +491,53 @@ def inbox_health() -> dict:
     }
 
 
+def claims_health() -> dict:
+    """Doctor check for the claim store (knowledge layer).
+
+    Reports whether claim flags are set, claim counts by status, age
+    of newest claim (proxy for extraction pipeline health), and the
+    effective extract idle threshold.
+    """
+    use = os.environ.get("BRAIN_USE_CLAIMS", "0") == "1"
+    strict = os.environ.get("BRAIN_STRICT_CLAIMS", "0") == "1"
+    try:
+        idle = int(os.environ.get("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", "20"))
+    except (ValueError, TypeError):
+        idle = 20
+
+    total = current = superseded = 0
+    newest_age: float | None = None
+    try:
+        from brain import db as _db
+        with _db.connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*), "
+                "SUM(CASE WHEN status='current' THEN 1 ELSE 0 END), "
+                "SUM(CASE WHEN status='superseded' THEN 1 ELSE 0 END), "
+                "MAX(observed_at) "
+                "FROM fact_claims"
+            ).fetchone()
+            if row:
+                total = row[0] or 0
+                current = row[1] or 0
+                superseded = row[2] or 0
+                if row[3]:
+                    newest_age = max(0.0, time.time() - float(row[3]))
+    except Exception:  # noqa: BLE001 — best-effort doctor read
+        pass
+
+    return {
+        "section": "Claims (knowledge layer)",
+        "use_claims": use,
+        "strict_mode": strict,
+        "fact_claims_total": total,
+        "fact_claims_current": current,
+        "fact_claims_superseded": superseded,
+        "newest_claim_age_sec": newest_age,
+        "extract_idle_threshold_sec": idle,
+    }
+
+
 def gather() -> StatusReport:
     sched = scheduler.get_status()
     in_flight = _in_flight()

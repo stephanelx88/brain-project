@@ -49,6 +49,18 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return subprocess.call(["bash", str(sh)])
 
 
+def _cmd_progress(args: argparse.Namespace) -> int:
+    """`brain progress` — show extraction pipeline progress + health."""
+    from brain.claims import progress as _progress
+    p = _progress.extraction_progress()
+    if getattr(args, "json", False):
+        import json as _json
+        print(_json.dumps(p, indent=2, ensure_ascii=False))
+    else:
+        print(_progress.format_text(p))
+    return 0
+
+
 def _cmd_config(args: argparse.Namespace) -> int:
     cfg = config.BRAIN_DIR / "brain-config.yaml"
     if not cfg.exists():
@@ -248,6 +260,11 @@ def main(argv: list[str] | None = None) -> int:
     p_status.set_defaults(func=_cmd_status)
     sub.add_parser("doctor", help="Diagnostics (bin/doctor.sh)").set_defaults(func=_cmd_doctor)
     sub.add_parser("config", help="Print brain-config.yaml").set_defaults(func=_cmd_config)
+
+    p_prog = sub.add_parser("progress", help="Extraction pipeline progress + health")
+    p_prog.add_argument("--json", action="store_true",
+                         help="Emit JSON instead of the text progress block")
+    p_prog.set_defaults(func=_cmd_progress)
 
     # `brain failure {record,list,resolve}` — structured failure ledger.
     # Substrate only; consumers (extraction DLQ, drift detector, ...) ship

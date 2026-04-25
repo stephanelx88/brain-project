@@ -366,3 +366,58 @@ def test_inbox_health_detects_hook_wired(tmp_path, monkeypatch):
     }))
     out = status.inbox_health()
     assert out["user_prompt_submit_hook_wired"] is True
+
+
+# ─── Claim layer health ──────────────────────────────────────────
+
+
+def test_claims_health_default_off(tmp_path, monkeypatch):
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    import brain.config as config
+    monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
+    from brain import db
+    monkeypatch.setattr(db, "DB_PATH", brain_dir / ".brain.db")
+    monkeypatch.delenv("BRAIN_USE_CLAIMS", raising=False)
+    monkeypatch.delenv("BRAIN_STRICT_CLAIMS", raising=False)
+    out = status.claims_health()
+    assert "Claims" in out["section"]
+    assert out["use_claims"] is False
+    assert out["strict_mode"] is False
+
+
+def test_claims_health_counts_claims(tmp_path, monkeypatch):
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    import brain.config as config
+    monkeypatch.setattr(config, "BRAIN_DIR", brain_dir)
+    from brain import db
+    monkeypatch.setattr(db, "DB_PATH", brain_dir / ".brain.db")
+    monkeypatch.setenv("BRAIN_USE_CLAIMS", "1")
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO entities (path, type, slug, name, summary) VALUES (?,?,?,?,?)",
+            ("entities/people/son.md", "people", "son", "Son", "owner"),
+        )
+        son_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db._insert_fact_claim(
+            conn, entity_id=son_id, subject_slug="son",
+            text="son in long xuyen",
+            source="note:foo.md", fact_date=None, status="current",
+        )
+        db._insert_fact_claim(
+            conn, entity_id=son_id, subject_slug="son",
+            text="son was in saigon",
+            source="note:foo.md", fact_date=None, status="superseded",
+        )
+    out = status.claims_health()
+    assert out["use_claims"] is True
+    assert out["fact_claims_total"] == 2
+    assert out["fact_claims_current"] == 1
+    assert out["fact_claims_superseded"] == 1
+
+
+def test_claims_health_extract_idle_threshold(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", "30")
+    out = status.claims_health()
+    assert out["extract_idle_threshold_sec"] == 30

@@ -3,9 +3,15 @@
 Clearance levels (all listed conditions must hold):
   0  always                                              harvest, WatchPaths
   1  CPU < 60% + MEM < 90%                               note_extract, index rebuild
-  2  CPU < 40% + MEM < 80% + idle 60s                    LLM extract, reconcile
+  2  CPU < 40% + MEM < 80% + idle 20s                    LLM extract, reconcile
   3  CPU < 20% + MEM < 70% + idle 180s + AC              dedupe
   4  CPU < 15% + MEM < 60% + idle 300s + AC + screen idle  backfill, revalidate
+
+Level 2 idle threshold lowered from 60s to 20s on 2026-04-25 to
+reduce note→claim extraction lag for the strict-mode claim store
+(see docs/claim-lattice-strict-design.md). Users can raise back via
+`BRAIN_RG_IDLE_L2=60` if their machine struggles with more frequent
+LLM extracts.
 
 CLI usage:
   python -m brain.resource_guard            # prints level (0-4)
@@ -40,7 +46,15 @@ _MEM_L2 = float(os.environ.get("BRAIN_RG_MEM_L2", "80"))
 _MEM_L3 = float(os.environ.get("BRAIN_RG_MEM_L3", "70"))
 _MEM_L4 = float(os.environ.get("BRAIN_RG_MEM_L4", "60"))
 
-_IDLE_L2 = float(os.environ.get("BRAIN_RG_IDLE_L2", "60"))    # seconds
+# Level 2 idle: 20s default (was 60s pre-2026-04-25). Lowered to
+# reduce note→claim extraction lag for strict-mode claim store. Floor
+# at 5s to prevent runaway re-extraction. Aliases:
+#   BRAIN_RG_IDLE_L2              — primary
+#   BRAIN_EXTRACT_IDLE_LEVEL2_SEC — discoverable alias (claims doctor uses this name)
+_IDLE_L2 = max(5.0, float(
+    os.environ.get("BRAIN_EXTRACT_IDLE_LEVEL2_SEC")
+    or os.environ.get("BRAIN_RG_IDLE_L2", "20")
+))
 _IDLE_L3 = float(os.environ.get("BRAIN_RG_IDLE_L3", "180"))
 _IDLE_L4 = float(os.environ.get("BRAIN_RG_IDLE_L4", "300"))
 
