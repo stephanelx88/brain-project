@@ -77,6 +77,7 @@ class StatusReport:
     vault: dict
     coverage: dict = field(default_factory=dict)
     live_coverage: dict = field(default_factory=dict)
+    claims: dict = field(default_factory=dict)
 
     # Back-compat alias: older clients (older MCP consumers, earlier
     # test fixtures) read `launchd`. Field aliasing doesn't survive
@@ -555,6 +556,7 @@ def gather() -> StatusReport:
         vault=_vault_counts(),
         coverage=_coverage(),
         live_coverage=_live_coverage(),
+        claims=claims_health(),
     )
 
 
@@ -655,6 +657,24 @@ def format_text(report: StatusReport) -> str:
     else:
         live_line = None  # hidden until the MCP has logged real calls
 
+    CL = report.claims or {}
+    if CL:
+        flags = (f"use={'on' if CL.get('use_claims') else 'off'} · "
+                 f"strict={'on' if CL.get('strict_mode') else 'off'}")
+        counts = (f"{CL.get('fact_claims_total', 0)} total "
+                  f"({CL.get('fact_claims_current', 0)} current, "
+                  f"{CL.get('fact_claims_superseded', 0)} superseded)")
+        age = CL.get("newest_claim_age_sec")
+        if age is None:
+            age_str = "no claims yet"
+        else:
+            age_str = f"newest {_delta_str(age)} ago"
+            if age > 600:
+                age_str += " ⚠ extraction stalled"
+        claims_line = f"{flags} · {counts} · {age_str}"
+    else:
+        claims_line = None
+
     lines = [
         "🧠 Brain status",
         f"  vault       : {report.brain_dir}",
@@ -669,6 +689,8 @@ def format_text(report: StatusReport) -> str:
     ]
     if live_line is not None:
         lines.append(f"  live recall : {live_line}")
+    if claims_line is not None:
+        lines.append(f"  Claims      : {claims_line}")
     lines.extend([
         f"  audit       : {audit_line}",
         f"  vault stats : {V['entities_total']} entities across "
