@@ -165,6 +165,86 @@ def test_client_uses_worker(tmp_worker, monkeypatch):
     assert res.get("changed") == 1
 
 
+def test_incremental_facts_entities_op_calls_helper(tmp_worker, monkeypatch):
+    """The new op must invoke semantic.incremental_update_facts_entities()
+    inside the warm worker (not full build) — that's the whole point."""
+    calls = {"n": 0}
+
+    def fake_inc():
+        calls["n"] += 1
+        return {"facts_added": 2, "entities_added": 1, "incremental": True}
+
+    monkeypatch.setattr(
+        semantic, "incremental_update_facts_entities", fake_inc
+    )
+
+    r = _request(tmp_worker, {"op": "incremental_facts_entities"})
+    assert r["ok"] is True
+    assert calls["n"] == 1
+    assert r["facts_added"] == 2
+    assert r["entities_added"] == 1
+    assert r["incremental"] is True
+    assert "took_ms" in r
+
+
+def test_update_facts_entities_via_worker_uses_socket(tmp_worker, monkeypatch):
+    """The high-level helper must round-trip through the worker socket and
+    surface `via_worker: True` so callers / tests can prove the warm path
+    actually ran."""
+    monkeypatch.setattr(semantic, "_worker_socket_path", lambda: tmp_worker)
+    monkeypatch.setattr(
+        semantic,
+        "incremental_update_facts_entities",
+        lambda: {"facts_added": 5, "entities_added": 3, "incremental": True},
+    )
+    res = semantic.update_facts_entities_via_worker()
+    assert res.get("via_worker") is True
+    assert res.get("facts_added") == 5
+    assert res.get("entities_added") == 3
+
+
+def test_update_facts_entities_via_worker_falls_back(tmp_path, monkeypatch):
+    """When the worker socket is absent the helper must silently fall back
+    to in-process incremental — never raise into the extract pipeline."""
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    monkeypatch.setattr(
+        semantic, "_worker_socket_path",
+        lambda: brain_dir / "no-such.sock",
+    )
+
+    fallback_called = {"n": 0}
+
+    def fake_inc():
+        fallback_called["n"] += 1
+        return {"facts_added": 0, "entities_added": 0, "incremental": True}
+
+    monkeypatch.setattr(
+        semantic, "incremental_update_facts_entities", fake_inc
+    )
+
+    res = semantic.update_facts_entities_via_worker()
+    assert fallback_called["n"] == 1
+    assert res.get("via_worker") is not True
+    assert res.get("incremental") is True
+
+
+def test_update_facts_via_worker_alias_delegates(tmp_worker, monkeypatch):
+    """`update_facts_via_worker` and `update_entities_via_worker` are sugar
+    that delegate to the unified helper — verify they both round-trip
+    through the same single socket call."""
+    monkeypatch.setattr(semantic, "_worker_socket_path", lambda: tmp_worker)
+    monkeypatch.setattr(
+        semantic,
+        "incremental_update_facts_entities",
+        lambda: {"facts_added": 1, "entities_added": 1, "incremental": True},
+    )
+    r1 = semantic.update_facts_via_worker()
+    r2 = semantic.update_entities_via_worker()
+    assert r1.get("via_worker") is True
+    assert r2.get("via_worker") is True
+
+
 def test_client_falls_back_when_socket_missing(tmp_path, monkeypatch):
     brain_dir = tmp_path / "brain"
     brain_dir.mkdir()

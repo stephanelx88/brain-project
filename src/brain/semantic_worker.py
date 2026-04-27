@@ -16,7 +16,15 @@ Protocol — newline-delimited JSON, one request → one reply:
   {"op":"ping"}                                      {"ok":true,"pid":N,"model_warm":bool}
   {"op":"upsert_notes","items":[{path,title,body}]}  {"ok":true,"changed":N,"took_ms":M}
   {"op":"delete_notes","paths":["a.md","b.md"]}      {"ok":true,"deleted":N,"took_ms":M}
+  {"op":"incremental_facts_entities"}                {"ok":true,"facts_added":N,
+                                                      "entities_added":M,"took_ms":T}
   {"op":"shutdown"}                                  {"ok":true,"shutting_down":true}
+
+The `incremental_facts_entities` op is what auto_extract / note_extract /
+promote want post-write: the warm worker reads the DB high-water mark, embeds
+only newly-added facts/entities, and appends them to .vec/{facts,entities}.npy.
+Without this op those callers paid ~10 s cold-load + ~1.6 s full rebuild on
+every batch — the worker was warming the model only for the notes path.
 
 Failure modes the client must handle (see semantic.update_notes_via_worker):
   - socket missing  → worker not running → fall back in-process
@@ -113,6 +121,22 @@ class _Handler(socketserver.StreamRequestHandler):
             took_ms = int((time.time() - t0) * 1000)
             print(f"delete {len(paths)} paths took {took_ms}ms",
                   file=sys.stderr, flush=True)
+            return {"ok": True, "took_ms": took_ms, **res}
+        if op == "incremental_facts_entities":
+            # Warm-model fast path for the post-extract pipeline. The
+            # underlying helper reads the DB, finds rows past the last
+            # high-water mark, embeds them, appends to .vec/{facts,
+            # entities}.npy. Held under _INDEX_LOCK because it does a
+            # read-modify-write of the same on-disk arrays a concurrent
+            # upsert_notes call would touch (meta.json, npy bundle).
+            t0 = time.time()
+            with _INDEX_LOCK:
+                res = semantic.incremental_update_facts_entities()
+            took_ms = int((time.time() - t0) * 1000)
+            print(
+                f"incremental_facts_entities took {took_ms}ms: {res}",
+                file=sys.stderr, flush=True,
+            )
             return {"ok": True, "took_ms": took_ms, **res}
         if op == "shutdown":
             return {"ok": True, "shutting_down": True}

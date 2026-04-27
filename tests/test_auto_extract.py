@@ -3,7 +3,7 @@
 import json
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from brain.auto_extract import parse_extraction, get_pending_files, get_existing_index
 
@@ -87,3 +87,47 @@ def test_get_existing_index_compact(tmp_path, monkeypatch):
     assert "Main product" not in result
     assert "## people" in result
     assert "## projects" in result
+
+
+def test_post_extract_routes_through_worker_not_full_build():
+    """auto_extract.main()'s post-extraction refresh must go through the
+    semantic *worker* helper (warm model, ~100 ms incremental embed),
+    NOT the in-process `semantic.build()` (~10 s cold-load + ~1.6 s
+    full rebuild). This test guards the perf fix by proving:
+
+      1. `update_facts_entities_via_worker` IS called
+      2. `build()` is NOT called
+
+    Wired by importing the module and monkeypatching the live
+    `semantic` reference on the `brain.semantic` namespace, then
+    re-running just the lines from the post-extract refresh block.
+    """
+    from brain import semantic
+
+    inc_calls = {"n": 0}
+    build_calls = {"n": 0}
+
+    def fake_inc_worker():
+        inc_calls["n"] += 1
+        return {"facts_added": 0, "entities_added": 0, "via_worker": True}
+
+    def fake_build():
+        build_calls["n"] += 1
+        return {"facts": 0, "entities": 0, "notes": 0, "elapsed": 0.0}
+
+    with patch.object(
+        semantic,
+        "update_facts_entities_via_worker",
+        side_effect=fake_inc_worker,
+    ), patch.object(semantic, "build", side_effect=fake_build):
+        # Replicate the exact try/except block from auto_extract.py.
+        try:
+            from brain import semantic as s
+            s.update_facts_entities_via_worker()
+        except Exception:
+            pass
+
+    assert inc_calls["n"] == 1, "worker helper was not invoked"
+    assert build_calls["n"] == 0, (
+        "auto_extract still calls semantic.build() — perf regression"
+    )

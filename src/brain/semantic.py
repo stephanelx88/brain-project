@@ -639,6 +639,73 @@ def update_notes_via_worker(
                 pass
 
 
+def update_facts_entities_via_worker(
+    *,
+    connect_timeout: float = 0.5,
+    request_timeout: float = 60.0,
+) -> dict:
+    """Hand a post-extract refresh to the persistent semantic worker.
+
+    The worker holds the sentence-transformers model warm; without this
+    helper, every auto_extract batch paid ~10 s cold-load + ~1.6 s full
+    rebuild = ~11.5 s wasted per run. The worker reads the DB-side
+    high-water mark and embeds only freshly-added facts/entities.
+
+    Falls back to the in-process `incremental_update_facts_entities()`
+    on any failure (socket missing, worker dead, timeout, malformed
+    reply). The fallback path pays ~10 s cold-start exactly once on a
+    fresh process — no worse than the pre-worker baseline.
+
+    Returns a dict shaped like `incremental_update_facts_entities()`
+    plus a `via_worker` flag so callers / tests can tell which path
+    ran.
+    """
+    sock_path = _worker_socket_path()
+    if not sock_path.exists():
+        return incremental_update_facts_entities()
+
+    s = None
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(connect_timeout)
+        s.connect(str(sock_path))
+        s.settimeout(request_timeout)
+
+        req = {"op": "incremental_facts_entities"}
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
+        r = _readline_json(s)
+        if not r.get("ok"):
+            raise RuntimeError(r.get("error", "worker error on incremental"))
+        # Strip the bookkeeping `ok`/`took_ms` keys before returning so
+        # the dict shape matches in-process incremental output, plus the
+        # `via_worker` flag.
+        out = {k: v for k, v in r.items() if k not in ("ok", "took_ms")}
+        out["via_worker"] = True
+        return out
+    except Exception:
+        return incremental_update_facts_entities()
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
+# Aliases keep the call-site idiom readable when extract code wants to
+# express "just refresh facts" or "just refresh entities" — the underlying
+# incremental helper always handles both, so both aliases delegate to the
+# same single round-trip rather than firing two socket calls.
+def update_facts_via_worker(**kwargs) -> dict:
+    """Refresh fact embeddings via the warm worker (alias)."""
+    return update_facts_entities_via_worker(**kwargs)
+
+
+def update_entities_via_worker(**kwargs) -> dict:
+    """Refresh entity embeddings via the warm worker (alias)."""
+    return update_facts_entities_via_worker(**kwargs)
+
+
 def _is_stale(threshold_seconds: float = 6 * 3600) -> bool:
     if not META_JSON.exists():
         return True
