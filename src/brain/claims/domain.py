@@ -34,10 +34,16 @@ class Claim:
 
 @dataclass(frozen=True)
 class ClaimHit:
-    """Recall hit for claim-mode reads. Mirrors brain_recall envelope."""
+    """Recall hit for claim-mode reads. Mirrors brain_recall envelope.
+
+    Per docs/claim-lattice-strict-design.md §3.3 the hit shape is
+    `{kind, path, text, name?, entity_summary?}` — `entity_summary`
+    emits only on the FIRST hit per entity (suppressed on duplicates).
+    """
     path: str
     text: str
     name: str | None
     score: float
     claim_id: int
+    entity_summary: str | None = None
     kind: str = "claim"

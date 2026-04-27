@@ -682,6 +682,11 @@ def _recall_strict_claims(query: str, k: int, verbose: bool) -> str:
             "name": h.name,
             "claim_id": h.claim_id,
         }
+        # Spec §3.3: include entity_summary on the first hit per
+        # entity (suppression already applied upstream by
+        # claims.read.search_text — formatter just passes through).
+        if h.entity_summary:
+            item["entity_summary"] = h.entity_summary
         if verbose:
             item["score"] = h.score
         formatted_hits.append(item)
@@ -1559,6 +1564,28 @@ def _live_uuids() -> set[str]:
     return {row["session_id"] for row in _ls.list_live_sessions(include_self=True)}
 
 
+def _detect_source_for_uuid(uuid: str) -> str:
+    """Pick `claude` vs `cursor` for short-id derivation.
+
+    Heuristic order:
+      1. `cursor:<UUIDv4>` prefix → cursor (no PID mapping available
+         on Cursor, so we use the first 8 chars of the UUID portion).
+      2. `~/.claude/sessions/<ppid>.json` exists → claude.
+      3. Default → claude (legacy fallback so existing sessions keep
+         their PID-based short id).
+    """
+    if (uuid or "").startswith("cursor:"):
+        return "cursor"
+    try:
+        from pathlib import Path
+        ppid = os.getppid()
+        if (Path.home() / ".claude" / "sessions" / f"{ppid}.json").exists():
+            return "claude"
+    except OSError:
+        pass
+    return "claude"
+
+
 def _ensure_self_registered(uuid: str) -> None:
     """Lazy-create a default-name registry entry for `uuid` on first use."""
     from brain.runtime import names as _names
@@ -1566,7 +1593,8 @@ def _ensure_self_registered(uuid: str) -> None:
     if _names.get(uuid):
         return
     project = _caller_project_for_uuid(uuid)
-    short = _sid.short_id_for_default_name(uuid, source="claude")
+    source = _detect_source_for_uuid(uuid)
+    short = _sid.short_id_for_default_name(uuid, source=source)
     _names.register(
         uuid=uuid,
         name=_names.default_name(project, short),
@@ -1685,7 +1713,20 @@ def brain_inbox(unread_only: bool = True, limit: int = 50,
     listed = listed[: max(1, min(int(limit), 500))]
 
     if mark_read and pending:
-        _inbox.mark_delivered(own, [m["id"] for m in pending])
+        # Only mark the LISTED slice as delivered. Previous code passed
+        # the full `pending` list, so brain_inbox(mark_read=True,
+        # limit=N) silently moved every pending message to delivered/
+        # even though the caller only saw N — a data-loss bug when N
+        # was small relative to queue depth. Intersect listed ∩ pending
+        # by id so we never try to re-mark already-delivered envelopes
+        # when unread_only=False.
+        pending_ids = {m["id"] for m in pending}
+        to_mark = [m["id"] for m in listed if m["id"] in pending_ids]
+        if to_mark:
+            _inbox.mark_delivered(own, to_mark)
+            # Recompute counts so they reflect the post-mark state.
+            pending = _inbox.list_pending(own)
+            delivered = _inbox.list_delivered(own)
 
     return json.dumps({
         "ok": True,
