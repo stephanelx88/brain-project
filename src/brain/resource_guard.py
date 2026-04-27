@@ -51,10 +51,33 @@ _MEM_L4 = float(os.environ.get("BRAIN_RG_MEM_L4", "60"))
 # at 5s to prevent runaway re-extraction. Aliases:
 #   BRAIN_RG_IDLE_L2              — primary
 #   BRAIN_EXTRACT_IDLE_LEVEL2_SEC — discoverable alias (claims doctor uses this name)
-_IDLE_L2 = max(5.0, float(
-    os.environ.get("BRAIN_EXTRACT_IDLE_LEVEL2_SEC")
-    or os.environ.get("BRAIN_RG_IDLE_L2", "20")
-))
+#
+# Read on each call (not at import time) so a malformed env value
+# (e.g. BRAIN_RG_IDLE_L2="60s") doesn't raise ValueError at import
+# and cascade through every importer. Falls back to 20.0 on parse
+# failure with a quiet log.
+_IDLE_L2_DEFAULT = 20.0
+_IDLE_L2_FLOOR = 5.0
+
+
+def _idle_l2() -> float:
+    raw = (
+        os.environ.get("BRAIN_EXTRACT_IDLE_LEVEL2_SEC")
+        or os.environ.get("BRAIN_RG_IDLE_L2")
+    )
+    if raw is None:
+        return _IDLE_L2_DEFAULT
+    try:
+        return max(_IDLE_L2_FLOOR, float(raw))
+    except ValueError:
+        import logging
+        logging.getLogger(__name__).warning(
+            "resource_guard: ignoring non-numeric idle-L2 env value %r; "
+            "falling back to %.1fs", raw, _IDLE_L2_DEFAULT,
+        )
+        return _IDLE_L2_DEFAULT
+
+
 _IDLE_L3 = float(os.environ.get("BRAIN_RG_IDLE_L3", "180"))
 _IDLE_L4 = float(os.environ.get("BRAIN_RG_IDLE_L4", "300"))
 
@@ -265,7 +288,7 @@ def clearance_level(
         return 4
     if cpu < _CPU_L3 and mem < _MEM_L3 and session_idle >= _IDLE_L3 and on_ac:
         return 3
-    if cpu < _CPU_L2 and mem < _MEM_L2 and session_idle >= _IDLE_L2:
+    if cpu < _CPU_L2 and mem < _MEM_L2 and session_idle >= _idle_l2():
         return 2
     if cpu < _CPU_L1 and mem < _MEM_L1:
         return 1
