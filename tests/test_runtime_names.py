@@ -1,6 +1,8 @@
 """Name registry — set, get, lookup, validation, collision."""
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pytest
 
 from brain.runtime import names
@@ -101,3 +103,45 @@ def test_delete_clears_entry():
     names.register("u1", "planner", "acme", "/tmp/a", 1)
     names.delete("u1")
     assert names.get("u1") is None
+
+
+def test_set_name_collision_under_concurrent_writes():
+    """Two sessions in the same project race to claim the same name.
+
+    Contract: at most one wins; the other gets `name_taken`. The current
+    implementation has a check-then-write race window between
+    `lookup_by_name` and `_write` (no filesystem-level locking), so this
+    test is marked xfail to document the gap without blocking CI. If
+    `set_name` ever picks up an atomic claim primitive, flip xfail off.
+    """
+    target = "shared-name"
+
+    def _claim(uuid: str) -> object:
+        return names.set_name(uuid, target)
+
+    results: list[tuple[str, ...]] = []
+    # Hammer it across many trials to maximise the chance of catching
+    # the race; a single attempt would almost always serialise cleanly.
+    trials = 50
+    for _ in range(trials):
+        # Reset both names back to non-conflicting before each trial.
+        names.register("u1", "honey-1", "acme", "/tmp/a", 1)
+        names.register("u2", "honey-2", "acme", "/tmp/b", 2)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(_claim, "u1"), pool.submit(_claim, "u2")]
+            trial_results = [f.result() for f in as_completed(futures)]
+        results.append(tuple(sorted(  # normalise: ("", "name_taken")
+            "" if r is None else str(r) for r in trial_results
+        )))
+
+    # Contract assertion: every trial produced exactly one winner
+    # (None) and one loser ("name_taken").
+    expected = ("", "name_taken")
+    bad = [r for r in results if r != expected]
+    if bad:
+        pytest.xfail(
+            "set_name has a check-then-write race; "
+            f"{len(bad)}/{trials} trials produced {bad[:3]} instead of "
+            f"{expected}. Needs filesystem-level claim primitive."
+        )
+    assert all(r == expected for r in results)
