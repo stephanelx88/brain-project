@@ -108,24 +108,50 @@ def test_brain_semantic_strict_returns_unsupported(claims_brain, monkeypatch):
 
 
 def test_brain_semantic_default_mode_unchanged(claims_brain, monkeypatch):
+    """A-1 regression: assert the strict branch isn't taken. Previously
+    the test wrapped the call in `try/except Exception → pytest.skip`,
+    which silenced every regression. Now we stub the heavy
+    semantic-init path so failures in the strict-vs-default routing
+    surface as real test failures.
+    """
     monkeypatch.delenv("BRAIN_USE_CLAIMS", raising=False)
     monkeypatch.delenv("BRAIN_STRICT_CLAIMS", raising=False)
-    # Default path imports semantic which has heavy deps + ensure_built.
-    # The test_default_mode_unchanged_when_flags_off test pattern in
-    # test_claims_strict_recall already exercises brain_recall default;
-    # for brain_semantic we just confirm it doesn't take the strict
-    # branch. Importing semantic is enough — if strict misfires, the
-    # error envelope would short-circuit before we get to the import.
-    # We assert by checking the result shape doesn't have our strict
-    # error fields.
-    try:
-        out = mcp_server.brain_semantic("test-default-noerr")
-        parsed = json.loads(out)
-        assert parsed.get("error") != "strict_unsupported"
-    except Exception:
-        # Semantic init may fail in tmp env — that's separate from
-        # our strict-mode contract. Skip.
-        pytest.skip("brain_semantic init failed in tmp env (unrelated)")
+
+    # Stub _semantic() so we don't depend on the embedding model in
+    # tmp env. brain_semantic calls _semantic().ensure_built() then
+    # .search_facts(); both safe to no-op for the routing assertion.
+    class _FakeSemantic:
+        def ensure_built(self):
+            return None
+        def search_facts(self, query, k=8, type=None):
+            return []
+    monkeypatch.setattr(mcp_server, "_semantic", lambda: _FakeSemantic())
+    monkeypatch.setattr(mcp_server, "_ensure_fresh", lambda: None)
+
+    out = mcp_server.brain_semantic("test-default-noerr")
+    parsed = json.loads(out)
+    # Default branch contract: not the strict error envelope.
+    assert parsed.get("error") != "strict_unsupported"
+    assert "fallback_tool" not in parsed
+    # Default envelope shape sanity check.
+    assert "query" in parsed
+    assert "hits" in parsed
+
+
+def test_brain_semantic_strict_misconfig_raises_specific_envelope(
+    claims_brain, monkeypatch
+):
+    """A-1 partner test: confirms the previously-silenced error path is
+    now exercised explicitly. Mis-configuring strict flags must yield
+    a specific error envelope — the kind the old blanket try/except
+    would have swallowed into pytest.skip.
+    """
+    monkeypatch.setenv("BRAIN_USE_CLAIMS", "0")
+    monkeypatch.setenv("BRAIN_STRICT_CLAIMS", "1")
+    out = mcp_server.brain_semantic("anything")
+    parsed = json.loads(out)
+    assert parsed.get("error") == "configuration_error"
+    assert "BRAIN_USE_CLAIMS" in parsed.get("detail", "")
 
 
 def test_strict_recall_emits_entity_summary_first_hit_only(
