@@ -1,8 +1,8 @@
 """One-time migration: populate `fact_claims` from the legacy `facts` table.
 
-WS6 step 3. Safe to re-run; idempotent via an "already populated"
-count check. Pass 2 remaps legacy `superseded_by` FK references
-through a `legacy_id → new_id` dict built in pass 1.
+WS6 step 3. Safe to re-run; idempotent via per-row `claim_key` membership
+check. Pass 2 remaps legacy `superseded_by` FK references through a
+`legacy_id → new_id` dict built in pass 1.
 
 Usage:
   python -m brain.backfill_facts            # dry run
@@ -53,12 +53,24 @@ def _observed_at_from_entity(last_updated: str | None) -> float:
     return time.time()
 
 
-def _is_already_populated(conn) -> tuple[int, int]:
-    """(fact_claims_count, facts_count). The caller treats fact_claims
-    >= facts as 'already backfilled' and short-circuits."""
-    fc = conn.execute("SELECT COUNT(*) FROM fact_claims").fetchone()[0]
-    f = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
-    return fc, f
+def _existing_claim_keys(conn) -> set[str]:
+    """Return the set of `claim_key` values already present in
+    `fact_claims`. The caller skips any fact whose computed claim_key
+    is in this set — that's what makes the backfill idempotent.
+
+    A count-based check (the previous approach) was unsafe: rerunning
+    against a partial state (claims < facts, e.g. from a crashed prior
+    run) would reinsert ALL facts, duplicating the rows that were
+    already populated. Membership-by-claim_key is the right primitive
+    because `claim_key = hash(s, p, o, evidence_ptr)` — exactly the
+    "two facts are the same claim" predicate the docstring promises.
+    """
+    rows = conn.execute("SELECT claim_key FROM fact_claims").fetchall()
+    return {r[0] for r in rows if r[0] is not None}
+
+
+def _facts_count(conn) -> int:
+    return conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
 
 
 def run(apply: bool = False, verbose: bool = False) -> dict:
@@ -77,19 +89,23 @@ def run(apply: bool = False, verbose: bool = False) -> dict:
     }
 
     with db.connect() as conn:
-        fc_count, f_count = _is_already_populated(conn)
+        f_count = _facts_count(conn)
         summary["facts_total"] = f_count
-        if fc_count >= f_count and f_count > 0:
+        existing_keys = _existing_claim_keys(conn)
+        # Snapshot *before* any inserts so first-run still inserts
+        # everything; only pre-existing keys are skipped.
+        if f_count > 0 and len(existing_keys) >= f_count:
+            # Likely a clean rerun — every fact's claim_key is already
+            # there. We still walk the rows below so the membership
+            # check confirms it row-by-row, but flag the summary so
+            # callers/CLI can short-circuit messaging.
             summary["already_populated"] = True
-            summary["skipped_existing"] = fc_count
             if verbose:
                 print(
-                    f"fact_claims already has {fc_count} rows for {f_count} facts — "
-                    "nothing to do. `DELETE FROM fact_claims WHERE scrub_tag='pre-ws4'` "
-                    "to re-run cleanly.",
+                    f"fact_claims already has {len(existing_keys)} keys for "
+                    f"{f_count} facts — checking each by claim_key.",
                     file=sys.stderr,
                 )
-            return summary
 
         rows = conn.execute(
             """
@@ -143,8 +159,29 @@ def run(apply: bool = False, verbose: bool = False) -> dict:
             if status == "superseded":
                 summary["facts_superseded"] += 1
 
+            # Idempotency primitive: skip facts whose claim_key already
+            # exists in fact_claims. Applies in dry-run too so the
+            # reported "would insert" count matches what apply will do.
+            if claim_key in existing_keys:
+                summary["skipped_existing"] += 1
+                # We still need the legacy_id for pass-2 remapping if
+                # an existing row participates in a supersession chain;
+                # look it up by claim_key.
+                if apply and sby:
+                    existing = conn.execute(
+                        "SELECT id FROM fact_claims WHERE claim_key=? LIMIT 1",
+                        (claim_key,),
+                    ).fetchone()
+                    if existing:
+                        id_map[legacy_id] = existing[0]
+                        pass1_superseded.append((legacy_id, sby))
+                continue
+
             if not apply:
                 summary["inserted"] += 1
+                # Mark the key as "would-be inserted" so a duplicate
+                # legacy fact later in the same dry-run isn't double-counted.
+                existing_keys.add(claim_key)
                 if sby:
                     pass1_superseded.append((legacy_id, sby))
                 continue
@@ -178,6 +215,7 @@ def run(apply: bool = False, verbose: bool = False) -> dict:
             )
             new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             id_map[legacy_id] = new_id
+            existing_keys.add(claim_key)
             summary["inserted"] += 1
             if sby:
                 pass1_superseded.append((legacy_id, sby))
@@ -189,6 +227,24 @@ def run(apply: bool = False, verbose: bool = False) -> dict:
                 new_sby = id_map.get(legacy_sby)
                 if new_id is None or new_sby is None:
                     continue
+                # Don't clobber a pre-existing supersession decision
+                # set by a prior backfill or live writer; the tests
+                # for this regression assert that an explicit
+                # superseded_by on a row already in fact_claims is
+                # preserved across a rerun. If the field is already
+                # populated we leave it alone.
+                row = conn.execute(
+                    "SELECT superseded_by FROM fact_claims WHERE id=?",
+                    (new_id,),
+                ).fetchone()
+                if row and row[0] is not None and row[0] != new_sby:
+                    continue
+                if row and row[0] == new_sby:
+                    # Already correct — count as remap for the summary
+                    # so reruns still report a faithful number, but
+                    # skip the redundant UPDATE.
+                    summary["superseded_remap"] += 1
+                    continue
                 conn.execute(
                     "UPDATE fact_claims SET superseded_by=? WHERE id=?",
                     (new_sby, new_id),
@@ -196,6 +252,16 @@ def run(apply: bool = False, verbose: bool = False) -> dict:
                 summary["superseded_remap"] += 1
         else:
             summary["superseded_remap"] = len(pass1_superseded)
+
+        # Re-evaluate "already_populated": a rerun where every fact
+        # had its claim_key already present (inserted == 0) and at
+        # least one fact existed counts as a no-op rerun.
+        if (
+            f_count > 0
+            and summary["inserted"] == 0
+            and summary["skipped_existing"] >= f_count
+        ):
+            summary["already_populated"] = True
 
     return summary
 
@@ -218,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     mode = "APPLY" if args.apply else "DRY-RUN"
     print(f"[{mode}] fact_claims backfill: "
           f"inserted={summary['inserted']}  "
+          f"skipped={summary['skipped_existing']}  "
           f"superseded={summary['facts_superseded']}  "
           f"superseded_remap={summary['superseded_remap']}  "
           f"facts_total={summary['facts_total']}  "

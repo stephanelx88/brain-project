@@ -371,3 +371,113 @@ def test_backfill_entity_resolution_for_object(tmp_vault, monkeypatch):
     assert ann_row[1] == "paris"
     assert ann_row[2] is None
     assert ann_row[3] == "entity"
+
+
+# ---------------------------------------------------------------------------
+# Backfill idempotency regression — fix/backfill-idempotency
+# ---------------------------------------------------------------------------
+
+
+def test_backfill_rerun_skips_by_claim_key(tmp_vault, monkeypatch):
+    """Second run on the same facts must report inserted=0 and
+    skipped == facts_total — the bug we're fixing was inserted=N,
+    skipped=0 on rerun (count-based check)."""
+    monkeypatch.delenv("BRAIN_USE_CLAIMS", raising=False)
+    from brain import db, backfill_facts
+
+    _make_entity(tmp_vault, "ann", "Ann",
+                 ["- currently in A (source: user)",
+                  "- works at B (source: user)",
+                  "- enjoys walks (source: user)"])
+    db.upsert_entity_from_file(tmp_vault / "entities" / "people" / "ann.md")
+
+    first = backfill_facts.run(apply=True)
+    assert first["inserted"] == 3
+    assert first["skipped_existing"] == 0
+
+    second = backfill_facts.run(apply=True)
+    assert second["inserted"] == 0
+    assert second["skipped_existing"] == 3
+    assert second["already_populated"] is True
+    with db.connect() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM fact_claims").fetchone()[0]
+    assert n == 3, "rerun must not duplicate fact_claims rows"
+
+
+def test_backfill_partial_state_inserts_only_new(tmp_vault, monkeypatch):
+    """Simulates the regression scenario: facts > fact_claims (because
+    a prior backfill ran, then more facts arrived). Rerun must insert
+    only the new ones, not re-insert the already-populated rows."""
+    monkeypatch.delenv("BRAIN_USE_CLAIMS", raising=False)
+    from brain import db, backfill_facts
+
+    # First batch: 2 facts, backfilled.
+    path = _make_entity(tmp_vault, "ann", "Ann",
+                        ["- currently in A (source: user)",
+                         "- works at B (source: user)"])
+    db.upsert_entity_from_file(path)
+    first = backfill_facts.run(apply=True)
+    assert first["inserted"] == 2
+
+    # Add 5 new facts to the same entity, re-ingest, rerun backfill.
+    body = ("---\nname: Ann\nslug: ann\n---\n\n# Ann\n\n"
+            "- currently in A (source: user)\n"
+            "- works at B (source: user)\n"
+            "- likes coffee (source: user)\n"
+            "- speaks French (source: user)\n"
+            "- born in Lyon (source: user)\n"
+            "- has a cat (source: user)\n"
+            "- runs daily (source: user)\n")
+    path.write_text(body)
+    db.upsert_entity_from_file(path)
+
+    second = backfill_facts.run(apply=True)
+    assert second["inserted"] == 5, (
+        f"expected 5 new inserts, got {second['inserted']} — "
+        "regression: count-based check would re-insert all 7"
+    )
+    assert second["skipped_existing"] == 2
+    with db.connect() as conn:
+        n = conn.execute("SELECT COUNT(*) FROM fact_claims").fetchone()[0]
+    assert n == 7, "no duplicates allowed; total must match facts count"
+
+
+def test_backfill_preserves_existing_superseded_by(tmp_vault, monkeypatch):
+    """If a fact_claim row already exists with a superseded_by value,
+    a rerun must not clobber that field — only fill it in for newly
+    inserted rows. Guards against accidental supersession overwrites
+    on idempotent reruns."""
+    monkeypatch.delenv("BRAIN_USE_CLAIMS", raising=False)
+    from brain import db, backfill_facts
+
+    path = _make_entity(tmp_vault, "ann", "Ann",
+                        ["- currently in A (source: user)",
+                         "- currently in B (source: user)"])
+    db.upsert_entity_from_file(path)
+    with db.connect() as conn:
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM facts ORDER BY id"
+        ).fetchall()]
+        conn.execute(
+            "UPDATE facts SET status='superseded', superseded_by=? WHERE id=?",
+            (ids[1], ids[0]),
+        )
+        conn.execute("DELETE FROM fts_facts WHERE rowid=?", (ids[0],))
+
+    first = backfill_facts.run(apply=True)
+    assert first["superseded_remap"] == 1
+    with db.connect() as conn:
+        before = conn.execute(
+            "SELECT id, superseded_by FROM fact_claims ORDER BY id"
+        ).fetchall()
+
+    # Second run — superseded_by must still point at the same target.
+    second = backfill_facts.run(apply=True)
+    assert second["inserted"] == 0
+    with db.connect() as conn:
+        after = conn.execute(
+            "SELECT id, superseded_by FROM fact_claims ORDER BY id"
+        ).fetchall()
+    assert before == after, (
+        "rerun must not clobber existing superseded_by values"
+    )
