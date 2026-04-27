@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -129,3 +130,30 @@ def test_concurrent_send_no_overwrites():
     assert bodies == {f"msg-{i}" for i in range(n)}
 
 
+def test_list_pending_skips_malformed_json():
+    """Corrupt JSON file in pending/ must be silently skipped, not raise."""
+    # Seed one valid envelope, then drop a malformed sibling.
+    good = inbox.send("rcv", "snd", "a", "b", "good")
+    pdir = paths.inbox_pending_dir("rcv")
+    bad = pdir / "01ABCDEFGHJKMNPQRSTVWXYZ12.json"  # ULID-shaped fake name
+    bad.write_text("not-valid-json{")
+    msgs = inbox.list_pending("rcv")
+    # The malformed one is skipped; the good one is returned.
+    assert [m["id"] for m in msgs] == [good["id"]]
+
+
+def test_list_pending_skips_unreadable_file(tmp_path):
+    """chmod 000 file in pending/ must be skipped silently (OSError swallowed)."""
+    if os.geteuid() == 0:
+        pytest.skip("running as root: chmod 000 has no effect")
+    good = inbox.send("rcv", "snd", "a", "b", "good")
+    pdir = paths.inbox_pending_dir("rcv")
+    locked = pdir / "01ZZZZZZZZZZZZZZZZZZZZZZZZ.json"
+    locked.write_text(json.dumps({"id": "01ZZZZZZZZZZZZZZZZZZZZZZZZ", "body": "x"}))
+    os.chmod(locked, 0)
+    try:
+        msgs = inbox.list_pending("rcv")
+    finally:
+        # restore so pytest can clean up
+        os.chmod(locked, stat.S_IRUSR | stat.S_IWUSR)
+    assert [m["id"] for m in msgs] == [good["id"]]
