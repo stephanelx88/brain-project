@@ -1690,7 +1690,20 @@ def brain_inbox(unread_only: bool = True, limit: int = 50,
     listed = listed[: max(1, min(int(limit), 500))]
 
     if mark_read and pending:
-        _inbox.mark_delivered(own, [m["id"] for m in pending])
+        # Only mark the LISTED slice as delivered. Previous code passed
+        # the full `pending` list, so brain_inbox(mark_read=True,
+        # limit=N) silently moved every pending message to delivered/
+        # even though the caller only saw N — a data-loss bug when N
+        # was small relative to queue depth. Intersect listed ∩ pending
+        # by id so we never try to re-mark already-delivered envelopes
+        # when unread_only=False.
+        pending_ids = {m["id"] for m in pending}
+        to_mark = [m["id"] for m in listed if m["id"] in pending_ids]
+        if to_mark:
+            _inbox.mark_delivered(own, to_mark)
+            # Recompute counts so they reflect the post-mark state.
+            pending = _inbox.list_pending(own)
+            delivered = _inbox.list_delivered(own)
 
     return json.dumps({
         "ok": True,

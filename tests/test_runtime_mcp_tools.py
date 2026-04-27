@@ -65,6 +65,29 @@ def test_brain_inbox_mark_read_moves_files(monkeypatch):
     monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
     inbox.send("u1", "snd", "planner", "executor", "hello")
     out = json.loads(mcp_server.brain_inbox(mark_read=True))
-    assert out["pending_count"] == 1
+    # `messages` reflects what the caller saw (1 message); after
+    # mark_read, pending_count is recomputed to the post-mark state
+    # (0 left in pending), delivered_count reflects the move.
+    assert len(out["messages"]) == 1
+    assert out["pending_count"] == 0
+    assert out["delivered_count"] == 1
     assert inbox.list_pending("u1") == []
     assert len(inbox.list_delivered("u1")) == 1
+
+
+def test_brain_inbox_mark_read_with_limit_does_not_overconsume(monkeypatch):
+    """Regression for D-1: mark_read=True must only move the LISTED
+    slice, not the full pending queue. Previously, with 5 pending and
+    limit=2, all 5 silently moved to delivered/ even though the caller
+    only saw 2.
+    """
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    for i in range(5):
+        inbox.send("u1", "snd", "planner", "executor", f"msg-{i}")
+    assert len(inbox.list_pending("u1")) == 5
+    out = json.loads(mcp_server.brain_inbox(mark_read=True, limit=2))
+    assert len(out["messages"]) == 2
+    assert out["pending_count"] == 3
+    assert out["delivered_count"] == 2
+    assert len(inbox.list_pending("u1")) == 3
+    assert len(inbox.list_delivered("u1")) == 2
