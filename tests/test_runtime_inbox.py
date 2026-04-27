@@ -130,6 +130,36 @@ def test_concurrent_send_no_overwrites():
     assert bodies == {f"msg-{i}" for i in range(n)}
 
 
+def test_list_delivered_empty():
+    """Fresh inbox with no delivered/ dir → empty list, no error."""
+    assert inbox.list_delivered("nobody") == []
+
+
+def test_list_delivered_returns_in_ulid_order():
+    """Send 3 messages, mark delivered, list → chronological (ULID) order."""
+    m1 = inbox.send("rcv", "snd", "a", "b", "first")
+    time.sleep(0.002)
+    m2 = inbox.send("rcv", "snd", "a", "b", "second")
+    time.sleep(0.002)
+    m3 = inbox.send("rcv", "snd", "a", "b", "third")
+    inbox.mark_delivered("rcv", [m1["id"], m2["id"], m3["id"]])
+    delivered = inbox.list_delivered("rcv")
+    assert [m["body"] for m in delivered] == ["first", "second", "third"]
+    assert [m["id"] for m in delivered] == [m1["id"], m2["id"], m3["id"]]
+
+
+def test_list_delivered_skips_malformed_json():
+    """Corrupt JSON file in delivered/ must be silently skipped, not raise."""
+    good = inbox.send("rcv", "snd", "a", "b", "good")
+    inbox.mark_delivered("rcv", [good["id"]])
+    ddir = paths.inbox_delivered_dir("rcv")
+    bad = ddir / "01ABCDEFGHJKMNPQRSTVWXYZ12.json"
+    bad.write_text("not-valid-json{")
+    delivered = inbox.list_delivered("rcv")
+    # The malformed one is skipped; the good one is returned.
+    assert [m["id"] for m in delivered] == [good["id"]]
+
+
 def test_list_pending_skips_malformed_json():
     """Corrupt JSON file in pending/ must be silently skipped, not raise."""
     # Seed one valid envelope, then drop a malformed sibling.
