@@ -17,6 +17,15 @@ import pytest
 import brain.status as status
 
 
+@pytest.fixture(autouse=True)
+def _reset_status_cache():
+    """gather() carries a module-level TTL cache. Bust it between tests
+    so each case sees a fresh probe of its monkeypatched fixture state."""
+    status._reset_cache()
+    yield
+    status._reset_cache()
+
+
 @pytest.fixture
 def fake_vault(tmp_path, monkeypatch):
     brain_dir = tmp_path / ".brain"
@@ -421,6 +430,94 @@ def test_claims_health_extract_idle_threshold(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", "30")
     out = status.claims_health()
     assert out["extract_idle_threshold_sec"] == 30
+
+
+# ─── TTL cache (perf) ────────────────────────────────────────────
+
+
+def test_gather_caches_within_ttl(fake_vault, monkeypatch):
+    """Two gather() calls inside the TTL window return the same object —
+    the second one must not re-run the underlying probes."""
+    _stub_launchctl_not_loaded(monkeypatch)
+    monkeypatch.setenv("BRAIN_STATUS_TTL_SEC", "1.0")
+    status._reset_cache()
+
+    calls = {"n": 0}
+    real = status._gather_uncached
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+    monkeypatch.setattr(status, "_gather_uncached", counting)
+
+    rep1 = status.gather()
+    rep2 = status.gather()
+    assert calls["n"] == 1, "second gather() within TTL must hit cache"
+    assert rep1 is rep2, "cache must return the same StatusReport instance"
+
+
+def test_gather_busts_after_ttl(fake_vault, monkeypatch):
+    """After the TTL expires, gather() re-runs the probes and returns
+    a fresh report (different identity, possibly different content)."""
+    _stub_launchctl_not_loaded(monkeypatch)
+    monkeypatch.setenv("BRAIN_STATUS_TTL_SEC", "0.05")  # 50ms TTL
+    status._reset_cache()
+
+    calls = {"n": 0}
+    real = status._gather_uncached
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+    monkeypatch.setattr(status, "_gather_uncached", counting)
+
+    rep1 = status.gather()
+    time.sleep(0.12)  # > TTL
+    rep2 = status.gather()
+    assert calls["n"] == 2, "gather() after TTL expiry must re-probe"
+    assert rep1 is not rep2, "post-TTL call must produce a new report object"
+
+
+def test_brain_status_ttl_env_override(fake_vault, monkeypatch):
+    """`BRAIN_STATUS_TTL_SEC=0.1` shrinks the cache window. A call at
+    0.2s elapsed must bust; a call at 0.05s must hit."""
+    _stub_launchctl_not_loaded(monkeypatch)
+    monkeypatch.setenv("BRAIN_STATUS_TTL_SEC", "0.1")
+    status._reset_cache()
+
+    calls = {"n": 0}
+    real = status._gather_uncached
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+    monkeypatch.setattr(status, "_gather_uncached", counting)
+
+    status.gather()                # cold → probe (n=1)
+    time.sleep(0.02)
+    status.gather()                # within 0.1s window → cache (still 1)
+    assert calls["n"] == 1
+    time.sleep(0.20)               # past 0.1s window
+    status.gather()                # bust → probe again (n=2)
+    assert calls["n"] == 2
+
+
+def test_gather_ttl_zero_disables_cache(fake_vault, monkeypatch):
+    """`BRAIN_STATUS_TTL_SEC=0` (or negative) is the escape hatch:
+    every call probes fresh, no caching. Used by integration tests
+    and any caller that needs guaranteed freshness."""
+    _stub_launchctl_not_loaded(monkeypatch)
+    monkeypatch.setenv("BRAIN_STATUS_TTL_SEC", "0")
+    status._reset_cache()
+
+    calls = {"n": 0}
+    real = status._gather_uncached
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+    monkeypatch.setattr(status, "_gather_uncached", counting)
+
+    status.gather()
+    status.gather()
+    status.gather()
+    assert calls["n"] == 3, "TTL=0 must disable caching"
 
 
 def test_gather_wires_claims_health_into_report(fake_vault, monkeypatch):

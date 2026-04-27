@@ -539,7 +539,42 @@ def claims_health() -> dict:
     }
 
 
-def gather() -> StatusReport:
+# ---------- TTL cache ------------------------------------------------------
+#
+# `gather()` shells out to `launchctl`/`systemctl` (via scheduler.get_status)
+# and `ps -A` on every call. Each shell-out is ~20-40ms on macOS, pushing the
+# whole status report to 75ms p50 / 460ms p99 — 100× slower than the other
+# read tools (1-3ms range). The data is a dashboard snapshot, so a 1s
+# staleness window is unobservable to humans / agents. Cache the assembled
+# `StatusReport` object for `BRAIN_STATUS_TTL_SEC` seconds (default 1.0,
+# clamped at 5.0 to keep staleness sub-perceptible).
+#
+# Module-level mutable cache. Single-process, no thread safety needed —
+# MCP tool calls are serialised by the FastMCP event loop. Tests reach in
+# via `_reset_cache()` to bust between cases.
+_GATHER_CACHE: tuple[float, StatusReport] | None = None
+
+
+def _ttl_seconds() -> float:
+    raw = os.environ.get("BRAIN_STATUS_TTL_SEC", "1.0")
+    try:
+        ttl = float(raw)
+    except (TypeError, ValueError):
+        ttl = 1.0
+    # Clamp: negative / zero means "no cache" — honour by returning 0.
+    # Upper bound 5s — beyond that the user starts seeing stale dashboards.
+    if ttl <= 0:
+        return 0.0
+    return min(ttl, 5.0)
+
+
+def _reset_cache() -> None:
+    """Test hook — clear the TTL cache between cases."""
+    global _GATHER_CACHE
+    _GATHER_CACHE = None
+
+
+def _gather_uncached() -> StatusReport:
     sched = scheduler.get_status()
     in_flight = _in_flight()
     last_run = _last_run()
@@ -558,6 +593,28 @@ def gather() -> StatusReport:
         live_coverage=_live_coverage(),
         claims=claims_health(),
     )
+
+
+def gather() -> StatusReport:
+    """Return a `StatusReport`, cached for `BRAIN_STATUS_TTL_SEC` seconds.
+
+    The TTL trades dashboard freshness for latency: subprocess probes
+    (`launchctl`/`systemctl`, `ps -A`) cost ~50ms per `gather()` call
+    on macOS. Cached responses return in ~microseconds. A 1s default
+    TTL keeps the dashboard responsive while making rapid-fire callers
+    (CLI loop, an agent polling the MCP tool) effectively free.
+    """
+    global _GATHER_CACHE
+    ttl = _ttl_seconds()
+    now = time.monotonic()
+    if ttl > 0 and _GATHER_CACHE is not None:
+        expires_at, cached = _GATHER_CACHE
+        if now < expires_at:
+            return cached
+    report = _gather_uncached()
+    if ttl > 0:
+        _GATHER_CACHE = (now + ttl, report)
+    return report
 
 
 def to_json(report: StatusReport) -> str:
