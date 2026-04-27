@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
@@ -87,3 +89,71 @@ def test_prune_delivered_removes_old():
 def test_ulid_monotonic_and_unique():
     ids = {inbox._ulid() for _ in range(1000)}
     assert len(ids) == 1000
+
+
+def test_concurrent_send_no_overwrites():
+    """100 concurrent sends to the same inbox: every message must land
+    with a unique id, all readable via list_pending. Reveals any race
+    on ULID generation or atomic-write paths."""
+    n = 100
+
+    def _send(i: int) -> dict:
+        return inbox.send(
+            to_uuid="rcv",
+            from_uuid=f"snd-{i}",
+            from_name_at_send="planner",
+            to_name_at_send="executor",
+            body=f"msg-{i}",
+        )
+
+    sent_ids: list[str] = []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(_send, i) for i in range(n)]
+        for f in as_completed(futures):
+            sent_ids.append(f.result()["id"])
+
+    # All ids returned by send() are unique
+    assert len(set(sent_ids)) == n, "send() returned duplicate ULIDs"
+
+    # All n files landed on disk
+    pending_files = list(paths.inbox_pending_dir("rcv").iterdir())
+    assert len(pending_files) == n, (
+        f"expected {n} files on disk, found {len(pending_files)}"
+    )
+
+    # list_pending sees every one of them
+    listed = inbox.list_pending("rcv")
+    assert len(listed) == n
+    listed_ids = {m["id"] for m in listed}
+    assert listed_ids == set(sent_ids)
+    bodies = {m["body"] for m in listed}
+    assert bodies == {f"msg-{i}" for i in range(n)}
+
+
+def test_list_pending_skips_malformed_json():
+    """Corrupt JSON file in pending/ must be silently skipped, not raise."""
+    # Seed one valid envelope, then drop a malformed sibling.
+    good = inbox.send("rcv", "snd", "a", "b", "good")
+    pdir = paths.inbox_pending_dir("rcv")
+    bad = pdir / "01ABCDEFGHJKMNPQRSTVWXYZ12.json"  # ULID-shaped fake name
+    bad.write_text("not-valid-json{")
+    msgs = inbox.list_pending("rcv")
+    # The malformed one is skipped; the good one is returned.
+    assert [m["id"] for m in msgs] == [good["id"]]
+
+
+def test_list_pending_skips_unreadable_file(tmp_path):
+    """chmod 000 file in pending/ must be skipped silently (OSError swallowed)."""
+    if os.geteuid() == 0:
+        pytest.skip("running as root: chmod 000 has no effect")
+    good = inbox.send("rcv", "snd", "a", "b", "good")
+    pdir = paths.inbox_pending_dir("rcv")
+    locked = pdir / "01ZZZZZZZZZZZZZZZZZZZZZZZZ.json"
+    locked.write_text(json.dumps({"id": "01ZZZZZZZZZZZZZZZZZZZZZZZZ", "body": "x"}))
+    os.chmod(locked, 0)
+    try:
+        msgs = inbox.list_pending("rcv")
+    finally:
+        # restore so pytest can clean up
+        os.chmod(locked, stat.S_IRUSR | stat.S_IWUSR)
+    assert [m["id"] for m in msgs] == [good["id"]]
