@@ -104,3 +104,39 @@ def test_gc_keeps_recent_orphan_inbox_under_ttl():
     n = gc.run(live_uuids=set())
     assert n["orphans_pruned"] == 0
     assert sid_dir.exists()
+
+
+def test_main_invokes_run_and_prints_summary(monkeypatch, capsys):
+    """`python -m brain.runtime.gc` discovers live UUIDs, runs all GC
+    passes, and prints a one-line `runtime-gc:` summary with the
+    pruned counts."""
+    # Seed: one stale delivered (live UUID, so pending/orphan rules
+    # don't fire) and one stale dead-name in the registry. Skip
+    # orphan inbox to avoid clobbering the delivered file under
+    # "u-alive". The two non-zero counts let us validate the print
+    # format end-to-end.
+    msg = inbox.send("u-alive", "snd", "a", "b", "hi")
+    inbox.mark_delivered("u-alive", [msg["id"]])
+    delivered = paths.inbox_delivered_dir("u-alive") / f"{msg['id']}.json"
+    _age_file(delivered, days=10)
+
+    names.register("u-ghost", "planner", "acme", "/tmp/g", 99)
+    name_file = paths.name_file("u-ghost")
+    _age_file(name_file, days=40)
+
+    # Stub live_sessions.list_live_sessions to a controlled set
+    # (u-alive is "live", u-ghost is dead).
+    import brain.live_sessions as ls
+    monkeypatch.setattr(
+        ls, "list_live_sessions",
+        lambda include_self=True: [{"session_id": "u-alive"}],
+    )
+
+    rc = gc.main()
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "runtime-gc:" in out
+    assert "delivered=1" in out
+    assert "names=1" in out
+    assert "pending=" in out
+    assert "orphans=" in out
