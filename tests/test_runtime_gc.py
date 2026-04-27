@@ -61,3 +61,46 @@ def test_gc_prunes_name_for_long_dead_uuid():
     n = gc.run(live_uuids=set())
     assert n["names_pruned"] == 1
     assert not name_file.exists()
+
+
+def test_gc_prunes_orphan_inbox_no_name_no_live_after_ttl():
+    """UUID with no names/<uuid>.json AND not in live_uuids -> pruned."""
+    inbox.send("orphan", "snd", "a", "b", "hi")
+    sid_dir = paths.inbox_dir() / "orphan"
+    assert sid_dir.exists()
+    _age_file(sid_dir, days=2)
+    n = gc.run(live_uuids=set())
+    assert n["orphans_pruned"] == 1
+    assert not sid_dir.exists()
+
+
+def test_gc_keeps_orphan_inbox_if_live_even_without_name():
+    """Live UUID without a name registry entry -> NOT pruned (live overrides)."""
+    inbox.send("newborn", "snd", "a", "b", "hi")
+    sid_dir = paths.inbox_dir() / "newborn"
+    _age_file(sid_dir, days=2)
+    n = gc.run(live_uuids={"newborn"})
+    assert n["orphans_pruned"] == 0
+    assert sid_dir.exists()
+
+
+def test_gc_does_not_orphan_prune_uuid_with_name_file():
+    """Dead UUID WITH name registry entry -> NOT pruned by orphan rule
+    (only the existing dead-pending rule applies)."""
+    names.register("named-dead", "planner", "acme", "/tmp/g", 99)
+    inbox.send("named-dead", "snd", "a", "b", "hi")
+    sid_dir = paths.inbox_dir() / "named-dead"
+    _age_file(sid_dir, days=2)
+    n = gc.run(live_uuids=set())
+    assert n["orphans_pruned"] == 0
+    assert sid_dir.exists()
+
+
+def test_gc_keeps_recent_orphan_inbox_under_ttl():
+    """Orphan UUID with dir mtime younger than TTL -> NOT pruned."""
+    inbox.send("fresh-orphan", "snd", "a", "b", "hi")
+    sid_dir = paths.inbox_dir() / "fresh-orphan"
+    _age_file(sid_dir, days=0.5)
+    n = gc.run(live_uuids=set())
+    assert n["orphans_pruned"] == 0
+    assert sid_dir.exists()
