@@ -397,11 +397,19 @@ def main():
             print(f"  verify sync skipped: {exc}", flush=True)
         # Refresh semantic index so MCP recall sees the new facts.
         # Failure here is non-fatal — semantic is a perf layer, not source of truth.
+        #
+        # Routes through the persistent semantic worker (warm sentence-
+        # transformers model, ~100 ms incremental embed) instead of the
+        # old in-process `semantic.build()` (~10 s cold-load + ~1.6 s
+        # full rebuild = ~11.5 s wasted per batch). When the worker
+        # socket is missing the helper falls back to the in-process
+        # incremental path; only when *that* also fails do we re-raise
+        # into the except below.
         try:
             from brain import semantic
-            semantic.build()
+            semantic.update_facts_entities_via_worker()
         except Exception as exc:
-            print(f"  semantic rebuild skipped: {exc}", flush=True)
+            print(f"  semantic refresh skipped: {exc}", flush=True)
         summary = ", ".join(f"{k}={v}" for k, v in counts.items() if v)
         append_log("extract-batch", summary)
         # Auto-managed allowlist (entities/, log.md, index.md, etc.) —
