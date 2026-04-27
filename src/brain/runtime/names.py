@@ -7,6 +7,7 @@ different projects without collision.
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -74,6 +75,77 @@ def _write(uuid: str, payload: dict) -> None:
     atomic_write_text(paths.name_file(uuid), json.dumps(payload, indent=2) + "\n")
 
 
+def _try_reserve(uuid: str, project: str, name: str) -> bool:
+    """Atomically claim (project, name) for `uuid`.
+
+    Uses O_CREAT|O_EXCL to make the reservation file the linearization
+    point for concurrent set_name/register calls. Returns True if this
+    call now holds the reservation (either because it just created it,
+    or because it already owned it). Returns False if a different
+    session already holds the reservation.
+    """
+    reserve_path = paths.name_reservation_file(project, name)
+    reserve_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(
+            str(reserve_path),
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o644,
+        )
+        try:
+            os.write(fd, uuid.encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    except FileExistsError:
+        # Reservation already held — check whether it's ours.
+        try:
+            holder = reserve_path.read_text().strip()
+        except OSError:
+            return False
+        return holder == uuid
+
+
+def _release_reservations_for(uuid: str) -> None:
+    """Remove every reservation file whose holder is `uuid`.
+
+    Called from delete() so a session releasing its name doesn't
+    permanently lock that (project, name) pair. Safe under races —
+    if a file disappears between scan and unlink, that's fine.
+    """
+    rdir = paths.name_reservations_dir()
+    if not rdir.exists():
+        return
+    for p in rdir.iterdir():
+        if p.suffix != ".lock":
+            continue
+        try:
+            holder = p.read_text().strip()
+        except OSError:
+            continue
+        if holder != uuid:
+            continue
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
+def _release_reservation(project: str, name: str, uuid: str) -> None:
+    """Release a single (project, name) reservation if `uuid` holds it."""
+    reserve_path = paths.name_reservation_file(project, name)
+    try:
+        holder = reserve_path.read_text().strip()
+    except OSError:
+        return
+    if holder != uuid:
+        return
+    try:
+        reserve_path.unlink()
+    except OSError:
+        pass
+
+
 def register(
     uuid: str,
     name: str,
@@ -81,15 +153,30 @@ def register(
     cwd: str,
     pid: int | None,
 ) -> dict:
-    """Write a name registry entry. Overwrites any prior entry for `uuid`."""
+    """Write a name registry entry. Overwrites any prior entry for `uuid`.
+
+    Also claims the (project, name) atomic reservation so this name is
+    treated as held by `uuid` for subsequent set_name calls. If the
+    reservation is currently held by a different uuid, the old holder's
+    reservation is left untouched and the existing JSON entry on disk
+    is what `lookup_by_name` continues to see — register() is the
+    "I'm taking this slot for myself" path used by tests/bootstrap and
+    must not silently fail; for race-correct rename, use set_name().
+    """
+    norm_project = normalize_project(project)
     entry = {
         "uuid": uuid,
         "name": name,
-        "project": normalize_project(project),
+        "project": norm_project,
         "cwd": cwd,
         "pid": pid,
         "set_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
     }
+    # Drop any reservations this uuid previously held under a different
+    # name in any project, so the registry stays in sync with the JSON
+    # entry on disk (one live name per uuid).
+    _release_reservations_for(uuid)
+    _try_reserve(uuid, norm_project, name)
     _write(uuid, entry)
     return entry
 
@@ -134,6 +221,11 @@ def set_name(uuid: str, new_name: str) -> Optional[str]:
 
     Error codes: validation codes from validate_user_name + "name_taken",
     "no_entry".
+
+    Race semantics: the (project, new_name) reservation file under
+    `paths.name_reservations_dir()` is created with O_CREAT|O_EXCL so it
+    acts as the linearization point. Concurrent calls racing for the
+    same name resolve to exactly one winner; losers see "name_taken".
     """
     err = validate_user_name(new_name)
     if err:
@@ -142,9 +234,21 @@ def set_name(uuid: str, new_name: str) -> Optional[str]:
     if not current:
         return "no_entry"
     project = current["project"]
+    old_name = current.get("name")
+    # Atomic claim — this is the linearization point. Cheap collision
+    # check first so callers don't churn reservation files for an
+    # obviously taken name, but the O_EXCL claim below is what makes
+    # the operation race-safe.
     other_uuid = lookup_by_name(new_name, project)
     if other_uuid and other_uuid != uuid:
         return "name_taken"
+    if not _try_reserve(uuid, project, new_name):
+        return "name_taken"
+    # Reservation now held by `uuid`. Release the old name's
+    # reservation (if any and different) before persisting the rename
+    # so future renames-back-to-old-name aren't permanently blocked.
+    if old_name and old_name != new_name:
+        _release_reservation(project, old_name, uuid)
     current["name"] = new_name
     current["set_at"] = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     _write(uuid, current)
@@ -155,3 +259,6 @@ def delete(uuid: str) -> None:
     p = paths.name_file(uuid)
     if p.exists():
         p.unlink()
+    # Free any (project, name) reservations this uuid still owned so
+    # the slot is reclaimable by other sessions.
+    _release_reservations_for(uuid)

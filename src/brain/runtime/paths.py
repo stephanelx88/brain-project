@@ -38,5 +38,19 @@ def name_file(session_uuid: str) -> Path:
     return names_dir() / f"{session_uuid}.json"
 
 
+def name_reservations_dir() -> Path:
+    return runtime_root() / "_name_reservations"
+
+
+def name_reservation_file(project: str, name: str) -> Path:
+    """Path of the atomic-claim reservation file for (project, name).
+
+    `project` is expected to be already normalised by the caller
+    (`names.normalize_project`). The composite key keeps reservations
+    project-scoped so the same name can coexist across projects.
+    """
+    return name_reservations_dir() / f"{project}__{name}.lock"
+
+
 def hook_log_path() -> Path:
     return runtime_root() / "log" / "inbox-hook.log"
