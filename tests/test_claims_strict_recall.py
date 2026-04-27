@@ -126,3 +126,49 @@ def test_brain_semantic_default_mode_unchanged(claims_brain, monkeypatch):
         # Semantic init may fail in tmp env — that's separate from
         # our strict-mode contract. Skip.
         pytest.skip("brain_semantic init failed in tmp env (unrelated)")
+
+
+def test_strict_recall_emits_entity_summary_first_hit_only(
+    claims_brain, monkeypatch
+):
+    """D-5 regression: strict-mode envelope must include
+    `entity_summary` on the FIRST hit per entity (spec §3.3).
+    Previously _recall_strict_claims dropped the field entirely.
+    Subsequent hits for the same entity must NOT repeat it (mirrors
+    default brain_recall envelope behaviour).
+    """
+    # Two claims, same entity → expect summary on first hit only.
+    with db.connect() as conn:
+        conn.execute(
+            "INSERT INTO entities (path, type, slug, name, summary) "
+            "VALUES (?,?,?,?,?)",
+            ("entities/people/son.md", "people", "son", "Son",
+             "owner currently in long xuyen"),
+        )
+        son_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        db._insert_fact_claim(
+            conn, entity_id=son_id, subject_slug="son",
+            text="son currently in long xuyen",
+            source="note:journal/2026-04-25.md", fact_date=None,
+            status="current",
+        )
+        db._insert_fact_claim(
+            conn, entity_id=son_id, subject_slug="son",
+            text="son works at aitomatic in long xuyen",
+            source="note:journal/2026-04-25.md", fact_date=None,
+            status="current",
+        )
+    monkeypatch.setenv("BRAIN_USE_CLAIMS", "1")
+    monkeypatch.setenv("BRAIN_STRICT_CLAIMS", "1")
+    out = mcp_server.brain_recall("son long xuyen")
+    parsed = json.loads(out)
+    hits = parsed["hits"]
+    assert len(hits) >= 2
+    assert hits[0].get("entity_summary"), (
+        f"first hit missing entity_summary: {hits[0]!r}"
+    )
+    assert "long xuyen" in hits[0]["entity_summary"]
+    for h in hits[1:]:
+        assert "entity_summary" not in h, (
+            f"duplicate entity_summary on subsequent hit: {h!r}"
+        )

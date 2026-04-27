@@ -682,6 +682,11 @@ def _recall_strict_claims(query: str, k: int, verbose: bool) -> str:
             "name": h.name,
             "claim_id": h.claim_id,
         }
+        # Spec §3.3: include entity_summary on the first hit per
+        # entity (suppression already applied upstream by
+        # claims.read.search_text — formatter just passes through).
+        if h.entity_summary:
+            item["entity_summary"] = h.entity_summary
         if verbose:
             item["score"] = h.score
         formatted_hits.append(item)

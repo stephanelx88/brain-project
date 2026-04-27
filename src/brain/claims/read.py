@@ -100,7 +100,7 @@ def search_text(query: str, k: int = 8) -> list[ClaimHit]:
         SELECT
             fc.id, fc.subject_slug, fc.text, fc.observed_at, fc.salience,
             fc.predicate_key, fc.object_text,
-            e.name, e.path
+            e.id, e.name, e.path, e.summary
         FROM fact_claims fc
         JOIN entities e ON e.id = fc.entity_id
         WHERE fc.status='current' AND ({where_clause})
@@ -108,11 +108,12 @@ def search_text(query: str, k: int = 8) -> list[ClaimHit]:
     """
 
     now = time.time()
-    raw_hits: list[tuple[float, ClaimHit]] = []
+    raw_hits: list[tuple[float, int | None, ClaimHit]] = []
     with db.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
     for r in rows:
-        cid, subj, text, observed_at, salience, _pred_key, _obj_text, name, path = r
+        (cid, subj, text, observed_at, salience, _pred_key, _obj_text,
+         eid, name, path, summary) = r
         score = _score_claim(
             tokens=tokens,
             text=(text or "").lower(),
@@ -124,18 +125,42 @@ def search_text(query: str, k: int = 8) -> list[ClaimHit]:
         if score <= 0:
             continue
         raw_hits.append((
-            score,
+            score, eid,
             ClaimHit(
                 path=path or f"entities/.../{subj}.md",
                 text=text or "",
                 name=name,
                 score=score,
                 claim_id=cid,
+                entity_summary=summary,
             ),
         ))
 
     raw_hits.sort(key=lambda x: -x[0])
-    return [hit for _, hit in raw_hits[:max(1, min(int(k), 100))]]
+    capped = raw_hits[: max(1, min(int(k), 100))]
+
+    # Spec §3.3: emit `entity_summary` only on the FIRST hit per
+    # entity. Subsequent hits for the same entity get summary stripped
+    # so the strict-mode envelope mirrors default brain_recall (which
+    # also suppresses duplicate summaries via the projection layer).
+    seen: set[int] = set()
+    out: list[ClaimHit] = []
+    for _score, eid, hit in capped:
+        if eid is not None and eid in seen:
+            out.append(ClaimHit(
+                path=hit.path,
+                text=hit.text,
+                name=hit.name,
+                score=hit.score,
+                claim_id=hit.claim_id,
+                entity_summary=None,
+                kind=hit.kind,
+            ))
+        else:
+            if eid is not None:
+                seen.add(eid)
+            out.append(hit)
+    return out
 
 
 def _score_claim(
