@@ -421,3 +421,19 @@ def test_claims_health_extract_idle_threshold(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", "30")
     out = status.claims_health()
     assert out["extract_idle_threshold_sec"] == 30
+
+
+def test_gather_wires_claims_health_into_report(fake_vault, monkeypatch):
+    """Regression: spec §5 required claims_health() to surface via gather().
+
+    Defined in 660ff74 but never wired, so the doctor signal
+    (newest_claim_age > 600s ⇒ extraction stalled) was unreachable
+    from the public `brain status` CLI / `brain_status` MCP tool.
+    """
+    _stub_launchctl_not_loaded(monkeypatch)
+    rep = status.gather()
+    expected = status.claims_health()
+    assert rep.claims == expected
+    assert "Claims" in rep.claims.get("section", "")
+    out = status.format_text(rep)
+    assert "Claims" in out
