@@ -93,6 +93,41 @@ def test_brain_inbox_mark_read_with_limit_does_not_overconsume(monkeypatch):
     assert len(inbox.list_delivered("u1")) == 2
 
 
+def test_brain_send_triggers_throttled_gc(monkeypatch):
+    """A successful `brain_send` invokes `gc.maybe_run` so stale name
+    registrations don't accumulate forever. The throttle stamp file
+    appearing under runtime_root proves the wiring is live; the
+    behaviour of the GC itself is covered by test_runtime_gc.
+    """
+    from brain.runtime import gc as _gc
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    monkeypatch.setattr(mcp_server, "_live_uuids", lambda: set())
+    target = "ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2"
+    assert not _gc._stamp_path().exists()
+    out = json.loads(mcp_server.brain_send(to=target, body="GO"))
+    assert out["ok"]
+    assert _gc._stamp_path().exists(), "brain_send should trigger gc.maybe_run"
+
+
+def test_brain_send_gc_failure_does_not_break_send(monkeypatch):
+    """GC errors must never poison the send path — best-effort, swallowed."""
+    from brain.runtime import gc as _gc
+
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated gc crash")
+
+    monkeypatch.setattr(_gc, "maybe_run", _boom)
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    monkeypatch.setattr(mcp_server, "_live_uuids", lambda: set())
+    out = json.loads(mcp_server.brain_send(
+        to="ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2", body="GO"))
+    assert out["ok"], "send should succeed even if GC raises"
+
+
 def test_ensure_self_registered_cursor_uses_uuid_prefix(monkeypatch):
     """Regression for D-3: a `cursor:<UUIDv4>` session must get a
     UUID-prefix short id, not the parent PID. Previously the code

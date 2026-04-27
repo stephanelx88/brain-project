@@ -106,6 +106,56 @@ def test_gc_keeps_recent_orphan_inbox_under_ttl():
     assert sid_dir.exists()
 
 
+def test_maybe_run_runs_when_no_stamp_exists():
+    """First call (no stamp file) executes a GC pass and writes the stamp."""
+    msg = inbox.send("u1", "snd", "a", "b", "hi")
+    inbox.mark_delivered("u1", [msg["id"]])
+    delivered = paths.inbox_delivered_dir("u1") / f"{msg['id']}.json"
+    _age_file(delivered, days=10)
+
+    counts = gc.maybe_run(live_uuids={"u1"})
+    assert counts is not None
+    assert counts["delivered_pruned"] == 1
+    assert gc._stamp_path().exists()
+
+
+def test_maybe_run_skips_when_stamp_recent():
+    """Within throttle window: returns None and does NOT prune."""
+    # Seed a stale delivered file so we'd notice if GC ran.
+    msg = inbox.send("u1", "snd", "a", "b", "hi")
+    inbox.mark_delivered("u1", [msg["id"]])
+    delivered = paths.inbox_delivered_dir("u1") / f"{msg['id']}.json"
+    _age_file(delivered, days=10)
+
+    # Touch stamp 'now' so throttle blocks the call.
+    stamp = gc._stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+
+    counts = gc.maybe_run(live_uuids={"u1"}, min_interval_sec=3600)
+    assert counts is None
+    assert delivered.exists()  # not pruned
+
+
+def test_maybe_run_runs_when_stamp_older_than_interval():
+    """Stamp older than min_interval -> GC runs and stamp is refreshed."""
+    msg = inbox.send("u1", "snd", "a", "b", "hi")
+    inbox.mark_delivered("u1", [msg["id"]])
+    delivered = paths.inbox_delivered_dir("u1") / f"{msg['id']}.json"
+    _age_file(delivered, days=10)
+
+    stamp = gc._stamp_path()
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    _age_file(stamp, days=1)  # well past 1-hour throttle
+    pre_mtime = stamp.stat().st_mtime
+
+    counts = gc.maybe_run(live_uuids={"u1"}, min_interval_sec=3600)
+    assert counts is not None
+    assert counts["delivered_pruned"] == 1
+    assert stamp.stat().st_mtime > pre_mtime  # stamp refreshed
+
+
 def test_main_invokes_run_and_prints_summary(monkeypatch, capsys):
     """`python -m brain.runtime.gc` discovers live UUIDs, runs all GC
     passes, and prints a one-line `runtime-gc:` summary with the

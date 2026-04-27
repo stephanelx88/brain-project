@@ -1683,6 +1683,15 @@ def brain_send(to: str, body: str) -> str:
         return json.dumps({"ok": False, "error": "body_too_large",
                            "detail": str(e)})
 
+    # Best-effort throttled cleanup of dead-session names + delivered TTL.
+    # Stale name slots otherwise sit on disk for 30 days, blocking name
+    # reclaim for new sessions in the same project.
+    try:
+        from brain.runtime import gc as _gc
+        _gc.maybe_run(_live_uuids())
+    except Exception:
+        pass
+
     return json.dumps({
         "ok": True,
         "message_id": env["id"],

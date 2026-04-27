@@ -88,6 +88,25 @@ def test_invalid_recipient():
     assert not out.ok and out.error == "invalid_recipient"
 
 
+def test_ambiguous_name_when_two_entries_match():
+    """Two registry entries with the same (project, name) -> ambiguous_name.
+
+    Can occur if `register()` (the forceful bootstrap path) was called
+    twice for the same slot from different UUIDs, leaving two JSON
+    files. lookup_by_name's linear scan would otherwise return a
+    nondeterministic first match; this guard makes the failure mode
+    explicit instead of silently picking one.
+    """
+    names.register("u1", "planner", "acme", "/tmp/a", 1)
+    names.register("u2", "planner", "acme", "/tmp/b", 2)
+    out = resolve.resolve_recipient(
+        to="planner",
+        sender_project="acme",
+        live_uuids={"u1", "u2"},
+    )
+    assert not out.ok and out.error == "ambiguous_name"
+
+
 def test_lowercase_normalization_for_name():
     names.register("u1", "planner", "acme", "/tmp/a", 1)
     out = resolve.resolve_recipient(

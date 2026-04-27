@@ -73,9 +73,16 @@ def _resolve_name(
     project: str,
     live_uuids: Set[str],
 ) -> Resolved:
-    uuid = names.lookup_by_name(name, project)
-    if uuid is None:
+    matches = names.lookup_uuids_by_name(name, project)
+    if not matches:
         return _err("name_not_found", f"name {name!r} not found in project {project!r}")
+    if len(matches) > 1:
+        return _err(
+            "ambiguous_name",
+            f"name {name!r} matches {len(matches)} entries in project {project!r}; "
+            "registry needs reconciliation",
+        )
+    uuid = matches[0]
     if uuid not in live_uuids:
         return _err(
             "recipient_dead",

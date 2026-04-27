@@ -207,13 +207,35 @@ def all_entries() -> list[dict]:
 
 
 def lookup_by_name(name: str, project: str) -> Optional[str]:
-    """Return the UUID matching (name, project) or None."""
+    """Return the UUID matching (name, project) or None.
+
+    If the registry contains multiple entries with the same (project,
+    name) — possible if `register()` was called forcefully past the
+    reservation guard — the first match in `iterdir()` order wins.
+    Callers that need to detect that ambiguity should use
+    `lookup_uuids_by_name` instead.
+    """
+    matches = lookup_uuids_by_name(name, project)
+    return matches[0] if matches else None
+
+
+def lookup_uuids_by_name(name: str, project: str) -> list[str]:
+    """Return all UUIDs whose registry entry matches (name, project).
+
+    Normally length 0 or 1 — `set_name()` is race-safe via the
+    reservation lock. Length > 1 indicates the registry got into an
+    ambiguous state (forceful `register()` call after a crash, or two
+    bootstrap-path registrations colliding); `resolve._resolve_name`
+    surfaces this to the user as `ambiguous_name` rather than picking
+    a winner non-deterministically.
+    """
     project = normalize_project(project)
     name = name.lower()
-    for entry in all_entries():
-        if entry.get("name") == name and entry.get("project") == project:
-            return entry["uuid"]
-    return None
+    return [
+        entry["uuid"]
+        for entry in all_entries()
+        if entry.get("name") == name and entry.get("project") == project
+    ]
 
 
 def set_name(uuid: str, new_name: str) -> Optional[str]:

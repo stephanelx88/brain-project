@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shutil
 import time
+from pathlib import Path
 from typing import Set
 
 from brain.runtime import inbox, paths
@@ -16,6 +17,41 @@ DEFAULT_DELIVERED_TTL_DAYS = 7
 DEFAULT_PENDING_TTL_DAYS = 30
 DEFAULT_NAME_TTL_DAYS = 30
 DEFAULT_ORPHAN_TTL_DAYS = 1
+DEFAULT_THROTTLE_SEC = 3600
+
+
+def _stamp_path() -> Path:
+    return paths.runtime_root() / ".gc-stamp"
+
+
+def maybe_run(
+    live_uuids: Set[str],
+    *,
+    min_interval_sec: int = DEFAULT_THROTTLE_SEC,
+    **run_kwargs,
+) -> dict | None:
+    """Throttled GC: runs `run()` at most once per `min_interval_sec`.
+
+    Returns the counts dict if GC ran, or None if the call was skipped
+    by the throttle. The throttle is a single mtime stamp under the
+    runtime root — concurrent callers may both run once on a cold
+    start, but the cost is bounded and idempotent.
+    """
+    stamp = _stamp_path()
+    now = time.time()
+    if stamp.exists():
+        try:
+            if now - stamp.stat().st_mtime < min_interval_sec:
+                return None
+        except OSError:
+            pass  # unreadable stamp — proceed and refresh
+    counts = run(live_uuids, **run_kwargs)
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError:
+        pass
+    return counts
 
 
 def run(
