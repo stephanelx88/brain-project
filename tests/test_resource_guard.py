@@ -212,15 +212,35 @@ class TestCrossPlatformProbes:
 
 class TestLevel2IdleThreshold:
     """The Level 2 idle threshold dropped from 60s to 20s on 2026-04-25
-    to reduce note→claim extraction lag for strict-mode claim store."""
+    to reduce note→claim extraction lag for strict-mode claim store.
 
-    def test_default_threshold_is_20(self):
+    Threshold is read on each call (not at import) so a malformed env
+    value can't ValueError at import time. Tests use monkeypatch.delenv
+    for clean state instead of reading a module-level global, so they
+    are no longer order-fragile.
+    """
+
+    def test_default_threshold_is_20(self, monkeypatch):
+        monkeypatch.delenv("BRAIN_RG_IDLE_L2", raising=False)
+        monkeypatch.delenv("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", raising=False)
         from brain import resource_guard
-        assert resource_guard._IDLE_L2 == 20.0
+        assert resource_guard._idle_l2() == 20.0
 
-    def test_level_2_clears_at_20s_idle(self):
+    def test_non_numeric_env_falls_back_to_default(self, monkeypatch):
+        # Regression: import-time float() blew up on values like "60s".
+        # Now: parse failure logs and falls back to 20.0 instead of raising.
+        monkeypatch.delenv("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", raising=False)
+        monkeypatch.setenv("BRAIN_RG_IDLE_L2", "60s")
+        from brain import resource_guard
+        assert resource_guard._idle_l2() == 20.0
+
+    def test_level_2_clears_at_20s_idle(self, monkeypatch):
+        monkeypatch.delenv("BRAIN_RG_IDLE_L2", raising=False)
+        monkeypatch.delenv("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", raising=False)
         assert _level(cpu=35, idle=20) == 2
 
-    def test_level_2_blocked_below_threshold(self):
+    def test_level_2_blocked_below_threshold(self, monkeypatch):
+        monkeypatch.delenv("BRAIN_RG_IDLE_L2", raising=False)
+        monkeypatch.delenv("BRAIN_EXTRACT_IDLE_LEVEL2_SEC", raising=False)
         # 19s idle is just below the new 20s threshold
         assert _level(cpu=35, idle=19) == 1
