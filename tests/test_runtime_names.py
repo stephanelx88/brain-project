@@ -108,11 +108,10 @@ def test_delete_clears_entry():
 def test_set_name_collision_under_concurrent_writes():
     """Two sessions in the same project race to claim the same name.
 
-    Contract: at most one wins; the other gets `name_taken`. The current
-    implementation has a check-then-write race window between
-    `lookup_by_name` and `_write` (no filesystem-level locking), so this
-    test is marked xfail to document the gap without blocking CI. If
-    `set_name` ever picks up an atomic claim primitive, flip xfail off.
+    Contract: exactly one winner; the other gets `name_taken`. The
+    O_EXCL reservation file under
+    `paths.name_reservations_dir()/<project>__<name>.lock` is the
+    linearization point that makes this race-safe.
     """
     target = "shared-name"
 
@@ -120,8 +119,6 @@ def test_set_name_collision_under_concurrent_writes():
         return names.set_name(uuid, target)
 
     results: list[tuple[str, ...]] = []
-    # Hammer it across many trials to maximise the chance of catching
-    # the race; a single attempt would almost always serialise cleanly.
     trials = 50
     for _ in range(trials):
         # Reset both names back to non-conflicting before each trial.
@@ -134,14 +131,56 @@ def test_set_name_collision_under_concurrent_writes():
             "" if r is None else str(r) for r in trial_results
         )))
 
-    # Contract assertion: every trial produced exactly one winner
-    # (None) and one loser ("name_taken").
     expected = ("", "name_taken")
-    bad = [r for r in results if r != expected]
-    if bad:
-        pytest.xfail(
-            "set_name has a check-then-write race; "
-            f"{len(bad)}/{trials} trials produced {bad[:3]} instead of "
-            f"{expected}. Needs filesystem-level claim primitive."
-        )
-    assert all(r == expected for r in results)
+    assert all(r == expected for r in results), (
+        f"expected exactly-one-winner per trial; got "
+        f"{[r for r in results if r != expected][:5]}"
+    )
+
+
+def test_set_name_collision_under_4_thread_concurrent_writes():
+    """Four sessions in the same project race for the same name.
+
+    Stronger version of the 2-thread race: 4 sessions hammer one name
+    across 50 trials. Contract: exactly ONE winner per trial, the other
+    three get `name_taken`. Catches reservation primitives that only
+    happen to serialise cleanly at low contention.
+    """
+    target = "shared-name"
+    uuids = ("u1", "u2", "u3", "u4")
+
+    def _claim(uuid: str) -> object:
+        return names.set_name(uuid, target)
+
+    trials = 50
+    bad_trials: list[tuple] = []
+    for _ in range(trials):
+        # Reset every uuid to a unique non-conflicting name.
+        for i, u in enumerate(uuids, start=1):
+            names.register(u, f"honey-{i}", "acme", f"/tmp/{u}", i)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(_claim, u) for u in uuids]
+            trial_results = [f.result() for f in as_completed(futures)]
+        winners = [r for r in trial_results if r is None]
+        losers = [r for r in trial_results if r == "name_taken"]
+        if not (len(winners) == 1 and len(losers) == 3):
+            bad_trials.append(tuple(sorted(
+                "" if r is None else str(r) for r in trial_results
+            )))
+
+    assert not bad_trials, (
+        f"{len(bad_trials)}/{trials} trials had != 1 winner; "
+        f"first few: {bad_trials[:5]}"
+    )
+
+
+def test_delete_releases_reservation_so_name_is_reclaimable():
+    """After delete(uuid), the (project, name) slot must be free again."""
+    names.register("u1", "planner", "acme", "/tmp/a", 1)
+    # u2 cannot claim 'planner' while u1 holds it.
+    names.register("u2", "honey-2", "acme", "/tmp/b", 2)
+    assert names.set_name("u2", "planner") == "name_taken"
+    # Once u1 is deleted, the reservation is released and u2 can claim it.
+    names.delete("u1")
+    assert names.set_name("u2", "planner") is None
+    assert names.get("u2")["name"] == "planner"
