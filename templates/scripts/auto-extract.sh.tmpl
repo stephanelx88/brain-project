@@ -16,6 +16,10 @@ export PYTHONPATH="{{PROJECT_DIR}}/src${PYTHONPATH:+:$PYTHONPATH}"
 # Tell brain.config which vault to operate on (launchd doesn't read the
 # user's shell rc, so without this it would default to ~/.brain).
 export BRAIN_DIR="{{BRAIN_DIR}}"
+# Source persisted brain config (BRAIN_USE_CLAIMS, BRAIN_STRICT_CLAIMS, ...).
+# launchd doesn't read shell rc, so without this dual-write to
+# fact_claims is silently disabled — see incident 2026-04-27.
+[ -f "$BRAIN_DIR/.brain.conf" ] && . "$BRAIN_DIR/.brain.conf"
 PYTHON="{{PYTHON}}"
 
 LOG_DIR="{{BRAIN_DIR}}/logs"
