@@ -91,3 +91,36 @@ def test_brain_inbox_mark_read_with_limit_does_not_overconsume(monkeypatch):
     assert out["delivered_count"] == 2
     assert len(inbox.list_pending("u1")) == 3
     assert len(inbox.list_delivered("u1")) == 2
+
+
+def test_ensure_self_registered_cursor_uses_uuid_prefix(monkeypatch):
+    """Regression for D-3: a `cursor:<UUIDv4>` session must get a
+    UUID-prefix short id, not the parent PID. Previously the code
+    hardcoded source="claude" so Cursor sessions got PID-based names.
+    """
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    cursor_uuid = "cursor:ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2"
+    mcp_server._ensure_self_registered(cursor_uuid)
+    entry = names.get(cursor_uuid)
+    assert entry is not None
+    # Default-name format is "<project>-<short>"; tail = first 8 of UUID.
+    tail = entry["name"].rsplit("-", 1)[-1]
+    assert tail == "ab2b1fa6", f"expected UUID-prefix short, got {entry['name']!r}"
+    # PID-derived names would be all-digit; confirm not.
+    assert not tail.isdigit()
+
+
+def test_ensure_self_registered_claude_falls_back_to_pid(monkeypatch):
+    """D-3 regression-guard: non-cursor UUID still gets the PID-based
+    short id (legacy fallback path).
+    """
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    monkeypatch.setattr(mcp_server, "_detect_source_for_uuid", lambda u: "claude")
+    plain_uuid = "ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2"
+    mcp_server._ensure_self_registered(plain_uuid)
+    entry = names.get(plain_uuid)
+    assert entry is not None
+    tail = entry["name"].rsplit("-", 1)[-1]
+    assert tail.isdigit(), f"expected PID short-id, got {entry['name']!r}"

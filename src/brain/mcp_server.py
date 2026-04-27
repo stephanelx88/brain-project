@@ -1564,6 +1564,28 @@ def _live_uuids() -> set[str]:
     return {row["session_id"] for row in _ls.list_live_sessions(include_self=True)}
 
 
+def _detect_source_for_uuid(uuid: str) -> str:
+    """Pick `claude` vs `cursor` for short-id derivation.
+
+    Heuristic order:
+      1. `cursor:<UUIDv4>` prefix → cursor (no PID mapping available
+         on Cursor, so we use the first 8 chars of the UUID portion).
+      2. `~/.claude/sessions/<ppid>.json` exists → claude.
+      3. Default → claude (legacy fallback so existing sessions keep
+         their PID-based short id).
+    """
+    if (uuid or "").startswith("cursor:"):
+        return "cursor"
+    try:
+        from pathlib import Path
+        ppid = os.getppid()
+        if (Path.home() / ".claude" / "sessions" / f"{ppid}.json").exists():
+            return "claude"
+    except OSError:
+        pass
+    return "claude"
+
+
 def _ensure_self_registered(uuid: str) -> None:
     """Lazy-create a default-name registry entry for `uuid` on first use."""
     from brain.runtime import names as _names
@@ -1571,7 +1593,8 @@ def _ensure_self_registered(uuid: str) -> None:
     if _names.get(uuid):
         return
     project = _caller_project_for_uuid(uuid)
-    short = _sid.short_id_for_default_name(uuid, source="claude")
+    source = _detect_source_for_uuid(uuid)
+    short = _sid.short_id_for_default_name(uuid, source=source)
     _names.register(
         uuid=uuid,
         name=_names.default_name(project, short),
