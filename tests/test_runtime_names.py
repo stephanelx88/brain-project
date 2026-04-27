@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
-from brain.runtime import names
+from brain.runtime import names, paths
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +103,36 @@ def test_delete_clears_entry():
     names.register("u1", "planner", "acme", "/tmp/a", 1)
     names.delete("u1")
     assert names.get("u1") is None
+
+
+def test_all_entries_empty_when_no_names():
+    """Fresh runtime root with no registered names → empty list, no error."""
+    assert names.all_entries() == []
+
+
+def test_all_entries_returns_all():
+    """3 sessions across 2 projects → all 3 entries returned."""
+    names.register("u1", "planner", "acme", "/tmp/a", 1)
+    names.register("u2", "executor", "acme", "/tmp/b", 2)
+    names.register("u3", "planner", "other", "/tmp/c", 3)
+    entries = names.all_entries()
+    assert len(entries) == 3
+    by_uuid = {e["uuid"]: e for e in entries}
+    assert by_uuid["u1"]["name"] == "planner"
+    assert by_uuid["u1"]["project"] == "acme"
+    assert by_uuid["u2"]["name"] == "executor"
+    assert by_uuid["u3"]["project"] == "other"
+
+
+def test_all_entries_skips_corrupt_files():
+    """Malformed JSON files in names/ dir are skipped silently — the
+    valid sibling is still returned."""
+    names.register("good-uuid", "planner", "acme", "/tmp/a", 1)
+    bad = paths.names_dir() / "corrupt-uuid.json"
+    bad.write_text("not-valid-json{")
+    entries = names.all_entries()
+    # The malformed file is skipped; the good one is returned.
+    assert [e["uuid"] for e in entries] == ["good-uuid"]
 
 
 def test_set_name_collision_under_concurrent_writes():
