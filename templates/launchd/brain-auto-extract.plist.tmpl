@@ -15,21 +15,29 @@
     <key>StartInterval</key>
     <integer>300</integer>
 
-    <!-- Event-driven. The vault root + Claude project dir + Cursor agent
-         transcript dir are watched so any Obsidian save or session message
-         triggers a run. Cursor was added 2026-04-20 — without it, Cursor
-         session captures had to wait for the 5-min safety poll. -->
+    <!-- Event-driven. Watch INPUT sources only — never the vault root.
+         auto-extract writes to logs/, entities/_MOC.md, .harvested,
+         .brain.db, .extract.lock.d/, all inside {{BRAIN_DIR}}. Watching
+         the root caused a self-trigger feedback loop (~1 run/sec, 125k
+         runs in <24h, log to 57 MB) that hammered disk I/O hard enough
+         to block pyenv-rehash and freeze new terminal startup for 60s
+         (incident 2026-04-28). The 5-min StartInterval above is the
+         safety net for anything that doesn't fall under an input-only
+         watch. -->
     <key>WatchPaths</key>
     <array>
-        <string>{{BRAIN_DIR}}</string>
         <string>{{BRAIN_DIR}}/raw</string>
         <string>{{HOME}}/.claude/projects</string>
         <string>{{HOME}}/.cursor/projects</string>
     </array>
 
-    <!-- 1 s throttle: pure-Python ingest is cheap (~50 ms idle). -->
+    <!-- 30 s throttle. Bursty session writes (every keystroke updates the
+         transcript jsonl) used to fire back-to-back at 1 s, generating
+         needless Python interpreter spawns. 30 s is short enough that
+         the user perceives ingest as "live" but long enough that
+         coalescing cuts CPU pressure ~30×. -->
     <key>ThrottleInterval</key>
-    <integer>1</integer>
+    <integer>30</integer>
 
     <key>RunAtLoad</key>
     <false/>
