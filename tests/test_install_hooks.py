@@ -385,3 +385,83 @@ def test_remove_user_prompt_submit_drops_only_brain_entry(tmp_path):
     ]
     assert len(surviving) == 1
     assert "inbox-surface-hook" not in surviving[0]["command"]
+
+
+# ─── Stop hook (peer-reply auto-continue) ────────────────────────────
+
+
+def test_install_stop_writes_entry(tmp_path):
+    from brain import install_hooks
+    import json
+    home = tmp_path
+    (home / ".claude").mkdir()
+    block = {
+        "hooks": {
+            "Stop": [{
+                "hooks": [{
+                    "type": "command",
+                    "command": "/abs/path/stop-inbox-hook.sh",
+                }]
+            }]
+        }
+    }
+    res = install_hooks.install_claude_stop(home, block)
+    written = json.loads((home / ".claude" / "settings.json").read_text())
+    assert "Stop" in written["hooks"]
+    assert any(
+        "stop-inbox-hook" in h["command"]
+        for grp in written["hooks"]["Stop"]
+        for h in grp["hooks"]
+    )
+    assert res == str(home / ".claude" / "settings.json")
+
+
+def test_install_stop_preserves_user_prompt_submit_and_session_start(tmp_path):
+    from brain import install_hooks
+    import json
+    home = tmp_path
+    (home / ".claude").mkdir()
+    settings = home / ".claude" / "settings.json"
+    settings.write_text(json.dumps({
+        "hooks": {
+            "SessionStart":      [{"hooks": [{"type": "command", "command": "x brain.audit"}]}],
+            "UserPromptSubmit":  [{"hooks": [{"type": "command", "command": "/abs/inbox-surface-hook.sh"}]}],
+        }
+    }))
+    block = {
+        "hooks": {
+            "Stop": [{
+                "hooks": [{"type": "command", "command": "/abs/stop-inbox-hook.sh"}]
+            }]
+        }
+    }
+    install_hooks.install_claude_stop(home, block)
+    written = json.loads(settings.read_text())
+    assert "SessionStart" in written["hooks"]
+    assert "UserPromptSubmit" in written["hooks"]
+    assert "Stop" in written["hooks"]
+
+
+def test_remove_stop_drops_only_brain_entry(tmp_path):
+    from brain import install_hooks
+    import json
+    home = tmp_path
+    (home / ".claude").mkdir()
+    (home / ".claude" / "settings.json").write_text(json.dumps({
+        "hooks": {
+            "Stop": [{
+                "hooks": [
+                    {"type": "command", "command": "/abs/stop-inbox-hook.sh"},
+                    {"type": "command", "command": "/some/other/stop-hook.sh"},
+                ]
+            }]
+        }
+    }))
+    install_hooks.remove_claude_stop(home)
+    written = json.loads((home / ".claude" / "settings.json").read_text())
+    surviving = [
+        h for grp in written["hooks"].get("Stop", [])
+        for h in grp["hooks"]
+    ]
+    assert len(surviving) == 1
+    assert "stop-inbox-hook" not in surviving[0]["command"]

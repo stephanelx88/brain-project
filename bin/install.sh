@@ -435,11 +435,16 @@ render "$PROJECT_DIR/templates/cursor/hooks.json.tmpl"   "$HOOKS_RENDERED"
 # Honors BRAIN_NO_INBOX_HOOK=1 to skip the hook entirely (users who
 # don't want per-prompt overhead).
 INBOX_HOOK_TARGET="$BRAIN_DIR/bin/inbox-surface-hook.sh"
+STOP_HOOK_TARGET="$BRAIN_DIR/bin/stop-inbox-hook.sh"
 mkdir -p "$BRAIN_DIR/bin"
 sed "s|{{BRAIN_PYTHON}}|$PYTHON|g" \
     "$PROJECT_DIR/bin/inbox-surface-hook.sh.template" \
     > "$INBOX_HOOK_TARGET"
 chmod +x "$INBOX_HOOK_TARGET"
+sed "s|{{BRAIN_PYTHON}}|$PYTHON|g" \
+    "$PROJECT_DIR/bin/stop-inbox-hook.sh.template" \
+    > "$STOP_HOOK_TARGET"
+chmod +x "$STOP_HOOK_TARGET"
 
 INBOX_BLOCK_RENDERED="$BRAIN_DIR/.claude-userpromptsubmit.brain.json"
 cat > "$INBOX_BLOCK_RENDERED" <<EOF
@@ -456,10 +461,27 @@ cat > "$INBOX_BLOCK_RENDERED" <<EOF
 }
 EOF
 
+# Stop hook — auto-continue when a peer just sent a message, so the
+# recipient agent doesn't sit idle waiting for the user to type.
+STOP_BLOCK_RENDERED="$BRAIN_DIR/.claude-stop.brain.json"
+cat > "$STOP_BLOCK_RENDERED" <<EOF
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {"type": "command", "command": "$STOP_HOOK_TARGET"}
+        ]
+      }
+    ]
+  }
+}
+EOF
+
 if [ "${BRAIN_NO_INBOX_HOOK:-0}" = "1" ]; then
     "$PYTHON" -m brain.install_hooks install "$SETTINGS_RENDERED" "$HOOKS_RENDERED" --no-inbox-hook
 else
-    "$PYTHON" -m brain.install_hooks install "$SETTINGS_RENDERED" "$HOOKS_RENDERED" "$INBOX_BLOCK_RENDERED"
+    "$PYTHON" -m brain.install_hooks install "$SETTINGS_RENDERED" "$HOOKS_RENDERED" "$INBOX_BLOCK_RENDERED" "$STOP_BLOCK_RENDERED"
 fi
 
 # ──────────────────────────────────────────────────────────────────────

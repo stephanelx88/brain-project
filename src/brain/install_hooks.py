@@ -209,7 +209,7 @@ def install_claude_user_prompt_submit(
 
 def _is_brain_inbox_hook(entry: dict[str, Any]) -> bool:
     cmd = entry.get("command") or ""
-    return INBOX_HOOK_MARKER in cmd
+    return INBOX_HOOK_MARKER in cmd or STOP_HOOK_MARKER in cmd
 
 
 def remove_claude_user_prompt_submit(home: Path) -> str | None:
@@ -237,6 +237,56 @@ def remove_claude_user_prompt_submit(home: Path) -> str | None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# Claude Code (~/.claude/settings.json) — Stop (auto-continue on peer reply)
+# ─────────────────────────────────────────────────────────────────────────
+STOP_HOOK_MARKER = "stop-inbox-hook"
+
+
+def install_claude_stop(home: Path, brain_block: dict[str, Any]) -> str | None:
+    """Merge `brain_block`'s Stop entry into Claude settings.
+
+    Replaces the Stop array as a whole — symmetric with how
+    UserPromptSubmit and SessionStart are handled. The .bak file
+    written before mutation preserves any prior Stop hooks the user
+    had set up.
+    """
+    if not (home / ".claude").is_dir():
+        return None
+    target = _claude_settings_path(home)
+    existing = _load_json(target)
+    if existing is None:
+        return None
+    hooks = existing.setdefault("hooks", {})
+    hooks["Stop"] = brain_block["hooks"]["Stop"]
+    _save_json(target, existing)
+    return str(target)
+
+
+def remove_claude_stop(home: Path) -> str | None:
+    target = _claude_settings_path(home)
+    existing = _load_json(target)
+    if not existing:
+        return None
+    bag = existing.get("hooks") or {}
+    starters = bag.get("Stop") or []
+    cleaned: list[dict[str, Any]] = []
+    for group in starters:
+        inner = [h for h in (group.get("hooks") or []) if not _is_brain_inbox_hook(h)]
+        if inner:
+            cleaned.append({**group, "hooks": inner})
+    if cleaned == starters:
+        return None
+    if cleaned:
+        bag["Stop"] = cleaned
+    else:
+        bag.pop("Stop", None)
+    if not bag:
+        existing.pop("hooks", None)
+    _save_json(target, existing)
+    return str(target)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────
 def main(argv: list[str] | None = None) -> int:
@@ -250,14 +300,23 @@ def main(argv: list[str] | None = None) -> int:
 
     if action == "install":
         if len(argv) < 3:
-            print("usage: install <settings_src> <hooks_src> [<inbox_hook_src>]",
+            print("usage: install <settings_src> <hooks_src> "
+                  "[<inbox_hook_src>] [<stop_hook_src>]",
                   file=sys.stderr)
             return 2
         settings_block = json.loads(Path(argv[1]).read_text())
         hooks_block = json.loads(Path(argv[2]).read_text())
         inbox_block = None
-        if len(argv) >= 4 and argv[3] != "--no-inbox-hook":
-            inbox_block = json.loads(Path(argv[3]).read_text())
+        stop_block = None
+        # Two optional hook srcs in argv[3:]. --no-inbox-hook skips both
+        # (Stop hook depends on the same plumbing). Positional otherwise.
+        rest = argv[3:]
+        if rest and rest[0] == "--no-inbox-hook":
+            rest = []  # explicit skip — neither inbox nor stop
+        if len(rest) >= 1:
+            inbox_block = json.loads(Path(rest[0]).read_text())
+        if len(rest) >= 2:
+            stop_block = json.loads(Path(rest[1]).read_text())
         for label, fn, payload in (
             ("Claude SessionStart hook installed",  install_claude, settings_block),
             ("Cursor sessionStart hook installed",  install_cursor, hooks_block),
@@ -278,12 +337,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"      ✓ Claude UserPromptSubmit (inbox surface) installed ({res})")
             elif (home / ".claude").is_dir():
                 print("      ! Claude UserPromptSubmit install failed — inbox-hook skipped.")
+        if stop_block is not None:
+            res = install_claude_stop(home, stop_block)
+            if res:
+                print(f"      ✓ Claude Stop (peer-reply auto-continue) installed ({res})")
+            elif (home / ".claude").is_dir():
+                print("      ! Claude Stop install failed — stop-hook skipped.")
         return 0
 
     if action == "remove":
         for label, fn in (
             ("Claude SessionStart hook removed", remove_claude),
             ("Claude UserPromptSubmit hook removed", remove_claude_user_prompt_submit),
+            ("Claude Stop hook removed", remove_claude_stop),
             ("Cursor sessionStart hook removed", remove_cursor),
         ):
             res = fn(home)

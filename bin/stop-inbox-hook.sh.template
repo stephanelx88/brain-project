@@ -1,0 +1,34 @@
+#!/bin/bash
+# Wired into Claude Code as a Stop hook by `brain install`.
+# Runs once per assistant turn END.
+#
+# When a peer just sent a message via brain_send, normally the recipient
+# session goes idle waiting for the user to type SOMETHING (so its
+# UserPromptSubmit hook fires and surfaces the message). This Stop
+# hook closes that gap: if pending/ has messages — or one lands during
+# a brief poll window — emit Claude Code's Stop-hook decision JSON
+# `{"decision": "block", "reason": <inbox block>}` and the agent
+# auto-continues with those messages as its next turn.
+#
+# Empty-inbox fast path — exit before starting Python when the recipient
+# has no pending messages and BRAIN_STOP_POLL_SEC is 0. Sub-millisecond
+# in the common case.
+set -u
+
+RUNTIME_DIR="${BRAIN_RUNTIME_DIR:-$HOME/.brain-runtime}"
+SID="${CLAUDE_SESSION_ID:-}"
+POLL_SEC="${BRAIN_STOP_POLL_SEC:-2}"
+
+if [ -z "$SID" ]; then
+    exit 0
+fi
+
+# Fast path: no pending AND no poll requested → return without forking python.
+PENDING_DIR="$RUNTIME_DIR/inbox/$SID/pending"
+if [ "$POLL_SEC" = "0" ]; then
+    [ -d "$PENDING_DIR" ] || exit 0
+    compgen -G "$PENDING_DIR/*.json" >/dev/null || exit 0
+fi
+
+mkdir -p "$RUNTIME_DIR/log"
+exec "{{BRAIN_PYTHON}}" -m brain.runtime.hook --stop 2>>"$RUNTIME_DIR/log/inbox-hook.log"
