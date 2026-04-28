@@ -1587,10 +1587,26 @@ def _detect_source_for_uuid(uuid: str) -> str:
 
 
 def _ensure_self_registered(uuid: str) -> None:
-    """Lazy-create a default-name registry entry for `uuid` on first use."""
+    """Lazy-create a default-name registry entry for `uuid` on first use.
+
+    Captures TMUX_PANE from the env so peers can wake this session via
+    `tmux send-keys` when they brain_send. Outside tmux, the field is
+    None and poke is skipped — UserPromptSubmit/Stop hooks remain the
+    delivery path.
+    """
     from brain.runtime import names as _names
     from brain.runtime import session_id as _sid
-    if _names.get(uuid):
+    existing = _names.get(uuid)
+    pane = os.environ.get("TMUX_PANE") or None
+    # Refresh the pane field even when an entry already exists — a
+    # session restarted in a new tmux pane should poke to the new one.
+    if existing:
+        if existing.get("tmux_pane") != pane:
+            existing["tmux_pane"] = pane
+            # _write is private; go through the module to keep the
+            # write path uniform.
+            from brain.runtime.names import _write as _names_write  # noqa: PLC0415
+            _names_write(uuid, existing)
         return
     project = _caller_project_for_uuid(uuid)
     source = _detect_source_for_uuid(uuid)
@@ -1601,6 +1617,7 @@ def _ensure_self_registered(uuid: str) -> None:
         project=project,
         cwd=_caller_cwd(),
         pid=int(short) if short.isdigit() else None,
+        tmux_pane=pane,
     )
 
 
@@ -1685,6 +1702,17 @@ def brain_send(to: str, body: str) -> str:
     except _inbox.BodyTooLarge as e:
         return json.dumps({"ok": False, "error": "body_too_large",
                            "detail": str(e)})
+
+    # Best-effort wake the recipient. Skipped when recipient registered
+    # without a tmux pane (not in tmux) or BRAIN_TMUX_POKE=0. Failures
+    # are silent — the recipient's UserPromptSubmit/Stop hook is the
+    # always-available fallback. Closes the "long-idle peer doesn't
+    # notice my message" gap that hooks alone can't solve.
+    try:
+        from brain.runtime import poke as _poke
+        _poke.poke_session(decision.uuid)
+    except Exception:  # noqa: BLE001
+        pass
 
     # Best-effort throttled cleanup of dead-session names + delivered TTL.
     # Stale name slots otherwise sit on disk for 30 days, blocking name

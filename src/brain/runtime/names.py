@@ -152,6 +152,7 @@ def register(
     project: str,
     cwd: str,
     pid: int | None,
+    tmux_pane: Optional[str] = None,
 ) -> dict:
     """Write a name registry entry. Overwrites any prior entry for `uuid`.
 
@@ -162,6 +163,12 @@ def register(
     is what `lookup_by_name` continues to see — register() is the
     "I'm taking this slot for myself" path used by tests/bootstrap and
     must not silently fail; for race-correct rename, use set_name().
+
+    `tmux_pane` (e.g. `%42`) is captured from the env at registration
+    time so peers can deliver wake-up keystrokes via `tmux send-keys`
+    when sending a brain_send. None when the session isn't running
+    inside tmux — in that case poke is silently skipped and the
+    UserPromptSubmit/Stop hook is the only delivery channel.
     """
     norm_project = normalize_project(project)
     entry = {
@@ -170,6 +177,7 @@ def register(
         "project": norm_project,
         "cwd": cwd,
         "pid": pid,
+        "tmux_pane": tmux_pane,
         "set_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
     }
     # Drop any reservations this uuid previously held under a different
