@@ -238,7 +238,11 @@ def lookup_uuids_by_name(name: str, project: str) -> list[str]:
     ]
 
 
-def set_name(uuid: str, new_name: str) -> Optional[str]:
+def set_name(
+    uuid: str,
+    new_name: str,
+    live_uuids: Optional[set[str]] = None,
+) -> Optional[str]:
     """Rename the entry for `uuid`. Returns error code or None.
 
     Error codes: validation codes from validate_user_name + "name_taken",
@@ -248,6 +252,13 @@ def set_name(uuid: str, new_name: str) -> Optional[str]:
     `paths.name_reservations_dir()` is created with O_CREAT|O_EXCL so it
     acts as the linearization point. Concurrent calls racing for the
     same name resolve to exactly one winner; losers see "name_taken".
+
+    Dead-holder takeover: when `live_uuids` is supplied and the slot is
+    held by a UUID NOT in that set, the dead holder's reservation and
+    name entry are silently reclaimed instead of returning "name_taken".
+    Without 30-day TTL pressure, sessions that crash or are killed would
+    otherwise lock their name forever — the live caller's claim wins.
+    `live_uuids=None` preserves the strict pre-2026-04-28 behavior.
     """
     err = validate_user_name(new_name)
     if err:
@@ -263,7 +274,15 @@ def set_name(uuid: str, new_name: str) -> Optional[str]:
     # the operation race-safe.
     other_uuid = lookup_by_name(new_name, project)
     if other_uuid and other_uuid != uuid:
-        return "name_taken"
+        if live_uuids is not None and other_uuid not in live_uuids:
+            # Holder is dead — free its slot so the live caller wins.
+            _release_reservation(project, new_name, other_uuid)
+            other_entry = get(other_uuid)
+            if other_entry and other_entry.get("name") == new_name:
+                other_entry["name"] = None
+                _write(other_uuid, other_entry)
+        else:
+            return "name_taken"
     if not _try_reserve(uuid, project, new_name):
         return "name_taken"
     # Reservation now held by `uuid`. Release the old name's

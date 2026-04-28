@@ -214,3 +214,31 @@ def test_delete_releases_reservation_so_name_is_reclaimable():
     names.delete("u1")
     assert names.set_name("u2", "planner") is None
     assert names.get("u2")["name"] == "planner"
+
+
+def test_set_name_takes_over_from_dead_holder():
+    """When live_uuids hints that the current holder is dead, set_name
+    silently reclaims the slot rather than returning name_taken."""
+    names.register("u1-dead", "planner", "acme", "/tmp/a", 1)
+    names.register("u2-live", "honey-2", "acme", "/tmp/b", 2)
+    # Without the hint, behavior is unchanged — strict name_taken.
+    assert names.set_name("u2-live", "planner") == "name_taken"
+    # With live_uuids excluding u1-dead, u2-live wins.
+    assert names.set_name("u2-live", "planner", live_uuids={"u2-live"}) is None
+    assert names.get("u2-live")["name"] == "planner"
+    # The dead holder's entry was rewritten to drop the now-stolen name.
+    assert names.get("u1-dead")["name"] is None
+
+
+def test_set_name_does_not_steal_from_live_holder_even_with_hint():
+    """If live_uuids includes the current holder, name_taken still wins —
+    we must not steal a slot from a session that's actually alive."""
+    names.register("u1-alive", "planner", "acme", "/tmp/a", 1)
+    names.register("u2-also-alive", "honey-2", "acme", "/tmp/b", 2)
+    err = names.set_name(
+        "u2-also-alive",
+        "planner",
+        live_uuids={"u1-alive", "u2-also-alive"},
+    )
+    assert err == "name_taken"
+    assert names.get("u1-alive")["name"] == "planner"

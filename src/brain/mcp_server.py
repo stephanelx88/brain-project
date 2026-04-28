@@ -1623,7 +1623,10 @@ def brain_set_name(name: str) -> str:
         return json.dumps({"ok": False, "error": "no_session",
                            "detail": "could not detect own session UUID"})
     _ensure_self_registered(uuid)
-    err = _names.set_name(uuid, name)
+    # Pass live_uuids so set_name can reclaim a slot held by a dead
+    # session — name_taken should only mean "another *live* session
+    # owns this name", not "some long-gone PID still has it on disk".
+    err = _names.set_name(uuid, name, live_uuids=_live_uuids())
     if err:
         return json.dumps({"ok": False, "error": err})
     entry = _names.get(uuid) or {}
