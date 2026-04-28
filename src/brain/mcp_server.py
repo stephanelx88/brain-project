@@ -1776,6 +1776,65 @@ def brain_inbox(unread_only: bool = True, limit: int = 50,
     })
 
 
+@mcp.tool()
+def brain_wait_for_inbox(timeout_sec: int = 60, poll_interval_sec: float = 1.0) -> str:
+    """Block until a peer message arrives in the inbox or timeout.
+
+    Tmux-free alternative to the tmux-poke wake-up: when you've just
+    sent a brain_send and expect a reply, call this to block your turn
+    until the reply lands. The MCP server polls the inbox server-side
+    while this tool is open — your agent isn't generating tokens during
+    the wait, so it costs nothing in API.
+
+    Use this when:
+      - Your machine isn't running Claude Code inside tmux (so the
+        sender's tmux poke can't reach you).
+      - You're building a synchronous request/response between two
+        sessions and want a single tool call rather than a Stop-hook
+        round trip.
+
+    Args:
+      timeout_sec: max seconds to wait, clamped [1, 300]. Default 60.
+      poll_interval_sec: how often to recheck the inbox, clamped
+        [0.25, 10]. Default 1.0.
+
+    Returns JSON {ok, messages, timed_out, waited_sec}. messages are
+    automatically marked-delivered when returned (you explicitly waited
+    for them, so the UserPromptSubmit hook would just re-show the same
+    block). On timeout, messages is [].
+    """
+    from brain.runtime import inbox as _inbox
+    from brain.runtime import session_id as _sid
+    own = _sid.detect_own_uuid()
+    if not own:
+        return json.dumps({"ok": False, "error": "no_session"})
+    _ensure_self_registered(own)
+
+    timeout_sec = max(1, min(int(timeout_sec), 300))
+    poll = max(0.25, min(float(poll_interval_sec), 10.0))
+    start = time.monotonic()
+    deadline = start + timeout_sec
+    while True:
+        pending = _inbox.list_pending(own)
+        if pending:
+            ids = [m["id"] for m in pending]
+            _inbox.mark_delivered(own, ids)
+            return json.dumps({
+                "ok": True,
+                "messages": pending,
+                "timed_out": False,
+                "waited_sec": round(time.monotonic() - start, 2),
+            })
+        if time.monotonic() >= deadline:
+            return json.dumps({
+                "ok": True,
+                "messages": [],
+                "timed_out": True,
+                "waited_sec": round(time.monotonic() - start, 2),
+            })
+        time.sleep(poll)
+
+
 def main():
     # Kick warmup off in a daemon thread BEFORE mcp.run() so the
     # embedding model loads in the background while the MCP stdio

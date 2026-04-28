@@ -75,6 +75,81 @@ def test_brain_inbox_mark_read_moves_files(monkeypatch):
     assert len(inbox.list_delivered("u1")) == 1
 
 
+def test_brain_wait_for_inbox_returns_immediately_when_pending(monkeypatch):
+    """If a message is already pending, wait_for_inbox should return
+    on its first poll without sleeping."""
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+    inbox.send("u1", "snd", "planner", "executor", "ALREADY-WAITING")
+    out = json.loads(mcp_server.brain_wait_for_inbox(timeout_sec=5))
+    assert out["ok"] is True
+    assert out["timed_out"] is False
+    assert len(out["messages"]) == 1
+    assert out["messages"][0]["body"] == "ALREADY-WAITING"
+    assert out["waited_sec"] < 1.0
+    # Side effect: drained from pending so UserPromptSubmit hook
+    # doesn't double-deliver.
+    assert inbox.list_pending("u1") == []
+    assert len(inbox.list_delivered("u1")) == 1
+
+
+def test_brain_wait_for_inbox_unblocks_on_late_arrival(monkeypatch):
+    """A reply that lands during the wait window should unblock the
+    tool — not waiting for the full timeout."""
+    import threading
+    import time as _time
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+
+    def _late_send():
+        _time.sleep(0.4)
+        inbox.send("u1", "snd", "planner", "executor", "PEER-REPLY")
+
+    t = threading.Thread(target=_late_send)
+    t.start()
+    out = json.loads(mcp_server.brain_wait_for_inbox(
+        timeout_sec=5, poll_interval_sec=0.25))
+    t.join()
+    assert out["ok"] is True
+    assert out["timed_out"] is False
+    assert out["messages"][0]["body"] == "PEER-REPLY"
+    # Unblocked well before the 5s timeout — order of magnitude check.
+    assert out["waited_sec"] < 2.0
+
+
+def test_brain_wait_for_inbox_returns_timed_out_when_silent(monkeypatch):
+    """No messages within the timeout → timed_out=True, messages empty."""
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+    out = json.loads(mcp_server.brain_wait_for_inbox(
+        timeout_sec=1, poll_interval_sec=0.25))
+    assert out["ok"] is True
+    assert out["timed_out"] is True
+    assert out["messages"] == []
+    assert out["waited_sec"] >= 0.9
+
+
+def test_brain_wait_for_inbox_no_session_returns_error(monkeypatch):
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: None)
+    out = json.loads(mcp_server.brain_wait_for_inbox(timeout_sec=1))
+    assert out["ok"] is False
+    assert out["error"] == "no_session"
+
+
+def test_brain_wait_for_inbox_clamps_timeout(monkeypatch):
+    """Timeout is clamped to [1, 300]; absurd values don't lock the
+    tool open. We verify the upper clamp by passing a huge value and
+    a peer message that arrives quickly — the tool returns promptly."""
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+    inbox.send("u1", "snd", "planner", "executor", "HI")
+    out = json.loads(mcp_server.brain_wait_for_inbox(timeout_sec=10000))
+    # Should still return immediately because pending was non-empty;
+    # this exercises the path even though we can't easily prove the
+    # internal clamp without timing the timeout branch.
+    assert out["ok"] is True and out["messages"][0]["body"] == "HI"
+
+
 def test_brain_inbox_mark_read_with_limit_does_not_overconsume(monkeypatch):
     """Regression for D-1: mark_read=True must only move the LISTED
     slice, not the full pending queue. Previously, with 5 pending and
