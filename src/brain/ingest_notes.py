@@ -56,6 +56,13 @@ EXCLUDE_FILE_PREFIXES = ("_",)  # _MOC.md, _placeholder.md, etc.
 # `.markdown` is the long-form alias a few editors emit.
 INGEST_EXTENSIONS = {".md", ".markdown", ".txt", ".text"}
 
+# Anything under <vault>/playbooks/ is indexed regardless of extension.
+# This is the "scripts brain stores so Claude can find + run them" path
+# (agent reads via brain_recall, executes via the Bash tool — brain
+# itself never runs code). A `.sh` outside `playbooks/` is still
+# skipped so we don't accidentally index every script in the vault.
+PLAYBOOK_DIR_NAME = "playbooks"
+
 # Hard cap so we don't OOM on a 50 MB markdown dump someone pasted in.
 MAX_BYTES = 256 * 1024
 
@@ -64,10 +71,18 @@ def _should_skip_dir(path: Path) -> bool:
     return path.name in EXCLUDE_DIR_NAMES or path.name.startswith(".")
 
 
+def _is_under_playbooks(path: Path) -> bool:
+    return PLAYBOOK_DIR_NAME in path.parts
+
+
 def _should_skip_file(path: Path) -> bool:
-    if path.suffix.lower() not in INGEST_EXTENSIONS:
-        return True
+    # Underscore-prefix is "machine-managed metadata, skip" everywhere,
+    # including playbooks/ (so e.g. _draft.md doesn't get indexed).
     if any(path.name.startswith(p) for p in EXCLUDE_FILE_PREFIXES):
+        return True
+    if _is_under_playbooks(path):
+        return False
+    if path.suffix.lower() not in INGEST_EXTENSIONS:
         return True
     return False
 

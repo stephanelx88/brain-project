@@ -1,0 +1,43 @@
+---
+name: {{ Human-readable name }}
+slug: {{ kebab-case-id }}
+summary: {{ One-line description, surfaces in brain_recall hit lists }}
+when_to_use: |
+  {{ Free-form criteria. Examples:
+       - User says "..." / "..." / "..."
+       - Trigger condition.
+       - When NOT to use this. }}
+inputs:
+  {{ name }}: {{ what to collect from the user / context }}
+outputs:
+  - {{ what the playbook produces / verifies }}
+language: bash         # bash | python | node | ...
+script: ./{{ slug }}.sh   # relative path; remove if no script
+safety: destructive    # readonly | destructive
+requires_confirm: true # remove or set to false for trivially-safe actions
+tags: []
+---
+
+# {{ Title }}
+
+## When to use
+{{ Expand the frontmatter. Concrete examples of the user prompts that
+   should activate this playbook. Edge cases to avoid. }}
+
+## Steps
+1. {{ step 1 }}
+2. {{ step 2 }}
+3. {{ step 3 }}
+
+## Verify
+```bash
+{{ command(s) the agent runs to confirm success }}
+```
+
+## Rollback
+{{ How to undo if a step failed mid-way. Reference a script flag,
+   manual procedure, or "no rollback needed" if the playbook is
+   read-only. }}
+
+## Notes
+{{ Optional: links to relevant entities, prior incidents, gotchas. }}

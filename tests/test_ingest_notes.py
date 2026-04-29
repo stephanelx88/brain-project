@@ -401,6 +401,64 @@ def test_ingest_rejects_unsupported_extensions(tmp_vault):
     assert "config.json" not in paths
 
 
+# ---------------------------------------------------------------------------
+# Playbook directory — index any extension under <vault>/playbooks/
+#
+# Brain stores runnable knowledge: a playbook .md doc + an executable
+# script (.sh/.py/.js). The agent reads both via brain_recall and runs
+# the script through its own shell tool. Ingest must therefore index
+# script files, but only inside the playbooks/ dir — outside it, .sh
+# stays skipped so we don't flood the notes index.
+# ---------------------------------------------------------------------------
+
+
+def test_ingest_indexes_scripts_under_playbooks_dir(tmp_vault):
+    """A .sh / .py inside playbooks/ is indexed; a .sh elsewhere isn't."""
+    from brain import ingest_notes, db
+    (tmp_vault / "playbooks").mkdir()
+    (tmp_vault / "playbooks" / "deploy.md").write_text(
+        "# Deploy staging\n\n## Steps\n1. run deploy.sh"
+    )
+    (tmp_vault / "playbooks" / "deploy.sh").write_text(
+        "#!/bin/bash\nset -euo pipefail\necho deploying"
+    )
+    (tmp_vault / "playbooks" / "rotate" / "verify.py").parent.mkdir()
+    (tmp_vault / "playbooks" / "rotate" / "verify.py").write_text(
+        "import os\nprint('rotated')"
+    )
+    # Control: a .sh outside playbooks/ stays skipped.
+    (tmp_vault / "stray.sh").write_text("#!/bin/bash\necho stray")
+    (tmp_vault / "kept.md").write_text("normal note")
+
+    ingest_notes.ingest_all()
+    with db.connect() as c:
+        paths = {row[0] for row in c.execute("SELECT path FROM notes").fetchall()}
+
+    assert "playbooks/deploy.md" in paths
+    assert "playbooks/deploy.sh" in paths, "scripts under playbooks/ must be indexed"
+    assert "playbooks/rotate/verify.py" in paths, "nested playbook scripts must be indexed"
+    assert "kept.md" in paths
+    assert "stray.sh" not in paths, "scripts outside playbooks/ must NOT be indexed"
+
+
+def test_ingest_skips_underscore_prefix_inside_playbooks(tmp_vault):
+    """Underscore-prefix exclusion applies even inside playbooks/, so users
+    can stage drafts as _wip.md without polluting recall."""
+    from brain import ingest_notes, db
+    (tmp_vault / "playbooks").mkdir()
+    (tmp_vault / "playbooks" / "real.md").write_text("# Real\n\nfor real")
+    (tmp_vault / "playbooks" / "_draft.md").write_text("# WIP\n\nnot ready")
+    (tmp_vault / "playbooks" / "_template.md").write_text("# Template")
+
+    ingest_notes.ingest_all()
+    with db.connect() as c:
+        paths = {row[0] for row in c.execute("SELECT path FROM notes").fetchall()}
+
+    assert "playbooks/real.md" in paths
+    assert "playbooks/_draft.md" not in paths
+    assert "playbooks/_template.md" not in paths
+
+
 
 def test_ingest_one_delete_calls_semantic_invalidate_for_touched_entities(tmp_vault, monkeypatch):
     from brain import ingest_notes
