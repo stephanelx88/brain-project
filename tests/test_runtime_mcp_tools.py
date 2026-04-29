@@ -150,6 +150,112 @@ def test_brain_wait_for_inbox_clamps_timeout(monkeypatch):
     assert out["ok"] is True and out["messages"][0]["body"] == "HI"
 
 
+# ─── brain_send_and_wait — synchronous request/response ──────────
+
+
+def test_brain_send_and_wait_returns_late_arriving_reply(monkeypatch):
+    """Sender sees the peer's reply inside the same tool call — the
+    turn doesn't have to end between send and receive."""
+    import threading
+    import time as _time
+    target = "ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2"
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    monkeypatch.setattr(mcp_server, "_live_uuids", lambda: {"u1", target})
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+    # Disable tmux poke so we don't shell out during tests.
+    monkeypatch.setenv("BRAIN_TMUX_POKE", "0")
+    names.register(target, "executor", "acme", "/tmp/x", 99)
+    names.register("u1", "planner", "acme", "/tmp/u1", 1)
+
+    def _peer_replies():
+        _time.sleep(0.4)
+        inbox.send("u1", target, "executor", "planner", "ANSWER")
+
+    t = threading.Thread(target=_peer_replies)
+    t.start()
+    out = json.loads(mcp_server.brain_send_and_wait(
+        to=target, body="QUESTION", timeout_sec=5, poll_interval_sec=0.25))
+    t.join()
+
+    assert out["ok"] is True
+    assert out["timed_out"] is False
+    assert out["reply"]["body"] == "ANSWER"
+    # Sub-second-ish; just bound to "well under timeout".
+    assert out["waited_sec"] < 2.0
+    # Reply was marked-delivered, not left lingering for next inbox call.
+    assert inbox.list_pending("u1") == []
+
+
+def test_brain_send_and_wait_times_out_when_silent(monkeypatch):
+    target = "ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2"
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    monkeypatch.setattr(mcp_server, "_live_uuids", lambda: {"u1", target})
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+    monkeypatch.setenv("BRAIN_TMUX_POKE", "0")
+
+    out = json.loads(mcp_server.brain_send_and_wait(
+        to=target, body="QUESTION", timeout_sec=1, poll_interval_sec=0.25))
+    assert out["ok"] is True
+    assert out["timed_out"] is True
+    assert out["reply"] is None
+    assert out["sent_message_id"]  # send still happened
+    assert out["waited_sec"] >= 0.9
+
+
+def test_brain_send_and_wait_propagates_send_error(monkeypatch):
+    """If the underlying brain_send fails (recipient dead, etc.) the
+    error surfaces unchanged — we don't blindly enter the wait loop."""
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    monkeypatch.setattr(mcp_server, "_live_uuids", lambda: {"u1"})
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+    names.register("ghost", "executor", "acme", "/tmp/g", 99)
+    out = json.loads(mcp_server.brain_send_and_wait(
+        to="executor", body="GO", timeout_sec=1))
+    assert out["ok"] is False
+    assert out["error"] == "recipient_dead"
+
+
+def test_brain_send_and_wait_ignores_pre_existing_inbox(monkeypatch):
+    """A message that was in the inbox BEFORE the send shouldn't
+    masquerade as the reply — we only consider arrivals after."""
+    import threading
+    import time as _time
+    target = "ab2b1fa6-22a4-4a7c-b719-7fb62a972aa2"
+    monkeypatch.setattr("brain.runtime.session_id.detect_own_uuid", lambda: "u1")
+    monkeypatch.setattr(mcp_server, "_caller_project_for_uuid", lambda u: "acme")
+    monkeypatch.setattr(mcp_server, "_caller_cwd", lambda: "/tmp/acme")
+    monkeypatch.setattr(mcp_server, "_live_uuids", lambda: {"u1", target})
+    monkeypatch.setattr(mcp_server, "_ensure_self_registered", lambda u: None)
+    monkeypatch.setenv("BRAIN_TMUX_POKE", "0")
+    names.register(target, "executor", "acme", "/tmp/x", 99)
+    names.register("u1", "planner", "acme", "/tmp/u1", 1)
+    # A stale message already in u1's pending — must NOT match.
+    inbox.send("u1", "stranger", "stranger", "planner", "OLD-NEWS")
+
+    def _peer_replies():
+        _time.sleep(0.3)
+        inbox.send("u1", target, "executor", "planner", "FRESH")
+
+    t = threading.Thread(target=_peer_replies)
+    t.start()
+    out = json.loads(mcp_server.brain_send_and_wait(
+        to=target, body="QUESTION", timeout_sec=5, poll_interval_sec=0.25))
+    t.join()
+    # Reply field is the fresh message, not the stale one.
+    assert out["reply"]["body"] == "FRESH"
+    # Stale message stays in pending — UserPromptSubmit hook will
+    # surface it on the next user turn.
+    pending_bodies = [m["body"] for m in inbox.list_pending("u1")]
+    assert "OLD-NEWS" in pending_bodies
+    assert "FRESH" not in pending_bodies
+
+
 def test_brain_inbox_mark_read_with_limit_does_not_overconsume(monkeypatch):
     """Regression for D-1: mark_read=True must only move the LISTED
     slice, not the full pending queue. Previously, with 5 pending and

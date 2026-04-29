@@ -1777,6 +1777,97 @@ def brain_inbox(unread_only: bool = True, limit: int = 50,
 
 
 @mcp.tool()
+def brain_send_and_wait(
+    to: str,
+    body: str,
+    timeout_sec: int = 120,
+    poll_interval_sec: float = 1.0,
+) -> str:
+    """Send a peer message and block this turn until a reply arrives.
+
+    Equivalent to `brain_send(...)` immediately followed by
+    `brain_wait_for_inbox(...)`, but as a single tool call so your
+    turn doesn't end between sending and waiting. Use this whenever
+    you ask a peer agent a question and want the answer back inside
+    the same turn — sub-second turn-boundary latency vs. the multi-
+    second cost of round-tripping through the Stop hook.
+
+    Args:
+      to: recipient (UUID, name, or `<project>/<name>`).
+      body: message text.
+      timeout_sec: max seconds to wait for a reply, clamped [1, 600].
+        Default 120. The wait is server-side — your agent isn't
+        generating tokens while blocked, so cost is zero.
+      poll_interval_sec: how often the server-side poll checks the
+        inbox, clamped [0.25, 10]. Default 1.0.
+
+    Returns JSON:
+      {ok: True, sent_message_id, reply: {...envelope...},
+       timed_out: False, waited_sec}
+      {ok: True, sent_message_id, reply: None,
+       timed_out: True,  waited_sec}        ← peer didn't answer in time
+      {ok: False, error, detail?}            ← send itself failed
+
+    The `reply` field is the FIRST peer message that lands after the
+    send; further messages stay in pending/ for the next inbox call.
+    Returned messages are auto-marked-delivered (you explicitly
+    waited for them).
+    """
+    # Reuse the brain_send code path so we honor every existing
+    # invariant (resolution, gc.maybe_run, tmux poke).
+    send_result = json.loads(brain_send(to=to, body=body))
+    if not send_result.get("ok"):
+        return json.dumps(send_result)
+
+    from brain.runtime import inbox as _inbox
+    from brain.runtime import session_id as _sid
+    own = _sid.detect_own_uuid()
+    if not own:
+        # send succeeded but we can't watch our own inbox without a
+        # uuid — return the send result with reply=None.
+        return json.dumps({
+            "ok": True,
+            "sent_message_id": send_result.get("message_id"),
+            "reply": None,
+            "timed_out": True,
+            "waited_sec": 0,
+            "detail": "no_session: cannot watch inbox without own uuid",
+        })
+
+    # Snapshot pre-send pending so a stale message that was already
+    # there doesn't masquerade as the reply. We only consider messages
+    # that arrived AFTER the send.
+    pre_existing_ids = {m["id"] for m in _inbox.list_pending(own)}
+
+    timeout_sec = max(1, min(int(timeout_sec), 600))
+    poll = max(0.25, min(float(poll_interval_sec), 10.0))
+    start = time.monotonic()
+    deadline = start + timeout_sec
+    while True:
+        pending = _inbox.list_pending(own)
+        new_msgs = [m for m in pending if m["id"] not in pre_existing_ids]
+        if new_msgs:
+            reply = new_msgs[0]
+            _inbox.mark_delivered(own, [reply["id"]])
+            return json.dumps({
+                "ok": True,
+                "sent_message_id": send_result.get("message_id"),
+                "reply": reply,
+                "timed_out": False,
+                "waited_sec": round(time.monotonic() - start, 2),
+            })
+        if time.monotonic() >= deadline:
+            return json.dumps({
+                "ok": True,
+                "sent_message_id": send_result.get("message_id"),
+                "reply": None,
+                "timed_out": True,
+                "waited_sec": round(time.monotonic() - start, 2),
+            })
+        time.sleep(poll)
+
+
+@mcp.tool()
 def brain_playbook_record_lesson(slug: str, lesson: str) -> str:
     """Append a lesson learned to a playbook's `## Lessons learned`
     section. Use this after running a playbook when something

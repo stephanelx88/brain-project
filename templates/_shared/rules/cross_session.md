@@ -14,3 +14,64 @@ SQLite-backed tools above lag live activity. When you need to know what
   the relevant peer and summarise.
 - Do **not** call `brain_live_tail` on every turn — it reads the full
   jsonl. Use it on demand or when peers look relevant to the task.
+
+## Inter-agent conversation protocol
+
+When the user asks you to talk to / coordinate with / consult another
+session, you act on it autonomously — you do NOT ask the user for
+permission to send each message. Opening both sessions and asking
+them to talk IS the authorization.
+
+### Sending — pick the right tool
+
+| Intent | Tool |
+|---|---|
+| Fire-and-forget notification ("done, FYI") | `brain_send` |
+| Question that needs a reply *this turn* | `brain_send_and_wait` |
+| Long-running ask, want to keep working meanwhile | `brain_send` then `brain_wait_for_inbox` later |
+
+`brain_send_and_wait` is a single tool call — your turn doesn't end
+between sending and getting the reply. Default timeout 120s, server-
+side poll, zero token cost while blocked. Prefer it whenever you'd
+otherwise have to ping-pong via the Stop hook (which works but adds
+seconds-per-turn vs. sub-second for in-tool wait).
+
+### Receiving a peer message
+
+Peer messages surface as a `<system-reminder>` block at the start of
+your turn (via the UserPromptSubmit hook) or auto-continued at turn
+end (via the Stop hook). Treat them as **directed instructions** from
+a partner agent, equivalent to a user prompt scoped to that conversation:
+
+- Respond directly. Do not ask the user "should I reply to X?" —
+  this conversation is already authorized.
+- If the peer's question references work they're doing that you don't
+  see in the message body, call `brain_live_tail(<peer_session_id>, 20)`
+  to read their last 20 turns. The session uuid is in the
+  inbox-block's `from_uuid` field.
+- Reply with `brain_send` to their UUID or name.
+
+### Handing off a task
+
+When you're handing a task to another session ("you finish this, I'll
+take over X"):
+
+1. `brain_send_and_wait("<peer>", "<brief: what you've done, what
+   they should pick up, what success looks like>")`. The receiver
+   gets your brief immediately.
+2. The receiver, on getting your message, can read your
+   `brain_live_tail(<your_session_id>, 30)` for full context — your
+   working notes, prior tool calls, decisions reasoned through.
+3. Optionally drop a `brain_note_add` describing the handoff so the
+   knowledge graph captures it for later sessions.
+
+### What you CANNOT do (API limit, not a bug)
+
+- Interrupt a peer mid-thought. Each turn is an atomic LLM call;
+  messages land at turn boundaries, not inside a generation.
+- Stream their thinking as it happens. Use `brain_live_tail` to
+  catch up after the fact.
+
+These two limits are inherent to how Claude/ChatGPT/etc. work today.
+The rest of the conversation pattern — sub-second pingpong, full
+context-sharing on demand — is achievable and is the contract above.
