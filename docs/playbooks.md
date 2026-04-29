@@ -136,6 +136,62 @@ brain_notes(query="when_to_use", k=50)
 `when_to_use:`. (A purpose-built `brain_playbooks()` tool can land
 later if recall-by-keyword turns out too noisy.)
 
+## Self-improvement loop
+
+Static skills go stale. Brain playbooks are designed to learn from
+every run: when an LLM finishes a playbook and discovered something
+non-obvious — a new precondition, an unhandled failure, an
+optimization — it should record that for the next session.
+
+The write path is one MCP call:
+
+```
+brain_playbook_record_lesson(
+  slug="redeploy-staging",
+  lesson="If secret X expired, run rotate-secret-x.sh first. "
+         "Detected by error 'auth failed'."
+)
+```
+
+What that does, in `<vault>/playbooks/redeploy-staging.md`:
+
+1. Locates the file by slug (`playbooks/<slug>.md`,
+   `playbooks/<slug>/README.md`, or any nested `<slug>.md` match).
+2. Appends a dated bullet under `## Lessons learned`. The section is
+   created if missing. Newest lessons first, so a cold reader sees the
+   most recent learning at the top.
+3. Bumps two audit fields in the frontmatter:
+   - `last_updated`: ISO-8601 timestamp of this write.
+   - `lessons_count`: incrementing counter.
+4. Optional attribution: if the calling MCP session has a UUID,
+   the bullet is suffixed with `(session abcd1234)` so future audits
+   can trace which session contributed the lesson.
+
+Atomic write. Last-write-wins under concurrent calls — brain isn't a
+database, and conflicting lessons are rare in practice.
+
+### When the agent should call it
+
+- After a step fails and the agent figured out the workaround.
+- After running and noticing the doc misses a precondition or
+  side effect.
+- When the script's behavior diverges from what the doc claims.
+
+### When NOT to call it
+
+- For one-time, machine-specific quirks (those belong in a personal
+  note, not a shareable playbook).
+- For trivial restatements of what the doc already says.
+- During dry-runs / hypothetical reasoning.
+
+### Cross-LLM behavior
+
+Just like the playbook itself, the lessons section is plain markdown.
+ChatGPT reading the playbook later sees the same `## Lessons learned`
+section with the same bullets. The frontmatter `lessons_count` lets a
+reader say "this playbook has been touched N times — probably mature"
+without parsing the body.
+
 ## What brain does NOT do
 
 - **Run scripts.** Brain is a knowledge layer. The agent runs them.
@@ -146,6 +202,9 @@ later if recall-by-keyword turns out too noisy.)
 - **Auto-suggest a playbook.** Recall is pull-based — the agent decides
   to look. Description-match auto-activation (the way Claude Code
   "Skills" work) is out of scope; brain isn't a skills replacement.
+- **Edit the executable script.** `record_lesson` only modifies the
+  .md doc. If a script needs to change, the agent uses its normal
+  Edit tool — and ideally records a lesson explaining why.
 
 ## Why this isn't a clone of Claude Code Skills
 

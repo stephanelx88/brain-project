@@ -1777,6 +1777,42 @@ def brain_inbox(unread_only: bool = True, limit: int = 50,
 
 
 @mcp.tool()
+def brain_playbook_record_lesson(slug: str, lesson: str) -> str:
+    """Append a lesson learned to a playbook's `## Lessons learned`
+    section. Use this after running a playbook when something
+    surprising happened — a step that needs a new precondition, a
+    failure mode the doc doesn't cover, an optimization you discovered.
+
+    The next session that recalls this playbook will see your lesson
+    and avoid the trap. This is the closed-loop step that keeps brain
+    playbooks current as the underlying systems drift.
+
+    Format on disk: a dated bullet under `## Lessons learned` (the
+    section is created if missing). Frontmatter `last_updated` and
+    `lessons_count` are bumped so cold readers can tell at a glance
+    how often the playbook has been touched.
+
+    Brain's read-only contract still holds — only the .md doc is
+    modified, never the executable script alongside it.
+
+    Args:
+      slug: playbook identifier; matches the frontmatter `slug` and
+        the filename. Looked up under `<vault>/playbooks/`.
+      lesson: free-form text. Be specific about WHEN it applies and
+        WHAT to do — that's what future readers need.
+
+    Returns JSON:
+      {ok: True, path, lessons_count, last_updated} on success;
+      {ok: False, error: "not_found"|"empty_lesson", detail?} otherwise.
+    """
+    from brain.runtime import playbooks as _pb
+    from brain.runtime import session_id as _sid
+    own = _sid.detect_own_uuid()
+    result = _pb.record_lesson(slug=slug, lesson=lesson, source_uuid=own)
+    return json.dumps(result)
+
+
+@mcp.tool()
 def brain_wait_for_inbox(timeout_sec: int = 60, poll_interval_sec: float = 1.0) -> str:
     """Block until a peer message arrives in the inbox or timeout.
 
