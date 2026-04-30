@@ -1061,6 +1061,109 @@ def brain_live_tail(session_id: str, n: int = 20) -> str:
 
 
 @mcp.tool()
+def brain_resolve_name(name: str, project: str | None = None) -> str:
+    """Resolve a session alias to its registered session(s).
+
+    The names registry (~/.brain-runtime/names/) is filesystem-only and
+    not indexed by the FTS pipeline; brain_recall has no path to it.
+    This tool is the canonical "find me the session called X" entry
+    point — agents asking "where is `planner`?" or "is `quynh` alive?"
+    should call this, NOT brain_recall.
+
+    Names are scoped per-project, so the same alias can exist in two
+    different projects (e.g. `commandor` in both vulcan and bangalore
+    repos). Without `project`, all matches are returned, each labeled
+    with its project. Pass `project` (matched after the same diacritic-
+    folding + slug normalization brain_set_name applies) to filter to
+    one repo's namespace.
+
+    Each match comes back decorated with an `alive` boolean derived
+    from the same activity rule as brain_live_sessions: Claude PIDs
+    that are still running, Cursor sessions whose transcript jsonl was
+    written within the last 5 minutes (300 s).
+
+    Returns JSON envelope:
+      {
+        "query": "<requested name>",
+        "project": "<requested project or null>",
+        "matches": [
+          {"uuid": str, "name": str|None, "project": str, "cwd": str,
+           "pid": int|None, "set_at": str, "alive": bool,
+           "last_write": str|None, "source": "claude"|"cursor"|null}
+        ]
+      }
+    Empty `matches` (with no error key) means "no session has registered
+    this alias" — distinct from a transient lookup failure. Agents
+    should treat empty as a definitive negative answer instead of
+    falling through to brain_recall.
+    """
+    from brain.runtime import names as _n
+    err = _n.validate_user_name(name)
+    if err == "length":
+        return json.dumps({"error": "name is required"}, ensure_ascii=False)
+    if err in ("lowercase", "chars"):
+        # Be forgiving: callers may have mixed-case input. Lowercase + retry
+        # the registry lookup. We don't surface "reserved" as an error —
+        # if someone managed to register one, surface it.
+        candidate = name.strip().lower()
+    else:
+        candidate = name.strip()
+
+    norm_project = _n.normalize_project(project) if project else None
+
+    # Build alive-set from the same source brain_live_sessions uses, so
+    # the answers can't drift apart.
+    from brain import live_sessions as _ls
+    live_rows = []
+    try:
+        live_rows = _ls.list_live_sessions(include_self=True)
+    except Exception:
+        live_rows = []
+    live_index: dict[str, dict] = {}
+    for row in live_rows:
+        sid = row.get("session_id") or ""
+        bare = sid.split(":", 1)[-1]
+        live_index[bare] = row
+
+    matches: list[dict] = []
+    for entry in _n.all_entries():
+        entry_name = entry.get("name")
+        if entry_name != candidate:
+            continue
+        if norm_project is not None and entry.get("project") != norm_project:
+            continue
+        bare_uuid = entry.get("uuid", "")
+        live = live_index.get(bare_uuid)
+        matches.append({
+            "uuid": bare_uuid,
+            "name": entry_name,
+            "project": entry.get("project"),
+            "cwd": entry.get("cwd"),
+            "pid": entry.get("pid"),
+            "set_at": entry.get("set_at"),
+            "alive": live is not None,
+            "last_write": (live or {}).get("last_write"),
+            "source": (live or {}).get("source"),
+        })
+
+    # Sort: alive first, then by set_at descending (most recent claim
+    # wins among same-status matches). Python's sort is stable, so two
+    # passes — first by recency desc, then by alive — yields the right
+    # composite order without needing a hand-built compound key.
+    matches.sort(key=lambda m: m.get("set_at") or "", reverse=True)
+    matches.sort(key=lambda m: 0 if m["alive"] else 1)
+
+    return json.dumps(
+        {
+            "query": candidate,
+            "project": norm_project,
+            "matches": matches,
+        },
+        ensure_ascii=False, indent=2,
+    )
+
+
+@mcp.tool()
 def brain_audit(limit: int = 3) -> str:
     """Top-N audit items the user should review (contested facts, high-confidence
     merge candidates, decayed single-source claims). Call this at session start

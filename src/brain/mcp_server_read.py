@@ -52,6 +52,7 @@ READ_TOOLS: tuple[str, ...] = (
     "brain_history",
     "brain_live_sessions",
     "brain_live_tail",
+    "brain_resolve_name",
     "brain_live_coverage",
     "brain_audit",
     "brain_learning_gaps",

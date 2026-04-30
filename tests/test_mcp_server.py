@@ -449,6 +449,185 @@ def test_brain_live_sessions_returns_null_name_when_entry_has_no_alias(
     assert out[0]["name"] is None
 
 
+# ---------- brain_resolve_name (Fix 2) -------------------------------------
+
+def test_brain_resolve_name_empty_when_alias_unknown(tmp_path, monkeypatch):
+    """No registered alias → empty matches list, no error key. The
+    contract is that empty matches IS the answer ("nothing has that
+    name"), not a transient lookup failure."""
+    from brain import harvest_session, mcp_server
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", tmp_path / "no-claude")
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", tmp_path / "no-claude" / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    out = json.loads(mcp_server.brain_resolve_name("ghost"))
+    assert out["query"] == "ghost"
+    assert out["project"] is None
+    assert out["matches"] == []
+    assert "error" not in out
+
+
+def test_brain_resolve_name_finds_single_alive_session(tmp_path, monkeypatch):
+    """Happy path: a Claude session has registered `planner` and is
+    alive. brain_resolve_name returns one match with alive=True."""
+    import os
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    sid = "claude-planner"
+    _write_claude_session(claude_root, sid, os.getpid(), "/tmp/work")
+    names.register(sid, "planner", project="acme", cwd="/tmp/work", pid=os.getpid())
+
+    out = json.loads(mcp_server.brain_resolve_name("planner"))
+    assert len(out["matches"]) == 1
+    m = out["matches"][0]
+    assert m["uuid"] == sid
+    assert m["name"] == "planner"
+    assert m["project"] == "acme"
+    assert m["alive"] is True
+    assert m["source"] == "claude"
+
+
+def test_brain_resolve_name_returns_dead_session_with_alive_false(
+    tmp_path, monkeypatch
+):
+    """A name registered to a session whose process is gone surfaces
+    with alive=False. The agent then knows the alias is *known* but
+    the holder isn't running — different from "alias never existed"."""
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    # Session file exists but PID is dead — list_live_sessions skips it,
+    # so the alive index won't see it.
+    _write_claude_session(claude_root, "claude-zombie", 999_999, "/tmp/zombie")
+    names.register("claude-zombie", "zombie", project="acme", cwd="/tmp/zombie", pid=999_999)
+
+    out = json.loads(mcp_server.brain_resolve_name("zombie"))
+    assert len(out["matches"]) == 1
+    m = out["matches"][0]
+    assert m["alive"] is False
+    assert m["last_write"] is None
+    assert m["source"] is None
+
+
+def test_brain_resolve_name_returns_all_projects_when_filter_omitted(
+    tmp_path, monkeypatch
+):
+    """Same alias in two different projects → both come back, each
+    labeled with its project. Without this, a caller asking for a name
+    that genuinely exists twice gets an arbitrary one (iterdir-order
+    winner) and silently loses the other."""
+    import os
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    pid = os.getpid()
+    _write_claude_session(claude_root, "claude-a", pid, "/tmp/a")
+    names.register("claude-a", "commandor", project="vulcan", cwd="/tmp/a", pid=pid)
+    # Second one is a dead holder so we can have two entries safely
+    # without the live PID file colliding.
+    _write_claude_session(claude_root, "claude-b", 999_998, "/tmp/b")
+    names.register("claude-b", "commandor", project="bangalore", cwd="/tmp/b", pid=999_998)
+
+    out = json.loads(mcp_server.brain_resolve_name("commandor"))
+    assert len(out["matches"]) == 2
+    by_project = {m["project"]: m for m in out["matches"]}
+    assert set(by_project) == {"vulcan", "bangalore"}
+    # Sort contract: alive first.
+    assert out["matches"][0]["project"] == "vulcan"
+    assert out["matches"][0]["alive"] is True
+    assert out["matches"][1]["alive"] is False
+
+
+def test_brain_resolve_name_filters_by_project(tmp_path, monkeypatch):
+    """`project` filter narrows the result set; no leakage across
+    projects with the same alias."""
+    import os
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    pid = os.getpid()
+    _write_claude_session(claude_root, "claude-a", pid, "/tmp/a")
+    names.register("claude-a", "commandor", project="vulcan", cwd="/tmp/a", pid=pid)
+    _write_claude_session(claude_root, "claude-b", 999_998, "/tmp/b")
+    names.register("claude-b", "commandor", project="bangalore", cwd="/tmp/b", pid=999_998)
+
+    out = json.loads(mcp_server.brain_resolve_name("commandor", project="bangalore"))
+    assert len(out["matches"]) == 1
+    assert out["matches"][0]["project"] == "bangalore"
+    assert out["project"] == "bangalore"
+
+
+def test_brain_resolve_name_normalizes_project_filter(tmp_path, monkeypatch):
+    """The project filter is run through the same normalize_project
+    pipeline brain_set_name uses, so callers can pass a raw cwd-style
+    label and still match."""
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", tmp_path / "no-claude")
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", tmp_path / "no-claude" / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    names.register("u-stored", "designer", project="my-repo", cwd="/tmp/x", pid=None)
+    out = json.loads(mcp_server.brain_resolve_name("designer", project="My/Repo"))
+    # normalize_project("My/Repo") == "my-repo", so the filter matches.
+    assert len(out["matches"]) == 1
+    assert out["project"] == "my-repo"
+
+
+def test_brain_resolve_name_lowercases_input_silently(tmp_path, monkeypatch):
+    """Input is forgivingly lowercased; we don't return a validation
+    error for a casing slip when the registry would store lowercase
+    anyway."""
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", tmp_path / "no-claude")
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", tmp_path / "no-claude" / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    names.register("u-x", "planner", project="acme", cwd="/tmp/x", pid=None)
+    out = json.loads(mcp_server.brain_resolve_name("Planner"))
+    assert len(out["matches"]) == 1
+    assert out["query"] == "planner"
+
+
+def test_brain_resolve_name_rejects_empty(tmp_path, monkeypatch):
+    """Empty name is an error, not an empty result. Callers should not
+    accidentally fish for "any registered session"."""
+    from brain import harvest_session, mcp_server
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", tmp_path / "no-claude")
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", tmp_path / "no-claude" / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    out = json.loads(mcp_server.brain_resolve_name(""))
+    assert "error" in out
+
+
+def test_brain_resolve_name_registered_on_read_server():
+    """The read-only MCP server must expose brain_resolve_name — agents
+    that connect through brain-read (the typical setup) need access."""
+    import brain.mcp_server_read as R
+    assert "brain_resolve_name" in R.READ_TOOLS
+    registered = set(R.mcp._tool_manager._tools.keys())
+    assert "brain_resolve_name" in registered
+
+
 # ---------- brain_recall envelope + weak_match ---------------------------
 
 def _call_brain_recall_with_stubbed_hits(monkeypatch, hits, *,
