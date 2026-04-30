@@ -350,6 +350,78 @@ else
   fi
 fi
 
+hdr "7. session-name registry (~/.brain-runtime/names)"
+# Show all registered aliases + flag drift the user can act on:
+#  - cross-project collisions (same name in 2+ projects → ambiguous lookup)
+#  - stale dead holders (>30 days old, holder gone) → reclaimable slots
+#
+# The registry lives in BRAIN_RUNTIME_DIR (default ~/.brain-runtime), one
+# JSON per session. Keeping it healthy matters because brain_resolve_name
+# and brain_set_name both consult it as ground truth.
+# Quoted heredoc (<<'PY') so backticks/$ in the body don't expand under
+# shell rules. PROJECT_DIR is handed to Python via env to keep the body
+# inert. (Earlier non-quoted version triggered an inline `pip install -e .`
+# from a stray backtick in a help-text string — the kind of bug that's
+# obvious in retrospect and silently corrupts output otherwise.)
+NAMES_OUT=$("$PYTHON" - <<'PY' 2>&1
+import json, sys
+# Don't sys.path.insert here — section 1 already verified `pip show brain`
+# resolves to an editable install, and forcing $PROJECT_DIR/src ahead of
+# that lets a stale .brain.conf override the live install (which silently
+# loads an older brain.runtime.names without report()).
+try:
+    from brain.runtime import names
+    from brain import live_sessions as ls
+except Exception as e:
+    print(f"FAIL_IMPORT: {e}")
+    sys.exit(0)
+if not hasattr(names, "report"):
+    # Older install without the names health helper. Surface explicitly
+    # rather than letting downstream parsers default to zeros — otherwise
+    # the user sees "0 entries" on a registry that's actually full.
+    print("FAIL_OLD: brain.runtime.names.report missing - reinstall with 'pip install -e .' from the up-to-date repo")
+    sys.exit(0)
+try:
+    live = {row["session_id"].split(":", 1)[-1]
+            for row in ls.list_live_sessions(include_self=True)}
+except Exception:
+    live = None
+rep = names.report(live_uuids=live)
+print(json.dumps(rep, ensure_ascii=False))
+PY
+)
+if echo "$NAMES_OUT" | grep -q "^FAIL_IMPORT"; then
+  warn "could not load brain.runtime.names — ${NAMES_OUT#FAIL_IMPORT: }"
+elif echo "$NAMES_OUT" | grep -q "^FAIL_OLD"; then
+  warn "${NAMES_OUT#FAIL_OLD: }"
+elif [[ -z "$NAMES_OUT" ]]; then
+  warn "names registry inspection produced no output"
+else
+  TOTAL=$(echo "$NAMES_OUT" | "$PYTHON" -c "import json, sys; print(json.load(sys.stdin)['total'])" 2>/dev/null || echo 0)
+  WITH_NAME=$(echo "$NAMES_OUT" | "$PYTHON" -c "import json, sys; print(json.load(sys.stdin)['with_name'])" 2>/dev/null || echo 0)
+  ALIVE=$(echo "$NAMES_OUT" | "$PYTHON" -c "import json, sys; print(json.load(sys.stdin)['alive_with_name'])" 2>/dev/null || echo 0)
+  DEAD=$(echo "$NAMES_OUT" | "$PYTHON" -c "import json, sys; print(json.load(sys.stdin)['dead_with_name'])" 2>/dev/null || echo 0)
+  COLLISIONS=$(echo "$NAMES_OUT" | "$PYTHON" -c "import json, sys; print(len(json.load(sys.stdin)['cross_project_collisions']))" 2>/dev/null || echo 0)
+  STALE=$(echo "$NAMES_OUT" | "$PYTHON" -c "import json, sys; print(len(json.load(sys.stdin)['stale_dead_holders']))" 2>/dev/null || echo 0)
+  ok "$TOTAL session entries, $WITH_NAME aliased ($ALIVE alive, $DEAD dead)"
+  if [[ "$COLLISIONS" -gt 0 ]]; then
+    warn "$COLLISIONS alias(es) registered in 2+ projects — ambiguous when caller omits project"
+    echo "$NAMES_OUT" | "$PYTHON" -c "
+import json, sys
+for c in json.load(sys.stdin)['cross_project_collisions']:
+    print(f\"      {c['name']}: {', '.join(c['projects'])}\")"
+    warn "  fix: brain_resolve_name(name=..., project=...) to disambiguate, or rename one"
+  fi
+  if [[ "$STALE" -gt 0 ]]; then
+    warn "$STALE dead holder(s) older than 30 days — slots reclaimable"
+    echo "$NAMES_OUT" | "$PYTHON" -c "
+import json, sys
+for s in json.load(sys.stdin)['stale_dead_holders'][:5]:
+    print(f\"      {s['name']} in {s['project']} (set_at {s['set_at']})\")"
+    warn "  fix: rm ~/.brain-runtime/names/<uuid>.json for those entries"
+  fi
+fi
+
 hdr "summary"
 printf "  %d passed, %d warnings, %d failures\n" "$PASS" "$WARN" "$FAIL"
 exit $(( FAIL > 0 ? 1 : 0 ))

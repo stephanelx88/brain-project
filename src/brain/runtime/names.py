@@ -311,3 +311,83 @@ def delete(uuid: str) -> None:
     # Free any (project, name) reservations this uuid still owned so
     # the slot is reclaimable by other sessions.
     _release_reservations_for(uuid)
+
+
+def report(live_uuids: Optional[set[str]] = None,
+           stale_after_days: int = 30) -> dict:
+    """Return a structured health snapshot of the names registry.
+
+    Used by `brain doctor` to surface registry hygiene issues without
+    inlining filesystem walks in shell. `live_uuids` is an optional set
+    of UUIDs that are known to be alive (typically from
+    `live_sessions.list_live_sessions(include_self=True)`); when
+    omitted, all entries are treated as "liveness unknown" and the
+    `dead_with_name` / `stale_dead_holders` counts collapse to zero.
+
+    Returned shape:
+      {
+        "total":               int,   # total entries on disk
+        "with_name":           int,   # entries whose `name` field is set
+        "alive_with_name":     int,   # subset that are also in live_uuids
+        "dead_with_name":      int,   # named but holder is gone
+        "stale_dead_holders":  list[ {uuid, name, project, set_at} ],
+                                       # dead holders unset for >stale_after_days
+        "cross_project_collisions":
+                               list[ {name, count, projects: [str, ...]} ],
+                                       # same alias used in 2+ projects
+      }
+
+    "Cross-project collision" is allowed by design (the registry is
+    per-project) but it's an ambiguity the user should know about: any
+    caller passing a name without project context gets an arbitrary
+    winner among the colliders. Doctor surfaces these so the user can
+    prune or rename.
+    """
+    from collections import defaultdict
+    entries = all_entries()
+    total = len(entries)
+    with_name = [e for e in entries if e.get("name")]
+    if live_uuids is None:
+        alive_named: list[dict] = []
+        dead_named: list[dict] = []
+    else:
+        alive_named = [e for e in with_name if e.get("uuid") in live_uuids]
+        dead_named = [e for e in with_name if e.get("uuid") not in live_uuids]
+
+    by_name: dict[str, list[dict]] = defaultdict(list)
+    for e in with_name:
+        by_name[e["name"]].append(e)
+    collisions = []
+    for nm, group in sorted(by_name.items()):
+        projects = sorted({e.get("project") or "" for e in group})
+        if len(projects) > 1:
+            collisions.append({
+                "name": nm,
+                "count": len(group),
+                "projects": projects,
+            })
+
+    cutoff = datetime.now(timezone.utc).timestamp() - stale_after_days * 86400
+    stale = []
+    for e in dead_named:
+        set_at = e.get("set_at") or ""
+        try:
+            ts = datetime.fromisoformat(set_at).timestamp()
+        except (TypeError, ValueError):
+            ts = 0
+        if ts and ts < cutoff:
+            stale.append({
+                "uuid": e.get("uuid"),
+                "name": e.get("name"),
+                "project": e.get("project"),
+                "set_at": set_at,
+            })
+
+    return {
+        "total": total,
+        "with_name": len(with_name),
+        "alive_with_name": len(alive_named),
+        "dead_with_name": len(dead_named),
+        "stale_dead_holders": stale,
+        "cross_project_collisions": collisions,
+    }

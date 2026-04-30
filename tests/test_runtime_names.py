@@ -230,6 +230,114 @@ def test_set_name_takes_over_from_dead_holder():
     assert names.get("u1-dead")["name"] is None
 
 
+def test_report_empty_registry():
+    """Fresh root → zeros across the board, no exceptions."""
+    rep = names.report()
+    assert rep["total"] == 0
+    assert rep["with_name"] == 0
+    assert rep["alive_with_name"] == 0
+    assert rep["dead_with_name"] == 0
+    assert rep["stale_dead_holders"] == []
+    assert rep["cross_project_collisions"] == []
+
+
+def test_report_counts_alive_vs_dead():
+    """With a live_uuids hint, named entries split into alive vs dead."""
+    names.register("u-alive", "planner", "acme", "/tmp/a", 1)
+    names.register("u-dead", "executor", "acme", "/tmp/b", 2)
+    rep = names.report(live_uuids={"u-alive"})
+    assert rep["total"] == 2
+    assert rep["with_name"] == 2
+    assert rep["alive_with_name"] == 1
+    assert rep["dead_with_name"] == 1
+
+
+def test_report_skips_entries_with_null_name():
+    """An entry whose `name` field has been cleared (e.g. by dead-holder
+    takeover) is no longer "named" and shouldn't be counted in
+    with_name/alive/dead — it's basically an orphan slot."""
+    names.register("u1", "planner", "acme", "/tmp/a", 1)
+    # Manually clear the name to simulate post-takeover state.
+    p = paths.name_file("u1")
+    import json as _json
+    entry = _json.loads(p.read_text())
+    entry["name"] = None
+    p.write_text(_json.dumps(entry))
+
+    rep = names.report(live_uuids={"u1"})
+    assert rep["total"] == 1
+    assert rep["with_name"] == 0
+    assert rep["alive_with_name"] == 0
+
+
+def test_report_flags_cross_project_collision():
+    """Same name in 2+ projects is allowed by the registry but
+    ambiguous when callers omit project context. Doctor needs the
+    list to surface."""
+    names.register("u1", "commandor", "vulcan", "/tmp/a", 1)
+    names.register("u2", "commandor", "bangalore", "/tmp/b", 2)
+    names.register("u3", "designer", "acme", "/tmp/c", 3)
+    rep = names.report()
+    collisions = rep["cross_project_collisions"]
+    assert len(collisions) == 1
+    assert collisions[0]["name"] == "commandor"
+    assert collisions[0]["count"] == 2
+    assert collisions[0]["projects"] == ["bangalore", "vulcan"]
+
+
+def test_report_does_not_flag_same_project_dupes_as_collisions():
+    """Multiple entries with the same (project, name) is a registry
+    integrity bug elsewhere (lookup_uuids_by_name surfaces it as
+    `ambiguous_name`). It is NOT a 'cross-project collision'."""
+    names.register("u1", "planner", "acme", "/tmp/a", 1)
+    # Force a second entry for the same (project, name) by writing the
+    # JSON directly — the public set_name path is race-guarded so we
+    # have to bypass it to construct this state.
+    p2 = paths.name_file("u2")
+    p2.parent.mkdir(parents=True, exist_ok=True)
+    import json as _json
+    p2.write_text(_json.dumps({
+        "uuid": "u2", "name": "planner", "project": "acme",
+        "cwd": "/tmp/b", "pid": 2, "set_at": "2026-04-30T00:00:00.000+00:00",
+    }))
+    rep = names.report()
+    assert rep["cross_project_collisions"] == []
+
+
+def test_report_lists_stale_dead_holders():
+    """Dead holders whose set_at is older than the threshold get
+    surfaced. The stale list is the actionable subset of dead_with_name —
+    user can rm them to reclaim the slot.
+    """
+    from datetime import datetime, timedelta, timezone
+    names.register("u-fresh-dead", "fresh", "acme", "/tmp/a", 1)
+    names.register("u-stale-dead", "stale", "acme", "/tmp/b", 2)
+
+    # Backdate the stale entry so its set_at is 60 days old.
+    p = paths.name_file("u-stale-dead")
+    import json as _json
+    entry = _json.loads(p.read_text())
+    old_iso = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat(timespec="milliseconds")
+    entry["set_at"] = old_iso
+    p.write_text(_json.dumps(entry))
+
+    rep = names.report(live_uuids=set(), stale_after_days=30)
+    stale_uuids = {row["uuid"] for row in rep["stale_dead_holders"]}
+    assert stale_uuids == {"u-stale-dead"}
+    # Both are dead, but only one is stale.
+    assert rep["dead_with_name"] == 2
+
+
+def test_report_treats_no_live_hint_as_liveness_unknown():
+    """If caller doesn't supply live_uuids, alive/dead counts collapse
+    to 0 — we can't lie about liveness without information."""
+    names.register("u1", "planner", "acme", "/tmp/a", 1)
+    rep = names.report()  # no live_uuids
+    assert rep["with_name"] == 1
+    assert rep["alive_with_name"] == 0
+    assert rep["dead_with_name"] == 0
+
+
 def test_set_name_does_not_steal_from_live_holder_even_with_hint():
     """If live_uuids includes the current holder, name_taken still wins —
     we must not steal a slot from a session that's actually alive."""
