@@ -15,6 +15,31 @@ SQLite-backed tools above lag live activity. When you need to know what
 - Do **not** call `brain_live_tail` on every turn — it reads the full
   jsonl. Use it on demand or when peers look relevant to the task.
 
+## Looking up a session by its alias
+
+When the user asks about a session by its human name ("where is
+`planner`?", "is `quynh` still running?", "what's `commandor` doing?"),
+**call `brain_resolve_name(name, project=None)` — NOT `brain_recall`**.
+
+Reason: the names registry under `~/.brain-runtime/names/` is
+filesystem-only and not indexed by the FTS pipeline that backs
+`brain_recall`. A `brain_recall("planner")` query will at best return
+weak-match hits about the *concept* of planning and let the agent
+hallucinate an answer about the session. `brain_resolve_name` is the
+canonical lookup — it returns `{matches: [{uuid, project, alive,
+last_write, ...}, ...]}` directly from the registry.
+
+- Same alias can exist in two different projects (e.g. `commandor` in
+  `vulcan` AND `bangalore`). Without `project`, all matches come back;
+  pass `project=...` to filter.
+- Empty `matches` (no `error` key) is the definitive negative: that
+  alias has never been registered. Do not fall through to
+  `brain_recall` to "double-check" — there's nothing to check.
+- `alive: true` means the holder process is running. `alive: false`
+  with a non-null `set_at` means the alias was registered but the
+  session has since died — surface that as "the session named X is
+  registered but no longer running", not "X doesn't exist".
+
 ## Inter-agent conversation protocol
 
 When the user asks you to talk to / coordinate with / consult another

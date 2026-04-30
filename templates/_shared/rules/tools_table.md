@@ -15,3 +15,4 @@
 | `brain_learning_gaps` | Queries the user repeatedly asks that keep missing — call at session-start to surface (never to auto-answer) |
 | `brain_live_sessions` | List Claude/Cursor sessions alive *right now* (bypasses extraction lag) |
 | `brain_live_tail` | Last N turns of a peer session (no LLM, no harvest) |
+| `brain_resolve_name` | Resolve a session alias (e.g. `planner`, `quynh`) → uuid + alive flag. Use this — NOT `brain_recall` — when looking up a session by its human name |
