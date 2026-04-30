@@ -11,6 +11,25 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from brain import harvest_session
+from brain.runtime import names as _names
+
+
+def _name_for_uuid(session_id: str) -> str | None:
+    """Look up the human-readable alias registered for a session_id, if any.
+
+    Strips the `cursor:` prefix before consulting the names registry so a
+    Cursor session's alias is found by its bare UUID. Returns None when no
+    entry exists, when the entry has no `name` (e.g. dead-holder takeover
+    cleared it), or when the lookup fails for any reason.
+    """
+    bare = session_id.split(":", 1)[-1]
+    try:
+        entry = _names.get(bare)
+    except Exception:
+        return None
+    if not entry:
+        return None
+    return entry.get("name") or None
 
 
 def find_session_jsonl(session_id: str) -> Path | None:
@@ -43,7 +62,10 @@ def list_live_sessions(
       - Claude:  PID in ~/.claude/sessions/<pid>.json is alive
       - Cursor:  transcript jsonl mtime within `active_within_sec` s
 
-    Each row: {source, session_id, project, cwd, pid, last_write, age_sec, path}.
+    Each row: {source, session_id, name, project, cwd, pid, last_write,
+               age_sec, path}.
+    `name` carries the human alias from `brain_set_name` if registered,
+    or None. Use it to identify peers without grepping ~/.brain-runtime.
     `active_within_sec` is clamped to [1, 86400].
     """
     window = max(1, min(int(active_within_sec), 86400))
@@ -78,6 +100,7 @@ def list_live_sessions(
         out.append({
             "source": "claude",
             "session_id": cs["session_id"],
+            "name": _name_for_uuid(cs["session_id"]),
             "project": project,
             "cwd": cs["cwd"],
             "pid": cs["pid"],
@@ -98,9 +121,11 @@ def list_live_sessions(
             continue
         if mtime < cutoff:
             continue
+        sid = f"{harvest_session.CURSOR_PREFIX}{jsonl.stem}"
         out.append({
             "source": "cursor",
-            "session_id": f"{harvest_session.CURSOR_PREFIX}{jsonl.stem}",
+            "session_id": sid,
+            "name": _name_for_uuid(sid),
             "project": harvest_session.derive_project_name(jsonl),
             "cwd": None,
             "pid": None,

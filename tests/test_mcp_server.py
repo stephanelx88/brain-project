@@ -158,6 +158,18 @@ def _write_claude_session(claude_root: Path, sid: str, pid: int, cwd: str,
     return jsonl
 
 
+@pytest.fixture(autouse=True)
+def _isolated_runtime_root(tmp_path_factory, monkeypatch):
+    """Point BRAIN_RUNTIME_DIR at a clean per-test dir.
+
+    Without this, brain.runtime.names.get() reads from the real
+    ~/.brain-runtime/names/ and bleeds the developer's session aliases
+    into live_sessions tests, making them assert against the host state.
+    """
+    runtime_root = tmp_path_factory.mktemp("brain-runtime")
+    monkeypatch.setenv("BRAIN_RUNTIME_DIR", str(runtime_root))
+
+
 def test_brain_live_sessions_lists_recent_cursor(tmp_path, monkeypatch):
     from brain import harvest_session, mcp_server
     cursor_root = tmp_path / "cursor"
@@ -334,6 +346,107 @@ def test_brain_live_sessions_include_self_returns_all(tmp_path, monkeypatch):
     out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300, include_self=True))
     sids = {r["session_id"] for r in out}
     assert sids == {"claude-self", "claude-peer"}
+
+
+# ---------- brain_live_sessions: name decoration (Fix 1) -------------------
+
+def test_brain_live_sessions_returns_null_name_when_unregistered(
+    tmp_path, monkeypatch
+):
+    """Default contract: every row carries a `name` key — null when no
+    alias has been registered for that session.
+    """
+    import os
+    from brain import harvest_session, mcp_server
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    _write_claude_session(claude_root, "claude-anon", os.getpid(), "/tmp/anon")
+
+    out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300))
+    assert len(out) == 1
+    assert "name" in out[0], "every row must carry the name key"
+    assert out[0]["name"] is None
+
+
+def test_brain_live_sessions_decorates_name_for_claude_session(
+    tmp_path, monkeypatch
+):
+    """A Claude session that has called brain_set_name surfaces the
+    alias on every subsequent live_sessions read. This is the bug Fix 1
+    addresses: peers were invisible by their human name."""
+    import os
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    sid = "claude-named-uuid"
+    _write_claude_session(claude_root, sid, os.getpid(), "/tmp/named")
+    names.register(sid, "planner", project="acme", cwd="/tmp/named", pid=os.getpid())
+
+    out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300))
+    assert len(out) == 1
+    assert out[0]["session_id"] == sid
+    assert out[0]["name"] == "planner"
+
+
+def test_brain_live_sessions_decorates_name_for_cursor_session(
+    tmp_path, monkeypatch
+):
+    """Cursor sessions register names under their bare UUID; the
+    cursor: prefix on session_id must be stripped before lookup."""
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names
+    cursor_root = tmp_path / "cursor"
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", cursor_root / "projects")
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", tmp_path / "no-claude")
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", tmp_path / "no-claude" / "projects")
+
+    bare_uuid = "uuid-cursor-named"
+    _write_cursor_jsonl(cursor_root, "Users-x-foo", bare_uuid, [
+        {"role": "user", "message": {"content": [{"type": "text", "text": "hi"}]}},
+    ])
+    names.register(bare_uuid, "designer", project="cursor/foo", cwd="/tmp/c", pid=None)
+
+    out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300))
+    assert len(out) == 1
+    assert out[0]["session_id"] == "cursor:" + bare_uuid
+    assert out[0]["name"] == "designer"
+
+
+def test_brain_live_sessions_returns_null_name_when_entry_has_no_alias(
+    tmp_path, monkeypatch
+):
+    """Edge case: dead-holder takeover clears `name` to None on the
+    losing entry. live_sessions must surface that as null, not the
+    empty string and not a stale value."""
+    import os
+    from brain import harvest_session, mcp_server
+    from brain.runtime import names, paths
+    import json as _json
+
+    claude_root = tmp_path / "claude"
+    monkeypatch.setattr(harvest_session, "CLAUDE_DIR", claude_root)
+    monkeypatch.setattr(harvest_session, "PROJECTS_DIR", claude_root / "projects")
+    monkeypatch.setattr(harvest_session, "CURSOR_PROJECTS_DIR", tmp_path / "no-cursor")
+
+    sid = "claude-cleared"
+    _write_claude_session(claude_root, sid, os.getpid(), "/tmp/cleared")
+    names.register(sid, "planner", project="acme", cwd="/tmp/cleared", pid=os.getpid())
+    # Simulate the post-takeover state: name field is None.
+    entry_path = paths.name_file(sid)
+    entry = _json.loads(entry_path.read_text())
+    entry["name"] = None
+    entry_path.write_text(_json.dumps(entry))
+
+    out = json.loads(mcp_server.brain_live_sessions(active_within_sec=300))
+    assert len(out) == 1
+    assert out[0]["name"] is None
 
 
 # ---------- brain_recall envelope + weak_match ---------------------------

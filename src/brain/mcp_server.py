@@ -1022,9 +1022,13 @@ def brain_live_sessions(active_within_sec: int = 300, include_self: bool = False
     `include_self=True` to include it. Cursor has no PID->session mapping,
     so Cursor self-exclusion is not possible and is silently skipped.
 
-    Returns JSON list of {source, session_id, project, cwd, last_write,
-    age_sec, path}, newest write first. Cursor `session_id`s come back
-    namespaced as `cursor:<uuid>` — pass them as-is to brain_live_tail.
+    Returns JSON list of {source, session_id, name, project, cwd,
+    last_write, age_sec, path}, newest write first. `name` is the human
+    alias set via `brain_set_name` (string) or `null` when no alias has
+    been registered for that session — use it to spot peers like
+    "planner" / "executor" without scraping ~/.brain-runtime. Cursor
+    `session_id`s come back namespaced as `cursor:<uuid>` — pass them
+    as-is to brain_live_tail.
 
     Caps `active_within_sec` to [1, 86400].
     """
