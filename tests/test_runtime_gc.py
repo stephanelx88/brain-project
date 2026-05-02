@@ -63,6 +63,44 @@ def test_gc_prunes_name_for_long_dead_uuid():
     assert not name_file.exists()
 
 
+def test_gc_prune_dead_names_releases_reservation_so_name_is_reclaimable():
+    """After GC removes a dead UUID's name JSON, the (project, name) slot
+    must be reclaimable by a fresh session.
+
+    Pre-fix bug: _prune_dead_names called Path.unlink() directly,
+    bypassing names._release_reservations_for(). The orphaned reservation
+    file under _name_reservations/ kept O_EXCL claim on (project, name),
+    so a follow-up brain_set_name in the same project came back
+    `name_taken` even though no live session held the slot. The session
+    couldn't reclaim its own name after a long absence — silent dead end.
+    """
+    # 1. Long-dead session was once registered as `planner` in `acme`.
+    names.register("ghost-uuid", "planner", "acme", "/tmp/g", 99)
+    name_file = paths.name_file("ghost-uuid")
+    reservation = paths.name_reservation_file("acme", "planner")
+    assert name_file.exists()
+    assert reservation.exists(), "register() should have placed the lock"
+    _age_file(name_file, days=40)
+
+    # 2. GC fires for an empty live-set — should remove BOTH the JSON
+    #    entry AND the (project, name) reservation.
+    counts = gc.run(live_uuids=set())
+    assert counts["names_pruned"] == 1
+    assert not name_file.exists()
+    assert not reservation.exists(), (
+        "GC must release the (project, name) reservation when it removes "
+        "a dead UUID's name JSON; otherwise the slot is permanently locked"
+    )
+
+    # 3. End-to-end: a fresh session in the same project can now claim
+    #    the freed alias. This is what was broken before — name_taken
+    #    even on an empty registry.
+    names.register("new-uuid", "honey-2", "acme", "/tmp/n", 100)
+    err = names.set_name("new-uuid", "planner")
+    assert err is None, f"new session should reclaim freed name; got {err!r}"
+    assert names.get("new-uuid")["name"] == "planner"
+
+
 def test_gc_prunes_orphan_inbox_no_name_no_live_after_ttl():
     """UUID with no names/<uuid>.json AND not in live_uuids -> pruned."""
     inbox.send("orphan", "snd", "a", "b", "hi")

@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Set
 
-from brain.runtime import inbox, paths
+from brain.runtime import inbox, names, paths
 
 DEFAULT_DELIVERED_TTL_DAYS = 7
 DEFAULT_PENDING_TTL_DAYS = 30
@@ -140,6 +140,14 @@ def _prune_orphan_inboxes(live_uuids: Set[str], ttl_days: int) -> int:
 
 
 def _prune_dead_names(live_uuids: Set[str], ttl_days: int) -> int:
+    """Remove names/<uuid>.json for UUIDs not in live_uuids and older
+    than ttl_days. Routes through `names.delete()` (rather than a raw
+    Path.unlink) so the corresponding (project, name) reservation file
+    under _name_reservations/ is released as well — leaving an orphan
+    reservation locks the slot forever and turns a future
+    brain_set_name into a silent `name_taken` failure even on an
+    otherwise-empty registry.
+    """
     ndir = paths.names_dir()
     if not ndir.exists():
         return 0
@@ -153,7 +161,7 @@ def _prune_dead_names(live_uuids: Set[str], ttl_days: int) -> int:
             continue
         try:
             if p.stat().st_mtime < cutoff:
-                p.unlink()
+                names.delete(uuid)
                 total += 1
         except (OSError, FileNotFoundError):
             continue
