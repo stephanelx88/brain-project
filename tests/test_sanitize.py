@@ -48,6 +48,12 @@ def _read_audit(vault: Path) -> list[dict]:
     ("GH_PAT", "ghp_" + "A" * 36),
     ("GH_OAUTH", "gho_" + "B" * 36),
     ("GH_REFRESH", "ghr_" + "C" * 36),
+    # Fine-grained PAT (GitHub's 2022+ format) — total 93 chars,
+    # 11-char `github_pat_` prefix + 82 chars of [A-Za-z0-9_].
+    # Pre-fix this only got caught by the HIGH_ENTROPY catch-all and
+    # was tagged as generic high-entropy in the audit ledger, breaking
+    # by-kind rotation tracking and security review.
+    ("GH_FINE_GRAINED_PAT", "github_pat_" + "Z" * 82),
     ("ANTHROPIC_KEY", "sk-ant-api03-" + "x" * 95),
     ("OPENAI_KEY", "sk-proj-" + "y" * 48),
     ("GOOGLE_API_KEY", "AIza" + "z" * 35),

@@ -68,7 +68,10 @@ import brain.config as config
 # "newer than" checks with tuple comparison on the suffix). History:
 #   v1 — initial (2026-04-23): 22 secret regex + 11 injection rules +
 #        4-pass order (secret → injection → entropy → length-elide).
-VERSION = "ws4-v1"
+#   v2 — 2026-05-02: add GH_FINE_GRAINED_PAT (github_pat_*) so the
+#        2022+ token format gets a named tag instead of falling
+#        through to the HIGH_ENTROPY catch-all.
+VERSION = "ws4-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +126,17 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("GH_SERVER_APP", re.compile(r"\bghs_[A-Za-z0-9]{36}\b")),
     ("GH_USER_APP", re.compile(r"\bghu_[A-Za-z0-9]{36}\b")),
     ("GH_REFRESH", re.compile(r"\bghr_[A-Za-z0-9]{36}\b")),
+    # Fine-grained personal access tokens (introduced 2022, increasingly
+    # common). Format: `github_pat_` + 82 chars of [A-Za-z0-9_]; total
+    # 93 characters. Without this rule, fine-grained PATs only fall
+    # through to the HIGH_ENTROPY catch-all, which redacts them but
+    # tags them as generic high-entropy in the audit ledger rather
+    # than as github tokens — so a security review can't tell the
+    # kind from the audit row, and rotation tracking by KIND is broken.
+    # Pattern matches detect-secrets / GitGuardian's official rule.
+    ("GH_FINE_GRAINED_PAT", re.compile(
+        r"\bgithub_pat_[A-Za-z0-9_]{82}\b",
+    )),
     ("ANTHROPIC_KEY", re.compile(
         r"\bsk-ant-(?:api|admin|rt)[0-9]{2}-[A-Za-z0-9_\-]{90,}\b",
     )),
