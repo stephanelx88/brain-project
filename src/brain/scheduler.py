@@ -40,13 +40,30 @@ import subprocess
 from pathlib import Path
 
 
-# Backend-neutral job label. macOS uses this verbatim as the launchd
-# label (``com.son.brain-auto-extract``); Linux uses it as the systemd
+# Backend-neutral job label. macOS uses this as the launchd label
+# (``com.<USER>.brain-auto-extract``); Linux uses it as the systemd
 # unit stem (``brain-auto-extract.timer``). Callers never need to
 # translate between the two — pass this string into any backend and
 # the backend knows what to do with it.
 LABEL_BASE = "brain-auto-extract"
-LAUNCHD_LABEL = "com.son.brain-auto-extract"
+
+
+def _launchd_label() -> str:
+    """Resolve the per-user launchd label from $USER / $USERNAME.
+
+    The plist installed by `bin/install.sh` is rendered with
+    `com.{{USERNAME}}.brain-auto-extract`, so the runtime probe must
+    compose the same label. The previous hardcoded "son" (an artifact
+    from when this file was first authored) made `brain status` report
+    "scheduler not loaded" for every user other than son even when the
+    job WAS loaded — false alarm that drove people to reinstall things
+    that were already correct.
+    """
+    user = os.environ.get("USER") or os.environ.get("USERNAME") or "user"
+    return f"com.{user}.{LABEL_BASE}"
+
+
+LAUNCHD_LABEL = _launchd_label()
 SYSTEMD_UNIT = f"{LABEL_BASE}.timer"
 
 

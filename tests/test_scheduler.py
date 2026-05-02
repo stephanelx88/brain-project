@@ -34,6 +34,38 @@ def test_current_backend_unknown_platform(monkeypatch):
     assert scheduler.current_backend() == "none"
 
 
+# ---------- launchd label resolution ------------------------------------
+
+
+def test_launchd_label_uses_current_user(monkeypatch):
+    """The plist installed by bin/install.sh is rendered with
+    `com.{{USERNAME}}.brain-auto-extract`, so the runtime probe must
+    compose the same label per user. Hardcoding "son" (the original
+    author's username) made `brain status` report "scheduler not loaded"
+    for any user other than son even when the job WAS loaded.
+    """
+    monkeypatch.setenv("USER", "alice")
+    monkeypatch.delenv("USERNAME", raising=False)
+    assert scheduler._launchd_label() == "com.alice.brain-auto-extract"
+
+
+def test_launchd_label_falls_back_to_username_env(monkeypatch):
+    """On Windows-style hosts $USER is unset; $USERNAME is the standard.
+    Defensive even though Windows hits the null backend path — the
+    helper is platform-neutral."""
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setenv("USERNAME", "bob")
+    assert scheduler._launchd_label() == "com.bob.brain-auto-extract"
+
+
+def test_launchd_label_safe_default_when_no_user_env(monkeypatch):
+    """Both env vars unset → "user" placeholder. Never crash, never
+    return a bare/empty label."""
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.delenv("USERNAME", raising=False)
+    assert scheduler._launchd_label() == "com.user.brain-auto-extract"
+
+
 # ---------- launchd backend ---------------------------------------------
 
 
