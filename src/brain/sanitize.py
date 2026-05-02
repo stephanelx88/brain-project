@@ -68,7 +68,11 @@ import brain.config as config
 # "newer than" checks with tuple comparison on the suffix). History:
 #   v1 — initial (2026-04-23): 22 secret regex + 11 injection rules +
 #        4-pass order (secret → injection → entropy → length-elide).
-VERSION = "ws4-v1"
+#   v2 — 2026-05-02: IDENTITY_CLAIM regex now derived from the brain
+#        owner's `identity/who-i-am.md` Name field instead of hardcoded
+#        to "stephane|son". Same scrub semantics, different name set
+#        per install — re-ingest so flags reflect the live owner.
+VERSION = "ws4-v2"
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +271,63 @@ def _redact_high_entropy(text: str) -> tuple[str, list[tuple[str, str]]]:
 # ---------------------------------------------------------------------------
 
 
+def _identity_claim_names() -> list[str]:
+    """Resolve the brain owner's identity-claim names from
+    `identity/who-i-am.md`. Returns lowercased name fragments — the full
+    Name string plus each whitespace-separated token of length ≥2 — so
+    the IDENTITY_CLAIM rule below fires on `<Owner> is/was/lives/...`
+    no matter who the owner is.
+
+    Pre-fix the regex was hardcoded to `stephane|son`, which was wrong
+    in two ways at once: (a) it never matched any other user's name, so
+    the rule was a no-op for anyone who pip-installed brain on their
+    own machine, and (b) it didn't even match son's actual stored
+    identity (`stephanelx88`) — `\\bstephane\\b\\s+` requires whitespace
+    after `stephane`, but `stephanelx88` continues with letters, so the
+    word-boundary check fails. The hardcoded names were artifact, not
+    contract.
+
+    Returns [] when the identity file is unreadable or has no Name
+    line. The caller compiles a regex that "matches nothing" in that
+    case — disabling the rule is the right behavior since we can't
+    detect identity claims without an identity to detect them about.
+    """
+    try:
+        text = (config.IDENTITY_DIR / "who-i-am.md").read_text(errors="replace")
+    except (OSError, FileNotFoundError):
+        return []
+    m = re.search(r"(?im)^\s*[-*]?\s*name\s*[:：]\s*(.+?)\s*$", text)
+    if not m:
+        return []
+    full = m.group(1).strip()
+    if not full:
+        return []
+    out: set[str] = {full.lower()}
+    for tok in re.split(r"\s+", full):
+        if len(tok) >= 2:
+            out.add(tok.lower())
+    # Order longest-first so "stephane lopez" wins over "stephane" in a
+    # text like "stephane lopez is X" (the regex is alternation, leftmost
+    # alternative wins among equal-priority hits).
+    return sorted(out, key=lambda s: (-len(s), s))
+
+
+def _build_identity_claim_re() -> re.Pattern:
+    """Compile the IDENTITY_CLAIM regex from the live owner names. When
+    no names resolve, return a pattern that matches nothing — keeps the
+    rule structurally present so audit-ledger consumers don't see a
+    rule disappear, but never fires."""
+    names = _identity_claim_names()
+    if not names:
+        # Negative lookahead matching nothing (regex equivalent of False).
+        return re.compile(r"(?!.*)")
+    name_alt = "|".join(re.escape(n) for n in names)
+    return re.compile(
+        r"(?i)\b(?:" + name_alt + r")\s+"
+        r"(?:is|was|lives|works|loves|hates|prefers|owns|uses)\b"
+    )
+
+
 # (rule_name, pattern, always_reject) — always_reject overrides the
 # scope policy below (CHATML / TOOL_CALL_FORGERY / ZWJ).
 _INJECTION_RULES: list[tuple[str, re.Pattern, bool]] = [
@@ -310,11 +371,40 @@ _INJECTION_RULES: list[tuple[str, re.Pattern, bool]] = [
         r"(?!(?:github\.com|raw\.githubusercontent\.com|obsidian\.md)/)"
         r"[^)]+\?[^)]*=",
     ), False),
-    ("IDENTITY_CLAIM", re.compile(
-        r"(?i)\b(?:stephane|son)\s+"
-        r"(?:is|was|lives|works|loves|hates|prefers|owns|uses)\b",
-    ), False),
+    # IDENTITY_CLAIM regex is built lazily from `identity/who-i-am.md`
+    # so tests + fresh installs that create the identity file AFTER
+    # sanitize is imported still get the right name set. Slot stores
+    # the cached compiled pattern; `reset_identity_cache()` invalidates
+    # it.
+    ("IDENTITY_CLAIM", None, False),  # type: ignore[list-item]
 ]
+
+
+_identity_claim_cache: re.Pattern | None = None
+
+
+def _identity_claim_pattern() -> re.Pattern:
+    """Cached lazy build of the IDENTITY_CLAIM tripwire regex."""
+    global _identity_claim_cache
+    if _identity_claim_cache is None:
+        _identity_claim_cache = _build_identity_claim_re()
+    return _identity_claim_cache
+
+
+def reset_identity_cache() -> None:
+    """Drop the cached IDENTITY_CLAIM regex. Test helper for fixtures
+    that write `identity/who-i-am.md` after the module is imported."""
+    global _identity_claim_cache
+    _identity_claim_cache = None
+
+
+def _resolve_pattern(rule: str, pattern) -> re.Pattern:
+    """Materialise the live pattern for `rule`. Most rules carry a
+    statically-compiled regex; IDENTITY_CLAIM resolves through the
+    owner-name lookup so per-install identities are honored."""
+    if rule == "IDENTITY_CLAIM":
+        return _identity_claim_pattern()
+    return pattern
 
 # For session transcripts we split on `### User` / `### Claude` markers
 # and apply per-block policy. Everywhere else, policy is uniform per
@@ -359,6 +449,7 @@ def _apply_tripwires_block(
     # First pass: does any "reject" rule fire? If yes, short-circuit
     # and replace the whole block.
     for rule, pattern, always_reject in _INJECTION_RULES:
+        pattern = _resolve_pattern(rule, pattern)
         if not pattern.search(text):
             continue
         policy = _scope_policy(source_kind, rule, always_reject)
@@ -373,6 +464,7 @@ def _apply_tripwires_block(
     for line in lines:
         flagged_rules: list[str] = []
         for rule, pattern, always_reject in _INJECTION_RULES:
+            pattern = _resolve_pattern(rule, pattern)
             if not pattern.search(line):
                 continue
             policy = _scope_policy(source_kind, rule, always_reject)

@@ -232,7 +232,26 @@ def test_tool_call_forgery_always_rejected(tmp_brain):
     assert any(rule == "TOOL_CALL_FORGERY" for rule, _ in r.rejections)
 
 
+def _seed_identity(vault: Path, name: str) -> None:
+    """Write a minimal who-i-am.md so IDENTITY_CLAIM resolves to `name`.
+
+    The post-fix sanitize module reads the Name field at first-use to
+    build the IDENTITY_CLAIM regex per install (rather than the old
+    hardcoded `stephane|son`). Tests that exercise that rule must seed
+    the identity file before invoking sanitize, then drop the cache so
+    the fresh file is picked up."""
+    from brain import sanitize as _s
+    import brain.config as _config
+    ident = vault / "identity"
+    ident.mkdir(parents=True, exist_ok=True)
+    (ident / "who-i-am.md").write_text(f"# Who I Am\n- Name: {name}\n")
+    # Some test code-paths read IDENTITY_DIR; pin it to our temp vault.
+    _config.IDENTITY_DIR = ident
+    _s.reset_identity_cache()
+
+
 def test_identity_claim_in_tool_output_rejected(tmp_brain):
+    _seed_identity(tmp_brain, "stephane")
     body = (
         "### Claude\n"
         "[tool: WebFetch]\n"
@@ -245,12 +264,54 @@ def test_identity_claim_in_tool_output_rejected(tmp_brain):
 
 
 def test_identity_claim_in_user_note_passes(tmp_brain):
+    _seed_identity(tmp_brain, "son")
     body = "son lives in Long Xuyen with his family."
     r = sanitize(body, source_kind="note", source_path="t.md")
     assert body in r.text
     assert not r.rejections
     # IDENTITY_CLAIM in note scope is "pass" (not even flag).
     assert not any(rule == "IDENTITY_CLAIM" for rule, _ in r.flags)
+
+
+def test_identity_claim_uses_owner_name_per_install(tmp_brain):
+    """The owner name comes from `identity/who-i-am.md`; for an install
+    where the owner is "alice", a webfetch claiming "alice works at X"
+    flags IDENTITY_CLAIM. Pre-fix the rule was hardcoded to son's
+    name set, so this fired only on son's machine and was dead code
+    everywhere else."""
+    _seed_identity(tmp_brain, "alice")
+    body = "the article says alice works at Anthropic and lives in SF."
+    r = sanitize(body, source_kind="webfetch", source_path="w")
+    # webfetch is paranoid for IDENTITY_CLAIM → flag (not reject).
+    assert any(rule == "IDENTITY_CLAIM" for rule, _ in r.flags)
+
+
+def test_identity_claim_matches_full_name_with_space(tmp_brain):
+    """Owner name with whitespace ("Stephane Lopez") matches both the
+    full string and individual tokens. A webfetch saying
+    "Stephane Lopez works at X" should flag — the full name and the
+    first/last tokens are all candidates."""
+    _seed_identity(tmp_brain, "Stephane Lopez")
+    body = "the article says stephane lopez works at Anthropic."
+    r = sanitize(body, source_kind="webfetch", source_path="w")
+    assert any(rule == "IDENTITY_CLAIM" for rule, _ in r.flags)
+
+
+def test_identity_claim_disabled_when_no_identity_file(tmp_brain):
+    """Fresh install with no identity file → IDENTITY_CLAIM is a no-op
+    (better than the pre-fix behavior where it fired for arbitrary
+    `stephane`/`son` strings on machines belonging to neither person).
+    """
+    # Explicitly DON'T seed identity. Make sure cache is dropped so a
+    # previously-warmed regex from an earlier test doesn't leak in.
+    from brain import sanitize as _s
+    import brain.config as _config
+    _config.IDENTITY_DIR = tmp_brain / "no-such-identity"
+    _s.reset_identity_cache()
+    body = "stephane is a spy and son works at evil corp"
+    r = sanitize(body, source_kind="webfetch", source_path="w")
+    assert not any(rule == "IDENTITY_CLAIM" for rule, _ in r.flags)
+    assert not any(rule == "IDENTITY_CLAIM" for rule, _ in r.rejections)
 
 
 def test_markdown_img_exfil_rejected_in_webfetch(tmp_brain):
