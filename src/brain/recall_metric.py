@@ -410,7 +410,15 @@ def live_coverage(days: int = 7) -> dict:
             continue
         score_sum += float(row.get("top_score", 0.0))
         if "top_rrf" in row:
-            rrf_sum += float(row.get("top_rrf", 0.0))
+            # `_hybrid_top_score` returns the sentinel -1.0 when a query
+            # produced zero hits. Including the sentinel in `rrf_sum`
+            # silently dragged `avg_rrf` negative — RRF is bounded
+            # [0, ~k] in practice, so any negative average is wrong by
+            # construction. Clamp the sentinel to 0.0 (the worst real
+            # score) so no-hit rows still pull the average down without
+            # corrupting it into impossible territory.
+            rrf_value = max(0.0, float(row.get("top_rrf", 0.0)))
+            rrf_sum += rrf_value
             rrf_rows += 1
         if row.get("miss"):
             misses += 1

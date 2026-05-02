@@ -193,6 +193,32 @@ def test_live_coverage_reports_avg_rrf_when_rows_carry_it(fake_ledger):
     assert abs(data["avg_top"] - (0.8 + 0.5 + 0.4) / 3) < 1e-6
 
 
+def test_live_coverage_clamps_no_hit_sentinel_into_avg_rrf(fake_ledger):
+    """`_hybrid_top_score` returns top_rrf=-1.0 as a sentinel when a
+    query produced zero hits. The pre-fix `live_coverage` summed the
+    sentinel directly, dragging avg_rrf negative — RRF is bounded
+    [0, ~k] in practice, so any negative average was wrong by
+    construction. The fix clamps the sentinel to 0.0 (the worst real
+    score), so no-hit rows still pull avg_rrf down without driving it
+    impossibly negative.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fake_ledger.write_text(
+        # Two real-hit rows + one no-hit sentinel row.
+        f'{{"ts":"{now}","kind":"live","query":"a","top_score":0.6,"top_rrf":0.10,"miss":false}}\n'
+        f'{{"ts":"{now}","kind":"live","query":"b","top_score":0.5,"top_rrf":0.05,"miss":false}}\n'
+        f'{{"ts":"{now}","kind":"live","query":"c","top_score":-1.0,"top_rrf":-1.0,"miss":true}}\n'
+    )
+    data = recall_metric.live_coverage()
+    assert data["rrf_rows"] == 3, "all three rows have top_rrf field"
+    # Pre-fix bug: (0.10 + 0.05 + -1.0) / 3 = -0.283 — meaninglessly negative.
+    # Post-fix: (0.10 + 0.05 + 0.0) / 3 = 0.05 — no-hit clamped to 0.
+    assert abs(data["avg_rrf"] - (0.10 + 0.05 + 0.0) / 3) < 1e-6
+    # avg_rrf must never be negative; that's the user-visible invariant
+    # this fix protects.
+    assert data["avg_rrf"] >= 0.0
+
+
 def test_live_coverage_ignores_eval_rows(fake_ledger):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     fake_ledger.write_text(
