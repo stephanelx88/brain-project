@@ -29,6 +29,7 @@ Design notes:
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import re
@@ -195,10 +196,11 @@ def _last_run() -> dict:
     out["ts"] = ts_str
     out["active_session"] = last.group("active") == "1"
     try:
-        epoch = time.mktime(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ"))
-        # `time.mktime` interprets the struct as local time; the ts is
-        # UTC, so add the offset back.
-        epoch -= time.timezone
+        # ts_str is UTC (`Z` suffix). calendar.timegm goes struct→epoch
+        # treating the struct as UTC; cleaner than mktime followed by
+        # a `-= time.timezone` correction which was off by one hour
+        # during DST in zones that observe it.
+        epoch = calendar.timegm(time.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ"))
         out["age_s"] = max(0.0, time.time() - epoch)
     except (ValueError, OverflowError):
         pass

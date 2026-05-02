@@ -128,6 +128,58 @@ def test_progress_health_red_on_high_backlog(progress_brain):
     assert p["health"] == "RED"
 
 
+def test_progress_parses_utc_log_timestamp_as_utc(progress_brain):
+    """The auto-extract log's run header is a UTC ISO string (`Z`
+    suffix). Pre-fix code used `time.mktime(...) - time.timezone`
+    which is correct outside DST but produces an epoch one hour off
+    inside DST in zones that observe it. Fix uses calendar.timegm
+    which always treats the struct as UTC.
+
+    This test simulates a DST-observing host (America/Los_Angeles) by
+    setting TZ + tzset, then writes a UTC header for a known recent
+    time and asserts the parsed age tracks UTC reality — not shifted
+    by the local offset. On the buggy code under TZ=America/Los_Angeles
+    in summer, age_sec drifts by ~3600 seconds.
+    """
+    import os as _os
+    import time as _time
+
+    if not hasattr(_time, "tzset"):
+        pytest.skip("time.tzset unavailable on this platform")
+
+    # 90 seconds ago, in UTC. Pick a recent time so it falls inside
+    # the one-hour throughput window the function counts.
+    ref_epoch = _time.time() - 90.0
+    ref_struct = _time.gmtime(ref_epoch)
+    ref_ts_str = _time.strftime("%Y-%m-%dT%H:%M:%SZ", ref_struct)
+    log_line = f"=== {ref_ts_str} auto-extract run (active=0)\n"
+    (progress_brain / "logs" / "auto-extract.log").write_text(log_line)
+
+    saved_tz = _os.environ.get("TZ")
+    try:
+        _os.environ["TZ"] = "America/Los_Angeles"
+        _time.tzset()
+        p = progress.extraction_progress()
+    finally:
+        if saved_tz is None:
+            _os.environ.pop("TZ", None)
+        else:
+            _os.environ["TZ"] = saved_tz
+        _time.tzset()
+
+    assert p["last_extract"]["ts"] == ref_ts_str
+    # age_sec should be close to 90s — the reference age. Allow 5s
+    # window for test execution time. The buggy code yields ~3690s
+    # on a DST-observing host in summer (or ~25290s outside DST in a
+    # non-Pacific zone, since mktime uses the simulated PST offset).
+    assert abs(p["last_extract"]["age_sec"] - 90.0) < 5.0, (
+        f"age_sec={p['last_extract']['age_sec']} "
+        f"should be ~90s; large drift means UTC parsing collapsed back "
+        f"into local-time math"
+    )
+    assert p["throughput_last_hour"]["extract_runs"] == 1
+
+
 def test_progress_format_text_renders_bar(progress_brain):
     _seed_note(progress_brain, "a.md", sha="aaa", extracted_sha="aaa")
     _seed_note(progress_brain, "b.md", sha="bbb", extracted_sha=None)

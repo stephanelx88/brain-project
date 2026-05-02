@@ -13,6 +13,7 @@ brain.consolidation. Read-only.
 """
 from __future__ import annotations
 
+import calendar
 import os
 import re
 import time
@@ -164,7 +165,14 @@ def _extract_runs(since_epoch: float) -> tuple[Optional[float], int]:
     for m in _RUN_HEADER_RE.finditer(text):
         try:
             ts_struct = time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")
-            epoch = time.mktime(ts_struct) - time.timezone
+            # The header timestamps are UTC (`Z` suffix). calendar.timegm
+            # converts a UTC struct_time directly to epoch. The previous
+            # `mktime(struct) - time.timezone` was correct only outside
+            # DST — during DST in zones that observe it (continental US,
+            # most of Europe), `time.timezone` is the standard-time
+            # offset and the result is one hour off, making the
+            # last-extract-age in `brain status` wrong every summer.
+            epoch = calendar.timegm(ts_struct)
         except (ValueError, OverflowError):
             continue
         if epoch >= since_epoch:
