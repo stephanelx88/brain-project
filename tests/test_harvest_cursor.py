@@ -114,6 +114,76 @@ def test_derive_project_name_claude_unchanged(tmp_path, monkeypatch):
     assert hs.derive_project_name(claude_jsonl) == "code/myproj"
 
 
+def test_derive_project_name_uses_cwd_to_preserve_hyphens(tmp_path, monkeypatch):
+    """When cwd is supplied, derive_project_name must use it directly
+    instead of decoding the encoded directory name. Claude's encoding
+    replaces `/` with `-` with no escape for hyphens that were in the
+    original path, so an encoded name like `Users-son-code-brain-project`
+    cannot be unambiguously decoded — it could mean `code/brain-project`
+    (one dir) or `code/brain/project` (two dirs). The fallback decoder
+    picks the lossy second option; the cwd path picks the truth.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("USER", "son")
+    # The encoded dir name on disk is the lossy form...
+    claude_jsonl = tmp_path / "claude" / "projects" / "-Users-son-code-brain-project" / "uuid.jsonl"
+    claude_jsonl.parent.mkdir(parents=True)
+    claude_jsonl.write_text("{}\n")
+    # ...but cwd preserves the truth — `brain-project` is one directory.
+    cwd = str(home / "code" / "brain-project")
+    assert hs.derive_project_name(claude_jsonl, cwd=cwd) == "code/brain-project"
+    # Without cwd, we get the existing lossy decoding (regression guard
+    # — flagging if someone breaks the fallback path).
+    assert hs.derive_project_name(claude_jsonl) == "code/brain/project"
+
+
+def test_derive_project_name_with_cwd_outside_home_returns_full_path(
+    tmp_path, monkeypatch
+):
+    """A session running from outside `$HOME` (e.g. `/tmp/work`) should
+    display its full path, not silently fall back to the lossy decoder.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    claude_jsonl = tmp_path / "projects" / "-tmp-work" / "uuid.jsonl"
+    claude_jsonl.parent.mkdir(parents=True)
+    claude_jsonl.write_text("{}\n")
+    assert hs.derive_project_name(claude_jsonl, cwd="/tmp/work") == "/tmp/work"
+
+
+def test_derive_project_name_with_empty_cwd_falls_back(tmp_path, monkeypatch):
+    """An empty/None cwd must NOT silently produce an empty project —
+    we fall back to the encoded-dir decoder path so callers without
+    cwd still get a label.
+    """
+    monkeypatch.setenv("USER", "son")
+    claude_jsonl = tmp_path / "Users-son-code-myproj" / "abcd.jsonl"
+    claude_jsonl.parent.mkdir(parents=True)
+    claude_jsonl.write_text("{}\n")
+    assert hs.derive_project_name(claude_jsonl, cwd="") == "code/myproj"
+    assert hs.derive_project_name(claude_jsonl, cwd=None) == "code/myproj"
+
+
+def test_derive_project_name_cursor_path_with_cwd_keeps_cursor_prefix(
+    tmp_path, monkeypatch
+):
+    """Cursor sessions normally don't have a cwd, but if a future
+    Cursor version exposes one, the cwd path must still apply the
+    `cursor/` prefix so peer-sessions display can tell tools apart.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(hs, "CURSOR_PROJECTS_DIR", tmp_path / "projects")
+    cursor_jsonl = _write_cursor_session(
+        tmp_path, "Users-son-code-myproj", "deadbeef",
+        [{"role": "user", "message": {"content": "x"}}],
+    )
+    cwd = str(home / "code" / "my-proj-with-hyphen")
+    assert hs.derive_project_name(cursor_jsonl, cwd=cwd) == "cursor/code/my-proj-with-hyphen"
+
+
 def test_cursor_recently_active(tmp_path):
     p = tmp_path / "x.jsonl"
     p.write_text("{}\n")

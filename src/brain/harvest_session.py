@@ -282,7 +282,7 @@ def extract_messages(jsonl_path: Path, start_offset: int = 0) -> tuple[list[dict
     return messages, new_offset
 
 
-def derive_project_name(jsonl_path: Path) -> str:
+def derive_project_name(jsonl_path: Path, cwd: str | None = None) -> str:
     """Derive a human-readable project name from the JSONL path.
 
     Claude lays out `~/.claude/projects/<dir-with-path-encoded>/<uuid>.jsonl`,
@@ -298,7 +298,25 @@ def derive_project_name(jsonl_path: Path) -> str:
 
     Cursor names get a `cursor/` prefix so it's obvious in the captured
     `session-*.md` whether a turn came from Cursor or Claude Code.
+
+    `cwd` (Claude only — Cursor exposes none) is the literal working
+    directory captured in the session.json file. When given, we derive
+    the project from cwd directly instead of decoding the encoded
+    directory name. Reason: Claude's directory encoding replaces `/`
+    with `-` with NO escape mechanism for hyphens that were in the
+    original path, so the encoded name `-Users-son-code-brain-project`
+    is genuinely ambiguous between `code/brain-project` (one dir) and
+    `code/brain/project` (two dirs). cwd is the only lossless source.
+    Decoding the encoded name reported `code/brain/project` for any
+    cwd containing hyphens — wrong but quietly so. With cwd, the
+    output is `code/brain-project`.
     """
+    if cwd:
+        readable = _readable_project_from_cwd(cwd)
+        if readable:
+            prefix = "cursor/" if is_cursor_path(jsonl_path) else ""
+            return f"{prefix}{readable}"
+
     if is_cursor_path(jsonl_path):
         # …/agent-transcripts/<uuid>/<uuid>.jsonl → workspace is 3 up.
         try:
@@ -322,6 +340,27 @@ def derive_project_name(jsonl_path: Path) -> str:
         meaningful.append(part)
     base = "/".join(meaningful) if meaningful else workspace_dir_name
     return f"{prefix}{base}"
+
+
+def _readable_project_from_cwd(cwd: str) -> str | None:
+    """Render `cwd` as a project label by stripping the home prefix.
+
+    Returns None when the input is empty or unparseable. Returning the
+    full path (instead of None) for paths outside `$HOME` is intentional —
+    a session running from `/tmp/work` should display `/tmp/work`, not
+    fall back to the lossy directory-name decoder.
+    """
+    if not cwd:
+        return None
+    try:
+        p = Path(cwd)
+    except (TypeError, ValueError):
+        return None
+    home = Path.home()
+    try:
+        return str(p.relative_to(home))
+    except ValueError:
+        return cwd
 
 
 def format_session_summary(messages: list[dict], project_name: str, session_id: str) -> str:

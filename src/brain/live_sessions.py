@@ -72,7 +72,12 @@ def list_live_sessions(
                 last_write_iso = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
                 age = int(now.timestamp() - mtime)
                 path_str = str(jsonl)
-                project = harvest_session.derive_project_name(jsonl)
+                # Pass cwd so derive_project_name uses the lossless source
+                # of truth instead of decoding the encoded dir name (which
+                # collapses hyphens-as-slashes into hyphens-as-name and
+                # produces misleading paths like 'brain/project' for the
+                # actual single dir 'brain-project').
+                project = harvest_session.derive_project_name(jsonl, cwd=cs.get("cwd"))
             except OSError:
                 pass
         out.append({
