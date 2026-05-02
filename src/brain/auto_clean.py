@@ -288,6 +288,11 @@ def update_rules(
         patterns = r.get("match", {}).get("name_patterns", []) or []
         existing[rname] = set(patterns)
 
+    # Compute vault-specific high-frequency tokens once. Skipped on
+    # sparse vaults (<20 entities) — the per-vault statistics aren't
+    # meaningful at that scale.
+    vault_common = _vault_common_tokens()
+
     added = 0
     for p in deleted_paths:
         try:
@@ -306,7 +311,7 @@ def update_rules(
             continue
 
         # Extract a 2-3 word anchor from the name that distinguishes this item
-        tokens = _extract_anchor_tokens(name)
+        tokens = _extract_anchor_tokens(name, extra_stopwords=vault_common)
         for token in tokens:
             pattern = _make_escaped_pattern(token)
             if pattern not in existing.get(rule_name, set()):
@@ -329,24 +334,77 @@ def update_rules(
     return added
 
 
-def _extract_anchor_tokens(name: str) -> list[str]:
+_GENERIC_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "of", "for", "in", "on", "at",
+    "to", "with", "is", "are", "was", "were", "by", "as", "–", "-",
+    "from", "that", "this", "be", "been", "both", "all", "has", "have",
+})
+
+
+def _vault_common_tokens(threshold_pct: float = 0.10,
+                          min_entities: int = 20) -> set[str]:
+    """Tokens that appear in ≥`threshold_pct` of entity names — too
+    common to act as a discriminator on this particular vault.
+
+    Replaces the previously-hardcoded `{"son", "brain", "project"}`
+    stopword carve-out, which was a leak from the original author's
+    vault into the codebase. For a different user's vault those tokens
+    are unrepresentative; meanwhile their own high-frequency tokens
+    (their own name, their main project name, etc.) get used as
+    anchors, leading to over-broad rule patterns that match unrelated
+    entities. Computing the set per vault from the entity-name
+    distribution makes the heuristic correct everywhere.
+
+    Returns the empty set when the vault is too small for frequency
+    statistics to be meaningful (under `min_entities`) or when the DB
+    is unavailable — safe degradation, never elevates an inappropriate
+    token to "stopword" on sparse data.
+    """
+    try:
+        from brain import db
+        with db.connect() as conn:
+            rows = conn.execute("SELECT name FROM entities").fetchall()
+    except Exception:
+        return set()
+    names = [r[0] for r in rows if r and r[0]]
+    if len(names) < min_entities:
+        return set()
+    from collections import Counter
+    counter: Counter = Counter()
+    for nm in names:
+        seen_in_this_name: set[str] = set()
+        for w in re.findall(r"[a-zA-Z]{3,}", nm.lower()):
+            if w in seen_in_this_name:
+                continue  # count document-frequency, not term-frequency
+            seen_in_this_name.add(w)
+            counter[w] += 1
+    cutoff = max(2, int(len(names) * threshold_pct))
+    return {w for w, c in counter.items() if c >= cutoff}
+
+
+def _extract_anchor_tokens(
+    name: str,
+    *,
+    extra_stopwords: set[str] | frozenset[str] = frozenset(),
+) -> list[str]:
     """Return 1-2 short tokens from `name` likely to recur in similar entities.
 
     Heuristic: skip stop words and very short tokens; prefer tokens that
     are specific enough to be discriminating but not so specific they only
     match one entity (e.g. skip version numbers like "2026-04-11").
+
+    `extra_stopwords` lets callers inject vault-specific high-frequency
+    tokens. The recommended source is `_vault_common_tokens()`, which
+    computes them from the live entity-name distribution. Defaults to
+    empty (English-only stopwords) so unit tests that don't depend on
+    a real vault can call directly.
     """
-    _STOP = {
-        "a", "an", "the", "and", "or", "of", "for", "in", "on", "at",
-        "to", "with", "is", "are", "was", "were", "by", "as", "–", "-",
-        "from", "that", "this", "be", "been", "both", "all", "has", "have",
-        "son", "brain", "project",  # too common in this vault
-    }
+    stop = _GENERIC_STOPWORDS | set(extra_stopwords)
     # Strip date prefixes like "2026-04-11"
     name = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", name).strip()
     # Tokenise on word boundaries
     words = [w.lower() for w in re.findall(r"[a-zA-Z]{3,}", name)]
-    candidates = [w for w in words if w not in _STOP]
+    candidates = [w for w in words if w not in stop]
     # Return first 2 non-stop words — enough to be specific, few enough to generalise
     return candidates[:2]
 
